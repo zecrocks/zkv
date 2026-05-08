@@ -84,10 +84,22 @@ impl Command {
             vec![Box::new(recipient) as _]
         };
 
-        // Parse or create the wallet's mnemonic phrase.
-        let phrase = SecretString::new(rpassword::prompt_password(
-            "Enter mnemonic (or just press Enter to generate a new one):",
-        )?);
+        // Parse or create the wallet's mnemonic phrase. When stdin is not a tty,
+        // fall back to reading a line directly from stdin so the command is scriptable.
+        let phrase = SecretString::new({
+            use std::io::IsTerminal;
+            if std::io::stdin().is_terminal() {
+                rpassword::prompt_password(
+                    "Enter mnemonic (or just press Enter to generate a new one):",
+                )?
+            } else {
+                eprintln!("Enter mnemonic (or just press Enter to generate a new one):");
+                use std::io::BufRead;
+                let mut line = String::new();
+                std::io::stdin().lock().read_line(&mut line)?;
+                line.trim_end_matches('\n').trim_end_matches('\r').to_owned()
+            }
+        });
         let (mnemonic, recover_until) = if !phrase.expose_secret().is_empty() {
             (
                 <Mnemonic<English>>::from_phrase(phrase.expose_secret())?,

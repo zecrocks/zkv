@@ -9,6 +9,7 @@ pub(crate) mod inspect;
 pub(crate) mod pczt;
 pub(crate) mod wallet;
 pub(crate) mod zip48;
+pub(crate) mod zkv;
 
 #[cfg(feature = "pczt-qr")]
 pub(crate) mod keystone;
@@ -41,6 +42,16 @@ pub(crate) struct Pczt {
 
     #[command(subcommand)]
     pub(crate) command: pczt::Command,
+}
+
+#[derive(Debug, Args)]
+pub(crate) struct Zkv {
+    /// Path to the wallet directory
+    #[arg(short, long)]
+    pub(crate) wallet_dir: Option<String>,
+
+    #[command(subcommand)]
+    pub(crate) command: zkv::Command,
 }
 
 #[cfg(feature = "pczt-qr")]

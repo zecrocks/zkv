@@ -57,6 +57,9 @@ pub(crate) enum Command {
     Keystone(commands::Keystone),
 
     CreateMultisigAddress(commands::create_multisig_address::Command),
+
+    /// Operate on a zkv key-value store backed by Zcash Orchard memos
+    Zkv(commands::Zkv),
 }
 
 fn main() -> Result<(), anyhow::Error> {
@@ -228,6 +231,15 @@ fn main() -> Result<(), anyhow::Error> {
             },
 
             Command::CreateMultisigAddress(command) => command.run(),
+            Command::Zkv(commands::Zkv {
+                wallet_dir,
+                command,
+            }) => match command {
+                commands::zkv::Command::Address(command) => command.run(wallet_dir),
+                commands::zkv::Command::Set(command) => command.run(wallet_dir).await,
+                commands::zkv::Command::Del(command) => command.run(wallet_dir).await,
+                commands::zkv::Command::Get(command) => command.run(wallet_dir),
+            },
         }
     })
 }
