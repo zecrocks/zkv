@@ -10,7 +10,6 @@ SETs and DELs.
 ```
 SET zec_usd_price 1008.33
 DEL zec_usd_price
-GET zec_usd_price
 ```
 
 This repo is a fork of [`zcash/zcash-devtool`](https://github.com/zcash/zcash-devtool)
