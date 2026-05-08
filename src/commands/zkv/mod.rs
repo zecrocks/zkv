@@ -251,8 +251,25 @@ pub(crate) struct ZkvCommand {
 }
 
 /// Parse a `Memo::Text` payload into a zkv command, if it is one.
+///
+/// Standard wire form: `"ZKV1 OP KEY VALUE\n<128-char hex sig>"`. Some
+/// broadcaster wallets normalize newlines into whitespace, so as a fallback
+/// we recover by taking the trailing 128 hex characters as the signature.
 pub(crate) fn parse_text_memo(text: &str) -> Option<ZkvCommand> {
-    let (line1, sig_hex) = text.split_once('\n')?;
+    let (line1, sig_hex) = if let Some((head, rest)) = text.split_once('\n') {
+        (head.to_owned(), rest.trim().to_owned())
+    } else {
+        let trimmed = text.trim_end();
+        if trimmed.len() < 128 {
+            return None;
+        }
+        let (head, tail) = trimmed.split_at(trimmed.len() - 128);
+        if !tail.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        (head.trim_end().to_owned(), tail.to_owned())
+    };
+
     let mut tokens = line1.splitn(4, ' ');
     if tokens.next()? != WIRE_MAGIC {
         return None;
@@ -276,7 +293,7 @@ pub(crate) fn parse_text_memo(text: &str) -> Option<ZkvCommand> {
         op,
         key,
         value,
-        sig_hex: sig_hex.trim_end().to_owned(),
+        sig_hex,
     })
 }
 
@@ -418,6 +435,27 @@ mod tests {
         let state = replay(entries, addr, &pk, true).unwrap();
         assert_eq!(state.get("a").map(String::as_str), Some("3"));
         assert!(state.get("b").is_none());
+    }
+
+    #[test]
+    fn parse_recovers_when_newline_collapsed_to_whitespace() {
+        // Some broadcaster wallets replace the newline between command and
+        // signature with whitespace; we should still parse the trailing 128
+        // hex chars as the signature.
+        let (sk, pk) = keypair();
+        let addr = "zkv1:test:1";
+        let payload = signed_payload(addr, Op::Set, "zec_usd_price", Some("1008.33"));
+        let sig = sign_command(&sk, &payload);
+        let sig_hex = hex::encode(sig);
+
+        let mangled = format!("ZKV1 SET zec_usd_price 1008.33                       {sig_hex}");
+        let cmd = parse_text_memo(&mangled).expect("parses despite missing newline");
+        assert!(matches!(cmd.op, Op::Set));
+        assert_eq!(cmd.key, "zec_usd_price");
+        assert_eq!(cmd.value.as_deref(), Some("1008.33"));
+
+        let recomputed = signed_payload(addr, cmd.op, &cmd.key, cmd.value.as_deref());
+        assert!(verify_command(&pk, &recomputed, &cmd.sig_hex));
     }
 
     #[test]
