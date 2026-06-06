@@ -1,0 +1,498 @@
+name: release
+
+# Build the shippable release artifacts.
+#
+#   * on a `v*` tag      -> build + publish a GitHub Release with them
+#   * on manual dispatch -> build only; artifacts are uploaded to the run
+#                           (nothing is published), so the pipeline can be
+#                           exercised without cutting a tag.
+#
+# Artifacts (each with a matching `.sha256`). Filenames are STABLE across
+# releases (no version), so `releases/latest/download/<name>` is a permanent
+# link; the version lives inside instead (the CLI archives unpack to a
+# `zkv-cli-<ver>-<label>/` folder, the GUI bundles carry it in their .app
+# Info.plist / .deb / .exe metadata). Filenames use a short platform label;
+# the build itself still uses the full Rust target triple.
+#   * Linux, x86_64 (build `x86_64-unknown-linux-gnu`, label `x86_64-linux`)
+#     and aarch64 (build `aarch64-unknown-linux-gnu`, label `aarch64-linux`),
+#     each built on a native runner (no cross-compile):
+#       - zkv-cli-<label>.tgz          : the lean `zkv` CLI (versioned folder inside).
+#       - zkv-browser-<label>.AppImage : desktop GUI, the portable single-file
+#         app (bundles its own WebKitGTK-dependent runtime view).
+#       - zkv-browser-<label>.deb      : desktop GUI, a Debian package
+#         (declares its WebKitGTK dependency for apt).
+#   * macOS, Apple Silicon (build `aarch64-apple-darwin`, label `macos-arm`):
+#       - zkv-cli-macos-arm.tgz      : the lean `zkv` CLI (versioned folder inside).
+#       - zkv-browser-macos-arm.dmg  : the native desktop GUI, a
+#         Tauri-bundled `.app` packaged in a `.dmg`.
+#   * Windows, x64 (build `x86_64-pc-windows-msvc`, label `x86_64-windows`):
+#       - zkv-cli-x86_64-windows.zip              : the lean `zkv.exe` (versioned folder inside).
+#       - zkv-browser-x86_64-windows-portable.exe : desktop GUI, the
+#         standalone single-file app (no installer; needs WebView2 present).
+#       - zkv-browser-x86_64-windows-setup.exe    : desktop GUI, NSIS
+#         installer (provisions WebView2). Not code-signed yet, so SmartScreen
+#         will warn.
+# To add more targets, extend the matrix (and add the matching runners).
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: "Platform to build (all builds on tag push)"
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - macos
+          - linux
+          - windows
+
+env:
+  CARGO_TERM_COLOR: always
+
+# Least privilege by default; only the publish job gets write access.
+permissions:
+  contents: read
+
+jobs:
+  # Compute the build matrix. On a tag push every platform is included; on a
+  # manual dispatch the `platform` input filters it down to one platform's
+  # jobs, saving CI minutes during testing.
+  setup:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.value }}
+    steps:
+      - name: Compute build matrix
+        id: matrix
+        shell: bash
+        run: |
+          platform="${{ inputs.platform || 'all' }}"
+          all=$(cat <<'JSON'
+          [
+            {"name":"zkv-cli-linux-x86_64","kind":"cli","bin":"zkv","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","label":"x86_64-linux","platform":"linux"},
+            {"name":"zkv-cli-linux-aarch64","kind":"cli","bin":"zkv","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","label":"aarch64-linux","platform":"linux"},
+            {"name":"zkv-browser-linux-x86_64","kind":"browser","bin":"zkv-browser","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","label":"x86_64-linux","platform":"linux"},
+            {"name":"zkv-browser-linux-aarch64","kind":"browser","bin":"zkv-browser","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","label":"aarch64-linux","platform":"linux"},
+            {"name":"zkv-cli-macos-arm","kind":"cli","bin":"zkv","os":"macos-14","target":"aarch64-apple-darwin","label":"macos-arm","platform":"macos"},
+            {"name":"zkv-browser-macos-arm","kind":"browser","bin":"zkv-browser","os":"macos-14","target":"aarch64-apple-darwin","label":"macos-arm","platform":"macos"},
+            {"name":"zkv-cli-windows","kind":"cli","bin":"zkv","os":"windows-2025","target":"x86_64-pc-windows-msvc","label":"x86_64-windows","platform":"windows"},
+            {"name":"zkv-browser-windows","kind":"browser","bin":"zkv-browser","os":"windows-2025","target":"x86_64-pc-windows-msvc","label":"x86_64-windows","platform":"windows"}
+          ]
+          JSON
+          )
+          if [ "$platform" = "all" ]; then
+            echo "value=$(echo "$all" | jq -c .)" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=$(echo "$all" | jq -c --arg p "$platform" '[.[] | select(.platform == $p)]')" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    needs: setup
+    name: build ${{ matrix.name }} (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.name }}
+
+      - name: Resolve version
+        id: version
+        # Force bash so this runs identically on the Windows runner (whose
+        # default shell is PowerShell). Git Bash is preinstalled there.
+        shell: bash
+        run: |
+          # A tag *push* is a real release: name the artifacts after the tag.
+          # Anything else (a manual workflow_dispatch, even one dispatched
+          # against a tag ref) is a dev build: use the short git sha so the
+          # artifacts are traceable to the exact commit instead of carrying a
+          # version number they don't correspond to.
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=dev-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
+          fi
+          # Pin the embedded build SHA to this exact commit so `build.rs` never
+          # probes git (and so never emits a `-dirty` marker from untracked
+          # scratch a later build step might leave in the tree).
+          echo "ZKV_GIT_SHA=${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+
+      # --- CLI: plain cargo build -> tarball -------------------------------
+      - name: Build zkv (release, lean CLI)
+        if: ${{ matrix.kind == 'cli' }}
+        run: >-
+          cargo build --release --locked
+          -p zkv --bin zkv
+          --target ${{ matrix.target }}
+          --no-default-features --features cli,transparent-inputs
+
+      - name: Import Apple certificate (macOS)
+        if: ${{ runner.os == 'macOS' }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          KEYCHAIN_PATH="$RUNNER_TEMP/app-signing.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 32)"
+          echo "KEYCHAIN_PATH=$KEYCHAIN_PATH" >> "$GITHUB_ENV"
+          echo "KEYCHAIN_PASSWORD=$KEYCHAIN_PASSWORD" >> "$GITHUB_ENV"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          echo "$APPLE_CERTIFICATE" | base64 --decode > /tmp/certificate.p12
+          security import /tmp/certificate.p12 \
+            -k "$KEYCHAIN_PATH" \
+            -P "$APPLE_CERTIFICATE_PASSWORD" \
+            -T /usr/bin/codesign
+          security list-keychain -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -k "$KEYCHAIN_PASSWORD" \
+            "$KEYCHAIN_PATH"
+          rm /tmp/certificate.p12
+
+      # Sign the CLI binary and submit for notarization. Hardened runtime is
+      # required by notarytool. The binary is zipped (via ditto, which
+      # preserves extended attributes) for submission; bare Mach-O binaries
+      # and .tgz archives can't be submitted directly. The binary can't be
+      # stapled either (stapling only works on .app/.dmg/.pkg), but macOS
+      # verifies notarized binaries online on first run, which is enough to
+      # clear the Gatekeeper quarantine warning.
+      - name: Sign and notarize CLI binary (macOS)
+        if: ${{ matrix.kind == 'cli' && runner.os == 'macOS' }}
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          binary="target/${{ matrix.target }}/release/zkv"
+          # Sign with hardened runtime (required for notarization).
+          codesign --deep --options runtime \
+            --sign "$APPLE_SIGNING_IDENTITY" \
+            "$binary"
+          # Zip via ditto to preserve code-signature metadata.
+          ditto -c -k --keepParent "$binary" /tmp/zkv-notarize.zip
+          # Submit and wait for Apple's scan.
+          xcrun notarytool submit /tmp/zkv-notarize.zip \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+          rm /tmp/zkv-notarize.zip
+
+      - name: Package tarball (macOS CLI)
+        if: ${{ matrix.kind == 'cli' && runner.os == 'macOS' }}
+        run: |
+          set -euo pipefail
+          # Stable archive name (no version) for a permanent download permalink;
+          # the inner folder keeps the version so extracting two releases never
+          # clobbers and you can tell them apart.
+          inner="zkv-cli-${{ steps.version.outputs.version }}-${{ matrix.label }}"
+          archive="zkv-cli-${{ matrix.label }}"
+          mkdir -p "dist/$inner"
+          cp "target/${{ matrix.target }}/release/zkv" "dist/$inner/"
+          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$inner/"
+          tar -C dist -czf "dist/$archive.tgz" "$inner"
+          rm -rf "dist/$inner"
+          ( cd dist && shasum -a 256 "$archive.tgz" > "$archive.tgz.sha256" )
+          ls -l dist
+
+      # Linux is the same tarball flow as macOS; only the checksum tool
+      # differs (`sha256sum` ships in coreutils, vs macOS's `shasum`).
+      - name: Package tarball (Linux CLI)
+        if: ${{ matrix.kind == 'cli' && runner.os == 'Linux' }}
+        run: |
+          set -euo pipefail
+          # Stable archive name, versioned inner folder (see the macOS step).
+          inner="zkv-cli-${{ steps.version.outputs.version }}-${{ matrix.label }}"
+          archive="zkv-cli-${{ matrix.label }}"
+          mkdir -p "dist/$inner"
+          cp "target/${{ matrix.target }}/release/zkv" "dist/$inner/"
+          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$inner/"
+          tar -C dist -czf "dist/$archive.tgz" "$inner"
+          rm -rf "dist/$inner"
+          ( cd dist && sha256sum "$archive.tgz" > "$archive.tgz.sha256" )
+          ls -l dist
+
+      # Windows ships a `.zip` of `zkv.exe`. Use PowerShell so the runner needs
+      # no extra UNIX tooling; `Compress-Archive` + `Get-FileHash` are built in.
+      - name: Package zip (Windows CLI)
+        if: ${{ matrix.kind == 'cli' && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $inner = "zkv-cli-${{ steps.version.outputs.version }}-${{ matrix.label }}"
+          $archive = "zkv-cli-${{ matrix.label }}"
+          New-Item -ItemType Directory -Force -Path "dist/$inner" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/zkv.exe" "dist/$inner/"
+          Copy-Item LICENSE-MIT, LICENSE-APACHE, README.md "dist/$inner/"
+          # Archive the folder itself (not its contents) so the versioned
+          # directory survives inside the zip.
+          Compress-Archive -Path "dist/$inner" -DestinationPath "dist/$archive.zip" -Force
+          Remove-Item -Recurse -Force "dist/$inner"
+          $hash = (Get-FileHash "dist/$archive.zip" -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive.zip" | Out-File -Encoding ascii "dist/$archive.zip.sha256"
+          Get-ChildItem dist
+
+      # --- Browser: Tauri bundle (.app/.dmg on macOS, portable exe + NSIS on Windows) --
+      # The desktop build embeds the web UI from `frontendDist` (the committed
+      # assets under src/gui/assets). We do NOT regenerate them here: the
+      # `gui-typecheck` CI job already guarantees the committed JS matches the
+      # TS sources, and running `npm ci` would drop a node_modules/ into
+      # frontendDist, which the Tauri bundler rejects. Only the Tauri CLI is
+      # needed (plain `cargo build` never bundles). The Node + Tauri-CLI steps
+      # are shared by both browser legs; only the bundle/package steps split.
+      - name: Set up Node (for the Tauri CLI)
+        if: ${{ matrix.kind == 'browser' }}
+        uses: actions/setup-node@v5
+        with:
+          node-version: 20
+
+      - name: Install Tauri CLI
+        if: ${{ matrix.kind == 'browser' }}
+        run: npm install -g @tauri-apps/cli@^2
+
+      # Linux desktop needs the system WebView (WebKitGTK 4.1) + GTK dev
+      # libraries to compile and bundle; macOS/Windows ship their webview
+      # with the OS. The appindicator/xdo/rsvg packages round out Tauri v2's
+      # Linux prerequisites. `xdg-utils` provides `/usr/bin/xdg-open`, which
+      # the AppImage bundler's linuxdeploy-plugin-gtk copies into the image;
+      # the x86_64 runner ships it preinstalled but the arm64 runner does not,
+      # so install it explicitly to keep the AppImage leg working on both.
+      - name: Install WebKitGTK + GTK deps (Tauri, Linux)
+        if: ${{ matrix.kind == 'browser' && runner.os == 'Linux' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libgtk-3-dev \
+            libsoup-3.0-dev \
+            librsvg2-dev \
+            libayatana-appindicator3-dev \
+            libxdo-dev \
+            libssl-dev \
+            build-essential \
+            file \
+            xdg-utils
+
+      - name: Build app bundles (Tauri, Linux)
+        if: ${{ matrix.kind == 'browser' && runner.os == 'Linux' }}
+        working-directory: crates/zkv
+        # The AppImage tooling normally FUSE-mounts itself to run; CI runners
+        # have no FUSE, so extract-and-run instead. `deb,appimage` skips the
+        # rpm bundle we don't ship.
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: 1
+        run: tauri build --features desktop --target ${{ matrix.target }} --bundles deb,appimage
+
+      - name: Build app + dmg (Tauri, macOS)
+        if: ${{ matrix.kind == 'browser' && runner.os == 'macOS' }}
+        working-directory: crates/zkv
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: tauri build --features desktop --target ${{ matrix.target }}
+
+      - name: Clean up keychain (macOS)
+        if: ${{ runner.os == 'macOS' && always() }}
+        run: |
+          security delete-keychain "$KEYCHAIN_PATH" || true
+
+      - name: Build installer (Tauri, Windows)
+        if: ${{ matrix.kind == 'browser' && runner.os == 'Windows' }}
+        working-directory: crates/zkv
+        # NSIS (`-setup.exe`) only. The bundler downloads the NSIS toolchain on
+        # first use; nothing else needs preinstalling. `tauri build` also leaves
+        # the bare `zkv-browser.exe` we ship as the portable single-file app.
+        run: tauri build --features desktop --target ${{ matrix.target }} --bundles nsis
+
+      - name: Package dmg (macOS)
+        if: ${{ matrix.kind == 'browser' && runner.os == 'macOS' }}
+        run: |
+          set -euo pipefail
+          dmg="$(find target -path '*/release/bundle/dmg/*.dmg' -print -quit)"
+          if [ -z "$dmg" ]; then
+            echo "::error::no .dmg produced by the Tauri bundler"
+            find target -name '*.dmg' -o -name '*.app' || true
+            exit 1
+          fi
+          out="zkv-browser-${{ matrix.label }}.dmg"
+          mkdir -p dist
+          cp "$dmg" "dist/$out"
+          ( cd dist && shasum -a 256 "$out" > "$out.sha256" )
+          ls -l dist
+
+      # Ship two things from the desktop build: the standalone single-file app
+      # (portable, needs WebView2 already present) and the NSIS installer
+      # (which provisions WebView2 itself). Named with the friendly `label`;
+      # build output still lives under the real `target` triple.
+      - name: Package GUI artifacts (Windows)
+        if: ${{ matrix.kind == 'browser' && runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $label = "${{ matrix.label }}"
+          $rel = "target/${{ matrix.target }}/release"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+
+          function Publish-Artifact($src, $out) {
+            Copy-Item $src "dist/$out"
+            $hash = (Get-FileHash "dist/$out" -Algorithm SHA256).Hash.ToLower()
+            "$hash  $out" | Out-File -Encoding ascii "dist/$out.sha256"
+          }
+
+          # Standalone single-file app: no installer, runs as-is on a host that
+          # already has the WebView2 runtime.
+          $exe = "$rel/zkv-browser.exe"
+          if (-not (Test-Path $exe)) { Write-Error "expected $exe was not produced" }
+          Publish-Artifact $exe "zkv-browser-$label-portable.exe"
+
+          # NSIS installer (`-setup.exe`).
+          $nsis = Get-ChildItem "$rel/bundle/nsis/*-setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
+          if (-not $nsis) {
+            Get-ChildItem -Recurse "$rel/bundle" -ErrorAction SilentlyContinue | Select-Object FullName
+            Write-Error "no NSIS installer produced by the Tauri bundler"
+          }
+          Publish-Artifact $nsis.FullName "zkv-browser-$label-setup.exe"
+          Get-ChildItem dist
+
+      # Ship the portable AppImage and the Debian package. Named with the
+      # friendly `label`; build output still lives under the real `target`
+      # triple's bundle dir.
+      - name: Package GUI artifacts (Linux)
+        if: ${{ matrix.kind == 'browser' && runner.os == 'Linux' }}
+        run: |
+          set -euo pipefail
+          label="${{ matrix.label }}"
+          rel="target/${{ matrix.target }}/release"
+          mkdir -p dist
+
+          publish() {
+            cp "$1" "dist/$2"
+            ( cd dist && sha256sum "$2" > "$2.sha256" )
+          }
+
+          # Portable single-file app: the AppImage.
+          appimage="$(find "$rel/bundle/appimage" -name '*.AppImage' -print -quit)"
+          if [ -z "$appimage" ]; then
+            echo "::error::no .AppImage produced by the Tauri bundler"
+            find "$rel/bundle" -type f || true
+            exit 1
+          fi
+          publish "$appimage" "zkv-browser-$label.AppImage"
+
+          # Debian package.
+          deb="$(find "$rel/bundle/deb" -name '*.deb' -print -quit)"
+          if [ -z "$deb" ]; then
+            echo "::error::no .deb produced by the Tauri bundler"
+            find "$rel/bundle" -type f || true
+            exit 1
+          fi
+          publish "$deb" "zkv-browser-$label.deb"
+          ls -l dist
+
+      # --- upload: one artifact per distributable -------------------------
+      # CLI legs, macOS browser, and Linux CLI each produce one distributable
+      # and upload as one artifact. Windows browser uploads two (portable exe
+      # + NSIS installer). Linux browser uploads two (AppImage + deb) for the
+      # same reason: they are separate install options and the combined zip
+      # would be huge (AppImage bundles the full WebKitGTK runtime).
+      - uses: actions/upload-artifact@v6
+        if: ${{ !(matrix.kind == 'browser' && runner.os == 'Windows') && !(matrix.kind == 'browser' && runner.os == 'Linux') }}
+        with:
+          name: ${{ matrix.name }}
+          path: |
+            dist/*.tgz
+            dist/*.dmg
+            dist/*.zip
+            dist/*.exe
+            dist/*.sha256
+          if-no-files-found: error
+
+      - name: Upload AppImage (Linux browser)
+        if: ${{ matrix.kind == 'browser' && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.name }}-appimage
+          path: |
+            dist/*.AppImage
+            dist/*.AppImage.sha256
+          if-no-files-found: error
+
+      - name: Upload deb (Linux browser)
+        if: ${{ matrix.kind == 'browser' && runner.os == 'Linux' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ matrix.name }}-deb
+          path: |
+            dist/*.deb
+            dist/*.deb.sha256
+          if-no-files-found: error
+
+      - name: Upload portable (Windows browser)
+        if: ${{ matrix.kind == 'browser' && runner.os == 'Windows' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: zkv-browser-windows-portable
+          path: |
+            dist/*-portable.exe
+            dist/*-portable.exe.sha256
+          if-no-files-found: error
+
+      - name: Upload installer (Windows browser)
+        if: ${{ matrix.kind == 'browser' && runner.os == 'Windows' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: zkv-browser-windows-setup
+          path: |
+            dist/*-setup.exe
+            dist/*-setup.exe.sha256
+          if-no-files-found: error
+
+  publish:
+    name: publish release
+    needs: [setup, build]
+    # Only publish when a tag triggered the run; manual dispatches just leave
+    # the artifacts attached to the workflow run.
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - run: ls -lR dist
+
+      - name: Create / update GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            dist/*.tgz
+            dist/*.dmg
+            dist/*.zip
+            dist/*.exe
+            dist/*.deb
+            dist/*.AppImage
+            dist/*.sha256
+          fail_on_unmatched_files: true
+          generate_release_notes: true

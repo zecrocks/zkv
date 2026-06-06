@@ -1,0 +1,41 @@
+# Production deployment for the zkv testnet price oracle.
+#
+#   cp .env.example .env      # fill in ZKV_ORACLE_SEED + COINGECKO_API_KEY
+#   docker compose up -d --build
+#   docker compose logs -f oracle
+#   curl -fsS http://localhost:8099/health
+#
+# The wallet data lives in the named volume `oracle-data` so a restart does
+# not re-scan the chain from the wallet birthday.
+
+services:
+  oracle:
+    build:
+      # Build context is the repo root so the whole cargo workspace is visible.
+      context: .
+      dockerfile: crates/zkv-oracle/Dockerfile
+    image: zkv-oracle:latest
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Data dir is the mounted volume; keep it in sync with the volume below.
+      ZKV_DATA: /data
+    volumes:
+      - oracle-data:/data
+    ports:
+      # Expose the health gate to the host (optional; remove for internal-only).
+      - "8099:8099"
+    healthcheck:
+      # Falls to "unhealthy" once the oracle drifts out of sync or stops
+      # writing; combined with `restart: unless-stopped` (and/or an autoheal
+      # sidecar; see README) this restarts the container.
+      test: ["CMD", "curl", "-fsS", "http://localhost:8099/health"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      # Generous cold-start window: the first chain sync can take a while.
+      start_period: 600s
+
+volumes:
+  oracle-data:

@@ -1,0 +1,378 @@
+/* ============================================================
+   ZKV: colors_and_type.css
+   Foundational design tokens: colors, typography, spacing,
+   radii, elevation, motion. Import this anywhere ZKV-branded.
+   ============================================================ */
+
+/* ---------- Webfonts (self-hosted, SIL OFL 1.1) ----------
+   IBM Plex Sans + Mono are the workhorse families. IBM Plex Serif
+   is used sparingly for display moments. Bundled with the app and
+   served from /fonts/ by `zkv gui` (no network needed); the license
+   ships alongside them at /fonts/OFL.txt. ------------------------- */
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 400; font-display: swap;
+  src: url('/fonts/ibm-plex-sans-latin-400-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 500; font-display: swap;
+  src: url('/fonts/ibm-plex-sans-latin-500-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 600; font-display: swap;
+  src: url('/fonts/ibm-plex-sans-latin-600-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Sans'; font-style: normal; font-weight: 700; font-display: swap;
+  src: url('/fonts/ibm-plex-sans-latin-700-normal.woff2') format('woff2'); }
+
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 400; font-display: swap;
+  src: url('/fonts/ibm-plex-mono-latin-400-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 500; font-display: swap;
+  src: url('/fonts/ibm-plex-mono-latin-500-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Mono'; font-style: normal; font-weight: 600; font-display: swap;
+  src: url('/fonts/ibm-plex-mono-latin-600-normal.woff2') format('woff2'); }
+
+@font-face { font-family: 'IBM Plex Serif'; font-style: normal; font-weight: 400; font-display: swap;
+  src: url('/fonts/ibm-plex-serif-latin-400-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Serif'; font-style: normal; font-weight: 500; font-display: swap;
+  src: url('/fonts/ibm-plex-serif-latin-500-normal.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Serif'; font-style: italic; font-weight: 400; font-display: swap;
+  src: url('/fonts/ibm-plex-serif-latin-400-italic.woff2') format('woff2'); }
+@font-face { font-family: 'IBM Plex Serif'; font-style: italic; font-weight: 500; font-display: swap;
+  src: url('/fonts/ibm-plex-serif-latin-500-italic.woff2') format('woff2'); }
+
+:root {
+  /* =====================================================
+     COLOR: Palette (raw values, do not use directly in UI;
+     use semantic tokens below).
+     ===================================================== */
+
+  /* Paper: warm neutrals, slightly desaturated. The system's
+     default canvas. Avoids the sterile "pure white SaaS" look. */
+  --paper-50:  #FAF8F3;   /* page background, default */
+  --paper-100: #F4F1EA;   /* sunken surfaces, table stripe */
+  --paper-200: #ECE7DC;   /* dividers on paper */
+  --paper-300: #D9D2C2;   /* heavier border on paper */
+
+  /* Ink: deep, slightly warm slate. Foreground text. */
+  --ink-50:   #6E6F73;    /* muted / metadata */
+  --ink-100:  #4A4B50;    /* secondary text */
+  --ink-200:  #2C2E33;    /* primary text */
+  --ink-300:  #15171B;    /* high-emphasis, button bg */
+  --ink-400:  #0A0B0E;    /* pure ink, used rarely */
+
+  /* Slate: cool neutral, for dark mode and data chrome. */
+  --slate-50:  #E7EAEF;
+  --slate-100: #B8BEC8;
+  --slate-200: #6B7280;
+  --slate-300: #3F4651;
+  --slate-400: #262A31;
+  --slate-500: #1A1D22;
+  --slate-600: #131519;
+  --slate-700: #0D0F12;
+
+  /* Amber: the brand accent. References Zcash's heritage gold
+     without screaming "crypto coin". Used SPARINGLY: brand mark,
+     the "permanent" / "on-chain" badge, hover edges. Never large
+     fills, never gradients. */
+  --amber-100: #F6E4BD;
+  --amber-200: #ECC677;
+  --amber-300: #D69E37;   /* primary brand amber */
+  --amber-400: #A8771E;   /* hover/pressed amber */
+  --amber-500: #6E4C12;   /* dark-mode amber */
+
+  /* Oxford: deep blue for links and informational state. */
+  --oxford-100: #DCE5F1;
+  --oxford-200: #6B8AB8;
+  --oxford-300: #2C4E80;   /* link, primary action alt */
+  --oxford-400: #1B3258;
+
+  /* Semantic palette: muted, never neon. */
+  --green-100: #DDE9D9;
+  --green-300: #4A7A3A;    /* success */
+  --green-500: #2E4F23;
+
+  --red-100:   #F2DAD4;
+  --red-300:   #A8412A;    /* error / destructive */
+  --red-500:   #6E2616;
+
+  --yellow-100: #F6E4BD;   /* (alias of amber-100) */
+  --yellow-300: #B8841F;   /* warning */
+
+  /* =====================================================
+     SEMANTIC TOKENS: use these in UI.
+     Light theme is default.
+     ===================================================== */
+
+  /* Surfaces */
+  --bg-canvas:    var(--paper-50);   /* page */
+  --bg-surface:   #FFFFFF;            /* card, panel */
+  --bg-sunken:    var(--paper-100);  /* table stripe, input */
+  --bg-inverse:   var(--ink-300);    /* dark callout on light */
+
+  /* Foreground */
+  --fg-1:         var(--ink-300);    /* primary text */
+  --fg-2:         var(--ink-100);    /* secondary text */
+  --fg-3:         var(--ink-50);     /* muted, metadata */
+  --fg-inverse:   var(--paper-50);   /* text on dark */
+  --fg-link:      var(--oxford-300);
+  --fg-brand:     var(--amber-400);  /* brand text, "Z" mark */
+
+  /* Borders */
+  --border-1:     var(--paper-200);  /* subtle dividers */
+  --border-2:     var(--paper-300);  /* card edges, input idle */
+  --border-3:     var(--ink-100);    /* focus, active */
+  --border-strong: var(--ink-300);
+
+  /* Interactive */
+  --action-primary-bg:        var(--ink-300);
+  --action-primary-bg-hover:  var(--ink-400);
+  --action-primary-fg:        var(--paper-50);
+
+  --action-secondary-bg:        #FFFFFF;
+  --action-secondary-bg-hover:  var(--paper-100);
+  --action-secondary-fg:        var(--ink-300);
+  --action-secondary-border:    var(--paper-300);
+
+  --action-brand-bg:        var(--amber-300);
+  --action-brand-bg-hover:  var(--amber-400);
+  --action-brand-fg:        var(--ink-400);
+
+  /* State */
+  --state-success-fg: var(--green-300);
+  --state-success-bg: var(--green-100);
+  --state-warning-fg: var(--yellow-300);
+  --state-warning-bg: var(--amber-100);
+  --state-error-fg:   var(--red-300);
+  --state-error-bg:   var(--red-100);
+  --state-info-fg:    var(--oxford-300);
+  --state-info-bg:    var(--oxford-100);
+
+  /* =====================================================
+     TYPOGRAPHY: families
+     ===================================================== */
+  --font-sans:  "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --font-mono:  "IBM Plex Mono", ui-monospace, SFMono-Regular, "Menlo", monospace;
+  --font-serif: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+
+  /* Type scale: restrained. Built for data density. */
+  --text-2xs:  11px;   /* legends, table caption, micro */
+  --text-xs:   12px;   /* table cells, metadata */
+  --text-sm:   13px;   /* default UI label */
+  --text-md:   14px;   /* default body in app */
+  --text-base: 15px;   /* default body on marketing */
+  --text-lg:   17px;
+  --text-xl:   20px;
+  --text-2xl:  24px;
+  --text-3xl:  30px;
+  --text-4xl:  40px;
+  --text-5xl:  56px;
+  --text-6xl:  72px;   /* hero only */
+
+  --leading-tight:  1.15;
+  --leading-snug:   1.3;
+  --leading-normal: 1.5;
+  --leading-loose:  1.7;
+
+  --tracking-tight:  -0.02em;
+  --tracking-normal: 0;
+  --tracking-wide:   0.04em;
+  --tracking-caps:   0.08em;  /* for ALL-CAPS labels */
+
+  --weight-regular: 400;
+  --weight-medium:  500;
+  --weight-semibold: 600;
+  --weight-bold:    700;
+
+  /* =====================================================
+     SPACING: 4px base
+     ===================================================== */
+  --space-0:  0;
+  --space-1:  2px;
+  --space-2:  4px;
+  --space-3:  8px;
+  --space-4:  12px;
+  --space-5:  16px;
+  --space-6:  20px;
+  --space-7:  24px;
+  --space-8:  32px;
+  --space-9:  40px;
+  --space-10: 48px;
+  --space-11: 64px;
+  --space-12: 96px;
+  --space-13: 128px;
+
+  /* =====================================================
+     RADII: small, precise. Database tools, not toys.
+     ===================================================== */
+  --radius-none: 0;
+  --radius-xs:   2px;     /* inputs, cells */
+  --radius-sm:   4px;     /* buttons, badges */
+  --radius-md:   6px;     /* cards, panels */
+  --radius-lg:   8px;     /* modal, sheet */
+  --radius-pill: 999px;
+
+  /* =====================================================
+     ELEVATION: minimal. Borders do most of the work.
+     ===================================================== */
+  --shadow-none: none;
+  --shadow-xs:   0 1px 0 rgba(20, 22, 27, 0.04);
+  --shadow-sm:   0 1px 2px rgba(20, 22, 27, 0.06), 0 1px 1px rgba(20, 22, 27, 0.04);
+  --shadow-md:   0 4px 12px rgba(20, 22, 27, 0.08), 0 1px 2px rgba(20, 22, 27, 0.04);
+  --shadow-lg:   0 12px 32px rgba(20, 22, 27, 0.12), 0 2px 6px rgba(20, 22, 27, 0.06);
+  --shadow-overlay: 0 24px 64px rgba(10, 11, 14, 0.24);
+
+  --ring-focus: 0 0 0 2px rgba(44, 78, 128, 0.18);  /* oxford focus ring */
+  --ring-brand: 0 0 0 3px rgba(214, 158, 55, 0.28);
+
+  /* =====================================================
+     MOTION: short, ease-out. No bounces.
+     ===================================================== */
+  --duration-fast:   100ms;
+  --duration-normal: 160ms;
+  --duration-slow:   240ms;
+  --ease-out:        cubic-bezier(0.16, 1, 0.3, 1);
+  --ease-in-out:     cubic-bezier(0.4, 0, 0.2, 1);
+
+  /* =====================================================
+     LAYOUT
+     ===================================================== */
+  --container-max:    1280px;
+  --container-narrow: 760px;
+  --sidebar-w:        260px;
+  --topbar-h:         44px;
+  --statusbar-h:      28px;
+}
+
+/* =====================================================
+   DARK THEME: for the app's "dark" mode. Cool slate,
+   not pitch black. Familiar to TablePlus / VSCode users.
+   ===================================================== */
+:root[data-theme="dark"] {
+  --bg-canvas:    var(--slate-600);
+  --bg-surface:   var(--slate-500);
+  --bg-sunken:    var(--slate-700);
+  --bg-inverse:   var(--paper-50);
+
+  --fg-1:         #ECEEF2;
+  --fg-2:         var(--slate-100);
+  --fg-3:         var(--slate-200);
+  --fg-inverse:   var(--ink-300);
+  --fg-link:      #8BAEDD;
+  --fg-brand:     var(--amber-300);
+
+  --border-1:     var(--slate-400);
+  --border-2:     var(--slate-300);
+  --border-3:     var(--slate-100);
+  --border-strong: var(--paper-50);
+
+  --action-primary-bg:        var(--amber-300);
+  --action-primary-bg-hover:  var(--amber-200);
+  --action-primary-fg:        var(--ink-400);
+
+  --action-secondary-bg:        var(--slate-400);
+  --action-secondary-bg-hover:  var(--slate-300);
+  --action-secondary-fg:        #ECEEF2;
+  --action-secondary-border:    var(--slate-300);
+
+  --shadow-sm:   0 1px 2px rgba(0,0,0,0.4);
+  --shadow-md:   0 4px 12px rgba(0,0,0,0.5);
+  --shadow-lg:   0 12px 32px rgba(0,0,0,0.6);
+}
+
+/* =====================================================
+   SEMANTIC ELEMENT STYLES: opinionated defaults.
+   Apply by giving an element class="h1", class="body", etc.
+   ===================================================== */
+.h-display {
+  font-family: var(--font-serif);
+  font-weight: var(--weight-medium);
+  font-size:   var(--text-6xl);
+  line-height: var(--leading-tight);
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-1);
+}
+.h1 {
+  font-family: var(--font-sans);
+  font-weight: var(--weight-semibold);
+  font-size:   var(--text-4xl);
+  line-height: var(--leading-tight);
+  letter-spacing: var(--tracking-tight);
+  color: var(--fg-1);
+}
+.h2 {
+  font-family: var(--font-sans);
+  font-weight: var(--weight-semibold);
+  font-size:   var(--text-2xl);
+  line-height: var(--leading-snug);
+  letter-spacing: -0.01em;
+  color: var(--fg-1);
+}
+.h3 {
+  font-family: var(--font-sans);
+  font-weight: var(--weight-semibold);
+  font-size:   var(--text-lg);
+  line-height: var(--leading-snug);
+  color: var(--fg-1);
+}
+.eyebrow {
+  font-family: var(--font-mono);
+  font-weight: var(--weight-medium);
+  font-size:   var(--text-2xs);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-caps);
+  color: var(--fg-3);
+}
+.body {
+  font-family: var(--font-sans);
+  font-weight: var(--weight-regular);
+  font-size:   var(--text-base);
+  line-height: var(--leading-normal);
+  color: var(--fg-2);
+}
+.body-sm {
+  font-family: var(--font-sans);
+  font-size:   var(--text-sm);
+  line-height: var(--leading-normal);
+  color: var(--fg-2);
+}
+.ui-label {
+  font-family: var(--font-sans);
+  font-weight: var(--weight-medium);
+  font-size:   var(--text-sm);
+  color: var(--fg-1);
+}
+.metadata {
+  font-family: var(--font-mono);
+  font-size:   var(--text-xs);
+  color: var(--fg-3);
+}
+.code,
+code {
+  font-family: var(--font-mono);
+  font-size:   0.92em;
+  color: var(--fg-1);
+  background: var(--bg-sunken);
+  padding: 1px 5px;
+  border-radius: var(--radius-xs);
+  border: 1px solid var(--border-1);
+}
+.data-key {       /* the "K" in K-V displays */
+  font-family: var(--font-mono);
+  font-weight: var(--weight-medium);
+  font-size:   var(--text-sm);
+  color: var(--amber-400);
+}
+.data-value {     /* the "V" */
+  font-family: var(--font-mono);
+  font-size:   var(--text-sm);
+  color: var(--fg-1);
+}
+
+/* Base reset of common selectors so demos look right */
+body {
+  font-family: var(--font-sans);
+  color: var(--fg-1);
+  background: var(--bg-canvas);
+  font-size: var(--text-base);
+  line-height: var(--leading-normal);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  margin: 0;
+}
+* { box-sizing: border-box; }
+a { color: var(--fg-link); text-decoration: underline; text-underline-offset: 2px; }
+a:hover { text-decoration-thickness: 2px; }

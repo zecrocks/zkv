@@ -1,0 +1,37 @@
+[package]
+name = "zkv-version-oracle"
+version = "0.0.1"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "Polls Docker Hub for project release tags and publishes latest/stable versions into a zkv database."
+publish = false
+
+[[bin]]
+name = "zkv-version-oracle"
+path = "src/main.rs"
+
+[dependencies]
+zkv = { path = "../zkv", version = "0.0.1-rc1" }
+
+anyhow = "1"
+clap = { version = "4.5", features = ["derive", "string"] }
+semver = "1"
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+tokio = { version = "1.21", features = ["rt-multi-thread", "macros", "signal", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+# Docker Hub HTTP client. We deliberately reuse the rustls + ring +
+# webpki-roots TLS stack already pulled in for lightwalletd, rather than
+# native-tls/OpenSSL or aws-lc-rs. reqwest 0.13's `rustls` feature would pull
+# aws-lc-rs (needs a C/cmake build); `rustls-no-provider` lets us install the
+# ring provider ourselves (see `dockerhub::build_client`). `json` pulls
+# `serde_json` transitively for response decoding.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "json"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+
+[dev-dependencies]
+# Only for the offline Docker Hub JSON-fixture parse test.
+serde_json = "1"

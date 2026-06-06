@@ -1,0 +1,35 @@
+{
+  // Type-check only. esbuild owns transpilation (see
+  // scripts/build-gui-assets.sh); `tsc --noEmit` is the linter.
+  //
+  // The frontend runs as CLASSIC SCRIPTS, not ES modules: React/ReactDOM/
+  // Lucide are vendored globals, each source file's top-level `const Foo`
+  // is a real global assigned to `window.Foo`, and other files consume it
+  // bare (`<Foo>`). To preserve that, every .ts/.tsx source must stay a
+  // script (NO top-level import/export) so its declarations merge with the
+  // ambient globals in types/*.d.ts. `module: none` + `moduleDetection:
+  // legacy` keep tsc from silently treating a source file as a module.
+  "compilerOptions": {
+    "target": "es2020",
+    "module": "none",
+    "moduleDetection": "legacy",
+    "lib": ["es2020", "dom", "dom.iterable"],
+    "jsx": "react",
+    "jsxFactory": "React.createElement",
+    "jsxFragmentFactory": "React.Fragment",
+    "skipLibCheck": true,
+    "noEmit": true,
+    "forceConsistentCasingInFileNames": true,
+    // Full `strict` is on: strictNullChecks, noImplicitAny,
+    // useUnknownInCatchVariables, and the rest of the strict family. Every
+    // component prop, handler param, and catch variable is typed.
+    "strict": true,
+    // ...except `alwaysStrict`, which only governs emit/parse, not type
+    // safety. esbuild reads it from tsconfig and would prepend `"use strict";`
+    // to every generated classic script, drifting the committed JS the CI
+    // guard checks. Turning it off keeps the emitted JS byte-identical while
+    // retaining every type-checking strict flag.
+    "alwaysStrict": false
+  },
+  "include": ["src/**/*.ts", "src/**/*.tsx", "types/**/*.d.ts"]
+}

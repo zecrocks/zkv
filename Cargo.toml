@@ -1,129 +1,65 @@
 [package]
-name = "zcash-devtool"
-version = "0.1.0"
+name = "zkv-workspace-tests"
+version = "0.0.0"
 edition = "2021"
-rust-version = "1.81"
-license = "MIT OR Apache-2.0"
 publish = false
+# This root package exists only to host the workspace-level integration
+# test at `tests/address_validation.rs`, which is intentionally an
+# *external* consumer of the `zkv` crate's public surface. No [lib] /
+# [[bin]] targets.
 
-[dependencies]
+[[test]]
+name = "address_validation"
+path = "tests/address_validation.rs"
+
+[[test]]
+name = "facade_smoke"
+path = "tests/facade_smoke.rs"
+
+[[test]]
+name = "gui_forget"
+path = "tests/gui_forget.rs"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+zkv = { workspace = true }
+
+[profile.release]
+strip = true
+
+[workspace]
+resolver = "2"
+members = ["crates/zkv", "crates/zkv-oracle", "crates/zkv-version-oracle"]
+
+[workspace.dependencies]
+# Internal crate (path resolved relative to the workspace root, so the faucet
+# and these root tests reference it identically).
+zkv = { path = "crates/zkv", version = "0.0.1-rc1" }
+
+# Shared third-party deps. Versions live here so the member crates (and the
+# workspace-root integration tests) can't drift; per-crate feature sets and
+# `optional` / `default-features` stay on the member declaration.
 anyhow = "1"
-bip0039 = { version = "0.12", features = ["std", "all-languages"] }
-bip32 = { version = "=0.6.0-pre.1", default-features = false, features = ["secp256k1-ffi"] }
-futures-util = "0.3"
+clap = { version = "4.5", features = ["derive", "string"] }
 hex = "0.4"
-jubjub = "0.10"
-nonempty = { version = "0.11", default-features = false }
-prost = "0.14"
-rayon = "1.7"
-ripemd = "0.1"
-rusqlite = { version = "0.37", features = ["time"] }
-schemerz = "0.2"
-secp256k1 = { version = "0.29", features = ["serde"] }
-secrecy = "0.8"
-serde = "1.0"
-time = "0.3"
-tokio = { version = "1.21.0", features = ["fs", "io-std", "macros", "rt-multi-thread", "signal"] }
-tokio-socks = "0.5"
-toml = "0.8"
-tonic = { version = "0.14", features = ["gzip", "tls-webpki-roots"] }
+rand = { version = "0.8", default-features = false }
+rusqlite = { version = "0.37", features = ["time", "uuid"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tokio = { version = "1.21" }
 tower = { version = "0.5", features = ["util"] }
-hyper-util = { version = "0.1", features = ["tokio"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-uuid = "1"
+axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "json"] }
 
-# Zcash
-orchard = { version = "0.12", default-features = false }
-pczt = "0.5"
-sapling = { package = "sapling-crypto", version = "0.6" }
-transparent = { package = "zcash_transparent", version = "0.6", features = ["test-dependencies"] }
-zcash_address = "0.10"
-zcash_client_backend = { version = "0.21", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt", "tor"] }
-zcash_client_sqlite = { version = "0.19", features = ["unstable", "orchard", "serde"] }
-zcash_keys = { version = "0.12", features = ["orchard", "unstable", "unstable-frost"] }
-zcash_primitives = "0.26"
-zcash_proofs = { version = "0.26", features = ["bundled-prover"] }
-zcash_protocol = { version = "0.7", features = ["local-consensus"] }
-zcash_script = "0.4"
+# Zcash ecosystem: version-locked as a set.
+transparent = { package = "zcash_transparent", version = "0.8" }
+zcash_address = "0.12"
+zcash_client_backend = { version = "0.23", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt"] }
+zcash_client_sqlite = { version = "0.21", features = ["unstable", "orchard", "serde"] }
+zcash_keys = { version = "0.14", features = ["orchard", "unstable"] }
+zcash_primitives = "0.28"
+zcash_protocol = { version = "0.9", features = ["local-consensus"] }
 zip32 = "0.2"
-zip321 = "0.6"
-
-# CLI
-clap = { version = "4.5", features = ["derive", "string", "unstable-styles"] }
-
-# CSPRNG
-rand = { version = "0.8", default-features = false }
-
-# Seed encryption
-age = { version = "0.11", features = ["armor", "plugin"] }
-chrono = "0.4"
-rpassword = "7"
-
-# Currency conversion
-iso_currency = { version = "0.5", features = ["with-serde"] }
-rust_decimal = "1"
-
-# Inspect
-bech32 = "0.11"
-bellman = "0.14"
-blake2b_simd = "1"
-bs58 = "0.5"
-ed25519-zebra = "4"
-equihash = "0.2"
-group = "0.13"
-lazy_static = "1"
-serde_json = "1"
-sha2 = "0.10"
-uint = "0.9"
-zcash_encoding = "0.3"
-zcash_note_encryption = "0.4.1"
-
-# PCZT QR codes
-image = { version = "0.25", optional = true }
-minicbor = { version = "0.19", optional = true }
-nokhwa = { version = "0.10", optional = true, features = ["input-native"] }
-qrcode = { version = "0.14", optional = true, default-features = false }
-rqrr = { version = "0.9", optional = true }
-ur = { version = "0.4", optional = true }
-
-# Tree exploration
-incrementalmerkletree = "0.8"
-shardtree = "0.6"
-
-# TUI
-crossterm = { version = "0.28", optional = true, features = ["event-stream"] }
-ratatui = { version = "0.29", optional = true }
-roaring = { version = "0.11", optional = true }
-tokio-util = { version = "0.7", optional = true }
-tui-logger = { version = "0.17", optional = true, features = ["tracing-support"] }
-
-[features]
-default = ["transparent-inputs"]
-qr = ["dep:qrcode"]
-pczt-qr = ["dep:image", "dep:minicbor", "dep:nokhwa", "dep:qrcode", "dep:rqrr", "dep:ur"]
-transparent-inputs = [
-    "zcash_client_sqlite/transparent-inputs",
-]
-tui = [
-    "dep:crossterm",
-    "dep:ratatui",
-    "dep:roaring",
-    "dep:tokio-util",
-    "dep:tui-logger",
-]
-
-[patch.crates-io]
-equihash = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-f4jumble = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-pczt = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-transparent = { package = "zcash_transparent", git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-zcash_address = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
-zip321 = { git = "https://github.com/zcash/librustzcash.git", rev = "77c422f1bd56400c9647f089c87f3776e16fd212" }
+zip321 = "0.8"

@@ -1,0 +1,422 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>z:kv, a key-value database on Zcash</title>
+  <meta name="description" content="A key-value store backed by Zcash shielded memos. Anyone with the address can read; only authorized keys can write." />
+  <meta property="og:title" content="z:kv, a key-value database on Zcash" />
+  <meta property="og:description" content="A key-value store whose entries are signed Zcash shielded memos. The chain is the source of truth." />
+  <meta property="og:type" content="website" />
+  <link rel="icon" href="assets/logo-mark.svg" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <!-- ============================ TOP BAR ============================ -->
+  <header class="topbar">
+    <a class="brand" href="#top">
+      <img src="assets/logo-mark.svg" width="24" height="24" alt="zkv" />
+      <span class="wordmark"><span>z</span><span class="colon">:</span><span>kv</span></span>
+    </a>
+    <nav class="topnav">
+      <a href="#download">Download</a>
+      <a href="#screenshots">Screenshots</a>
+      <a href="#reference">Reference</a>
+      <a href="#opcodes">Opcodes</a>
+      <a href="#faq">FAQ</a>
+      <a class="ext" href="https://github.com/zecrocks/zkv">GitHub ↗</a>
+    </nav>
+  </header>
+
+  <!-- ============================ HERO / WELCOME ============================ -->
+  <section class="hero" id="top">
+    <div class="hero-grid">
+      <div class="hero-left">
+        <span class="eyebrow">Alpha · for testing, not production</span>
+        <h1 class="hero-title">A key-value database on Zcash.</h1>
+        <p class="hero-lede">
+          <strong>z:kv</strong> stores key-value pairs as signed shielded memos on
+          Zcash. Anyone with the <code>zkv1…</code> address can read; only authorized
+          keys can write. Great for feature flags, price oracles, and other small
+          public data.
+        </p>
+        <div class="hero-cta">
+          <a class="btn primary" href="#download">Download z:kv</a>
+          <a class="btn secondary" href="#reference">Read the reference</a>
+          <!-- Replace the href below with the specific Zcash forum thread once published. -->
+          <a class="btn ghost" href="https://forum.zcashcommunity.com/" rel="noopener">
+            Zcash Forum announcement ↗
+          </a>
+        </div>
+        <p class="hero-foot">
+          <code>github.com/zecrocks/zkv</code> · MIT / Apache-2.0
+        </p>
+      </div>
+
+      <div class="hero-right">
+        <div class="terminal">
+          <div class="terminal-bar">
+            <span class="tl-dot"></span><span class="tl-dot"></span><span class="tl-dot"></span>
+            <span class="tl-title">~/projects/zcash-oracle</span>
+          </div>
+          <div class="terminal-body" id="term">
+<div><span class="prompt">$ </span><span class="cmd">zkv init</span></div>
+<div class="out">Creating mainnet zkv database "default"</div>
+<div class="out">&nbsp;</div>
+<div class="dim">Recovery phrase. Write these 24 words down NOW.</div>
+<div class="out">&nbsp;</div>
+<div class="out">&nbsp;&nbsp;wisdom fabric essence bottom luxury tower</div>
+<div class="out">&nbsp;&nbsp;arrest quick ozone raccoon defy spy …</div>
+<div class="out">&nbsp;</div>
+<div class="ok">✓ Created database "default" (mainnet, birthday 3338983)</div>
+<div class="out">&nbsp;</div>
+<div><span class="prompt">$ </span><span class="cmd">zkv set zec_usd_price 1008.33</span></div>
+<div class="ok">✓ broadcast tx 96feedf9…584166214</div>
+<div class="out">&nbsp;</div>
+<div><span class="prompt">$ </span><span class="cmd">zkv get zec_usd_price</span></div>
+<div class="out">zec_usd_price = 1008.33</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ DOWNLOAD ============================ -->
+  <section class="section" id="download">
+    <div class="wrap">
+      <h2 class="sec-h">Download</h2>
+      <p class="sec-lede">
+        Desktop browser and CLI binaries, published on GitHub Releases.
+      </p>
+
+      <div class="dl-grid">
+        <a class="dl-card" href="https://github.com/zecrocks/zkv/releases">
+          <div class="dl-os">Linux</div>
+          <div class="dl-sub">x86_64 / arm64</div>
+          <div class="dl-note">v0.0.1-rc1</div>
+        </a>
+        <a class="dl-card" href="https://github.com/zecrocks/zkv/releases">
+          <div class="dl-os">macOS</div>
+          <div class="dl-sub">Apple Silicon</div>
+          <div class="dl-note">v0.0.1-rc1</div>
+        </a>
+        <a class="dl-card" href="https://github.com/zecrocks/zkv/releases">
+          <div class="dl-os">Windows</div>
+          <div class="dl-sub">x64</div>
+          <div class="dl-note">v0.0.1-rc1</div>
+        </a>
+      </div>
+
+      <p class="sec-note">
+        Builds aren't code-signed yet, so macOS Gatekeeper and Windows SmartScreen
+        will warn on first launch. The
+        <a href="https://github.com/zecrocks/zkv#install">install guide</a> covers
+        building from source.
+      </p>
+    </div>
+  </section>
+
+  <!-- ============================ SCREENSHOTS ============================ -->
+  <section class="section" id="screenshots">
+    <div class="wrap">
+      <h2 class="sec-h">Screenshots</h2>
+      <p class="sec-lede">The z:kv desktop browser. Click any image to enlarge.</p>
+      <div class="shot-grid">
+        <button class="shot" type="button" data-full="assets/screenshots/screenshot-1.png">
+          <img src="assets/screenshots/screenshot-1.png" alt="z:kv Browser: Funding tab showing a confirmed deposit" loading="lazy" onerror="this.closest('.shot').classList.add('empty')" />
+          <span class="shot-ph">Screenshot 1</span>
+        </button>
+        <button class="shot" type="button" data-full="assets/screenshots/screenshot-2.png">
+          <img src="assets/screenshots/screenshot-2.png" alt="z:kv Browser: Rejections tab showing a dropped INIT memo" loading="lazy" onerror="this.closest('.shot').classList.add('empty')" />
+          <span class="shot-ph">Screenshot 2</span>
+        </button>
+        <button class="shot" type="button" data-full="assets/screenshots/screenshot-3.png">
+          <img src="assets/screenshots/screenshot-3.png" alt="z:kv Browser: History tab showing a signed SET write" loading="lazy" onerror="this.closest('.shot').classList.add('empty')" />
+          <span class="shot-ph">Screenshot 3</span>
+        </button>
+        <button class="shot" type="button" data-full="assets/screenshots/screenshot-4.png">
+          <img src="assets/screenshots/screenshot-4.png" alt="z:kv Browser: Browse tab showing a key's current value" loading="lazy" onerror="this.closest('.shot').classList.add('empty')" />
+          <span class="shot-ph">Screenshot 4</span>
+        </button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Lightbox modal for screenshots -->
+  <div class="modal" id="shot-modal" hidden>
+    <button class="modal-close" type="button" aria-label="Close">&times;</button>
+    <img class="modal-img" id="shot-modal-img" src="" alt="" />
+  </div>
+
+  <!-- ============================ REFERENCE ============================ -->
+  <section class="section alt" id="reference">
+    <div class="wrap">
+      <h2 class="sec-h">Reference</h2>
+      <p class="sec-lede">
+        A zkv database is a key-value store whose entries are signed Zcash shielded
+        memos. The chain is the source of truth; everything on disk is a rebuildable
+        cache.
+      </p>
+
+      <!-- DESIGN -->
+      <article class="doc" id="design">
+        <h3 class="doc-h">Design</h3>
+        <p>
+          zkv stores a key-value log entirely on the Zcash blockchain. There is no
+          separate database server; readers reconstruct state by scanning the chain
+          with a viewing key and replaying the signed memos.
+        </p>
+        <h4 class="doc-sub">Chain as the source of truth</h4>
+        <p>
+          A "database" is a Unified Full Viewing Key plus a birthday height, living in
+          a single shielded pool (Orchard by default, or Sapling). A write is a
+          zero-value shielded output to the database's own address carrying a
+          <code>Memo::Text</code> that begins with the wire magic <code>ZKV1</code>.
+          Same-block ordering is <code>(mined_height, txid, output_index)</code>; last
+          write wins.
+        </p>
+        <pre class="wire">ZKV1 SET zec_usd_price 1008.33
+0285d48bd429fd9382bb54145ce66107c8faee6fb38c4e55fccb8d44f9c0bd542d…</pre>
+        <h4 class="doc-sub">Snapshot + tail replay</h4>
+        <p>
+          Scanning every memo on every read would be O(total writes). Instead a local
+          <code>zkv_state.sqlite</code> snapshot holds the projection of memos buried
+          past a reorg-safe depth (100 blocks); only the recent live tail is
+          re-verified in memory per read. The snapshot is a cache, safe to delete; it
+          rebuilds on the next read.
+        </p>
+        <h4 class="doc-sub">Recoverable signatures</h4>
+        <p>
+          Each write carries a 65-byte recoverable ECDSA signature, so the reader
+          recovers the signer's pubkey from the signature itself; the memo carries no
+          pubkey field. That's what lets a database have many authorized writers
+          without growing the wire format.
+        </p>
+        <h4 class="doc-sub">Receiver-binding &amp; replay protection</h4>
+        <p>
+          Signatures commit to the database's <em>receiver</em> (derived from the
+          viewing key) and a network tag, not the address text, so a memo signed for
+          one database, or one network, can never verify against another. Each key and
+          management target carries a tombstone-surviving high-water counter folded
+          into the signing domain, so a verbatim re-broadcast is dropped as
+          <code>StaleVersion</code> and can't revert a value or resurrect a deleted key.
+        </p>
+        <h4 class="doc-sub">Owners and writers</h4>
+        <p>
+          The root (UFVK-derived) key becomes owner #1 when INIT confirms, and is the
+          permanent <em>creator</em>. Owners may write anything and manage the
+          registry; writers are limited to a scope of CREATE / UPDATE / DESTROY.
+          Authorization is enforced identically by every reader (it's just replay), so
+          it holds with no central server. An owner can <code>FINALIZE</code> the
+          database, a one-way latch that seals it permanently.
+        </p>
+        <p class="callout">
+          <strong>Privacy caveat:</strong> the address <em>is</em> a viewing key.
+          Everyone you share it with can read all values, forever, with no forward
+          secrecy. Don't put secrets in it; it's a public, auditable KV log.
+        </p>
+      </article>
+
+      <!-- IDENTIFIERS -->
+      <article class="doc" id="identifiers">
+        <h3 class="doc-h">Identifiers</h3>
+        <p>
+          Every identifier is a self-describing, checksummed Bech32m token; a mistyped
+          character fails the checksum rather than denoting a different thing.
+        </p>
+        <dl class="idlist">
+          <dt><code>zkv1…</code>: the database identity</dt>
+          <dd>The Unified Full Viewing Key (transparent + one shielded pool) plus a private-use <em>zkv-meta</em> item holding the 4-byte birthday, under a <code>zkv</code> HRP. <code>zkvtest1…</code> / <code>zkvregtest1…</code> on other networks; the network is recoverable from the prefix alone.</dd>
+          <dt><code>uview…</code>: the same key, relabeled</dt>
+          <dd>A zkv address is just a viewing key under a different HRP, so it relabels to a standard <code>uview…</code> that pastes into any wallet (Zashi / Ywallet / zcashd) to view the raw memos.</dd>
+          <dt><code>zkvid1…</code>: a signer pubkey</dt>
+          <dd>The canonical Bech32m encoding of a secp256k1 public key. This is what the owner/writer registry keys on, what management memos carry, and what signatures commit to.</dd>
+        </dl>
+      </article>
+    </div>
+  </section>
+
+  <!-- ============================ OPCODES ============================ -->
+  <section class="section" id="opcodes">
+    <div class="wrap">
+      <h2 class="sec-h">Opcodes</h2>
+      <p class="sec-lede">
+        Every write is a <code>ZKV1</code> memo. The signature line is
+        <code>[seq]&lt;130 hex chars, a 65-byte recoverable ECDSA signature&gt;</code>;
+        the optional <code>[seq]</code> prefix carries replay-protection state.
+        Unauthorized and stale writes are <em>silently dropped</em> on replay.
+      </p>
+
+      <div class="op-grid">
+        <div class="op"><div class="op-head"><span class="op-name">SET</span><span class="tag data">Data</span></div><p>Set a key to a value (compact single-line form).</p><pre class="wire">ZKV1 SET &lt;key&gt; &lt;value&gt;
+[seq]&lt;sig&gt;</pre><p class="op-auth">Owner, or a writer scoped CREATE / UPDATE.</p></div>
+
+        <div class="op"><div class="op-head"><span class="op-name">SETL</span><span class="tag data">Data</span></div><p>Length-framed set for empty, multi-line, or binary values.</p><pre class="wire">ZKV1 SETL &lt;key&gt; &lt;byte_len&gt;
+&lt;value, exactly byte_len bytes&gt;
+[seq]&lt;sig&gt;</pre><p class="op-auth">Owner, or a writer scoped CREATE / UPDATE.</p></div>
+
+        <div class="op"><div class="op-head"><span class="op-name">DEL</span><span class="tag data">Data</span></div><p>Tombstone a key. The version counter survives the delete.</p><pre class="wire">ZKV1 DEL &lt;key&gt;
+[seq]&lt;sig&gt;</pre><p class="op-auth">Owner, or a writer scoped DESTROY.</p></div>
+
+        <div class="op"><div class="op-head"><span class="op-name">INIT</span><span class="tag life">Lifecycle</span></div><p>Bootstrap the database. Root-signed, first-valid-wins.</p><pre class="wire">ZKV1 INIT &lt;zkv_addr&gt;
+&lt;sig&gt;</pre><p class="op-auth">The root (UFVK-derived) key only; becomes owner #1 / creator.</p></div>
+
+        <div class="op"><div class="op-head"><span class="op-name">OWNERSET</span><span class="tag mgmt">Management</span></div><p>Grant (or re-affirm) owner authority.</p><pre class="wire">ZKV1 OWNERSET &lt;pubkey&gt;
+[seq]&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
+
+        <div class="op"><div class="op-head"><span class="op-name">OWNERDEL</span><span class="tag mgmt">Management</span></div><p>Revoke owner authority. The last owner can't be removed.</p><pre class="wire">ZKV1 OWNERDEL &lt;pubkey&gt;
+[seq]&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
+
+        <div class="op"><div class="op-head"><span class="op-name">WRITERSET</span><span class="tag mgmt">Management</span></div><p>Grant (or overwrite) a scoped writer. Scope ⊆ CREATE,UPDATE,DESTROY.</p><pre class="wire">ZKV1 WRITERSET &lt;pubkey&gt; &lt;scope&gt;
+[seq]&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
+
+        <div class="op"><div class="op-head"><span class="op-name">WRITERDEL</span><span class="tag mgmt">Management</span></div><p>Revoke a writer entirely (all-or-nothing).</p><pre class="wire">ZKV1 WRITERDEL &lt;pubkey&gt;
+[seq]&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
+
+        <div class="op"><div class="op-head"><span class="op-name">VERSION</span><span class="tag ver">Version</span></div><p>Announce the required client/protocol epoch (forward-compat gate).</p><pre class="wire">ZKV1 VERSION &lt;n&gt; &lt;flags&gt;
+[seq]&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
+
+        <div class="op"><div class="op-head"><span class="op-name">FINALIZE</span><span class="tag life">Lifecycle</span></div><p>Permanently seal the database. A one-way latch.</p><pre class="wire">ZKV1 FINALIZE
+&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ============================ FAQ ============================ -->
+  <section class="section alt" id="faq">
+    <div class="wrap">
+      <h2 class="sec-h">FAQ</h2>
+
+      <div class="faq"><div class="faq-q">Can anyone read my data?</div><p>Yes, if they have your database's <code>zkv1…</code> address. The zkv address is a viewing key, so anyone you share it with can read every value, now and forever. There's no forward secrecy, so don't store secrets.</p></div>
+
+      <div class="faq"><div class="faq-q">Who can write?</div><p>Any authorized signer, broadcasting to the database's address. Owners may write any key; writers act within their CREATE / UPDATE / DESTROY scope. The creator (the root key that signs INIT) is the first authorized signer and becomes owner #1.</p></div>
+
+      <div class="faq"><div class="faq-q">Does each write cost money?</div><p>Yes. Every SET / DEL / INIT / management memo is one Zcash transaction with a ZIP-317 fee, real ZEC on mainnet. Fund the database's funding address first.</p></div>
+
+      <div class="faq"><div class="faq-q">Is there replay protection?</div><p>Yes. Every write to a key carries a version number, and readers only honor the next expected version, so rebroadcasting an old signed memo can't roll a value back or bring a deleted key back; it's recognized as stale and dropped. Your own back-to-back writes to the same key are fine, since the client counts its in-flight writes.</p></div>
+
+      <div class="faq"><div class="faq-q">What's the difference between SET and SETL?</div><p>SET is the compact one-line form; SETL frames the value by byte length so it can be empty, multi-line, or binary. They're semantically identical, but a signature is bound to one opcode string, so they're not interchangeable. The client auto-promotes SET → SETL when needed.</p></div>
+
+      <div class="faq"><div class="faq-q">Can I make a database read-only forever?</div><p>Yes. Broadcast FINALIZE. Once it confirms, the database is permanently sealed: every later write (including another FINALIZE) is dropped. The latch is one-way and can't be undone, so freeze only a finished dataset.</p></div>
+    </div>
+  </section>
+
+  <!-- ============================ FOOTER ============================ -->
+  <footer class="footer">
+    <div class="wrap foot-row">
+      <span class="foot-brand">
+        <img src="assets/logo-mark.svg" width="18" height="18" alt="" />
+        z:kv · alpha · for testing, not ready for production use
+      </span>
+      <span class="foot-links">
+        <a href="https://github.com/zecrocks/zkv">GitHub</a>
+        <!-- Replace with the specific Zcash forum thread once published. -->
+        <a href="https://forum.zcashcommunity.com/">Zcash Forum</a>
+        <a href="#download">Download</a>
+      </span>
+    </div>
+    <div class="wrap foot-built">
+      Built by <a href="https://zec.rocks">Zec.rocks</a>, we &lt;3 Zcash.
+    </div>
+  </footer>
+
+  <script>
+  // ---------- Animated terminal (mirrors the in-app onboarding) ----------
+  (function () {
+    var term = document.getElementById('term');
+    if (!term) return;
+    var reduce = window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (reduce) return; // keep the static fallback content
+
+    // type: prompt = typed command line, others render instantly.
+    var lines = [
+      { t: 'prompt', cmd: 'zkv init' },
+      { t: 'out', text: 'Creating mainnet zkv database "default"' },
+      { t: 'out', text: '' },
+      { t: 'dim', text: 'Recovery phrase. Write these 24 words down NOW.' },
+      { t: 'out', text: '' },
+      { t: 'out', text: '  wisdom fabric essence bottom luxury tower' },
+      { t: 'out', text: '  arrest quick ozone raccoon defy spy …' },
+      { t: 'out', text: '' },
+      { t: 'ok',  text: '✓ Created database "default" (mainnet, birthday 3338983)' },
+      { t: 'out', text: '' },
+      { t: 'prompt', cmd: 'zkv set zec_usd_price 1008.33' },
+      { t: 'ok',  text: '✓ broadcast tx 96feedf9…584166214' },
+      { t: 'out', text: '' },
+      { t: 'prompt', cmd: 'zkv get zec_usd_price' },
+      { t: 'out', text: 'zec_usd_price = 1008.33' },
+    ];
+
+    term.innerHTML = '';
+    var cursor = document.createElement('span');
+    cursor.className = 'cursor';
+
+    function appendOut(l) {
+      var div = document.createElement('div');
+      if (l.t === 'dim') div.className = 'dim';
+      else if (l.t === 'ok') div.className = 'ok';
+      else div.className = 'out';
+      div.innerHTML = (l.text === '' ? '&nbsp;' : escapeHtml(l.text));
+      term.appendChild(div);
+    }
+    function escapeHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    var i = 0;
+    function step() {
+      if (i >= lines.length) { if (cursor.parentNode) cursor.remove(); return; }
+      var l = lines[i];
+      if (l.t === 'prompt') {
+        var div = document.createElement('div');
+        var p = document.createElement('span'); p.className = 'prompt'; p.textContent = '$ ';
+        var c = document.createElement('span'); c.className = 'cmd';
+        div.appendChild(p); div.appendChild(c); div.appendChild(cursor);
+        term.appendChild(div);
+        typeCmd(c, l.cmd, 0, function () { i++; setTimeout(step, 450); });
+      } else {
+        appendOut(l);
+        term.appendChild(cursor);
+        i++;
+        setTimeout(step, l.text === '' ? 90 : 160);
+      }
+    }
+    function typeCmd(el, text, n, done) {
+      if (n > text.length) { done(); return; }
+      el.textContent = text.slice(0, n);
+      setTimeout(function () { typeCmd(el, text, n + 1, done); }, 38);
+    }
+    setTimeout(step, 350);
+  })();
+
+  // ---------- Screenshot lightbox ----------
+  (function () {
+    var modal = document.getElementById('shot-modal');
+    var modalImg = document.getElementById('shot-modal-img');
+    if (!modal) return;
+    function open(src) {
+      modalImg.src = src;
+      modal.hidden = false;
+      document.body.style.overflow = 'hidden';
+    }
+    function close() {
+      modal.hidden = true;
+      modalImg.src = '';
+      document.body.style.overflow = '';
+    }
+    document.querySelectorAll('.shot').forEach(function (btn) {
+      btn.addEventListener('click', function () {
+        if (btn.classList.contains('empty')) return; // no image yet
+        open(btn.getAttribute('data-full'));
+      });
+    });
+    modal.addEventListener('click', function (e) {
+      if (e.target === modal || e.target.classList.contains('modal-close')) close();
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape' && !modal.hidden) close();
+    });
+  })();
+  </script>
+</body>
+</html>

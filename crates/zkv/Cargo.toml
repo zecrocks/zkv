@@ -1,0 +1,150 @@
+[package]
+name = "zkv"
+version = "0.0.1-rc1"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT OR Apache-2.0"
+description = "A Redis-style key-value store backed by Zcash Orchard memos."
+publish = false
+
+[[bin]]
+name = "zkv"
+path = "src/main.rs"
+required-features = ["cli"]
+
+# Native desktop GUI, shipped as its own binary. Skipped on a default build
+# (its `required-features` aren't met); built with `--features desktop`.
+# Needs `cli` too; that's where clap (flag parsing) and the default
+# `tracing` subscriber come from.
+[[bin]]
+name = "zkv-browser"
+path = "src/bin/zkv-browser.rs"
+required-features = ["cli", "desktop"]
+
+[dependencies]
+anyhow = { workspace = true }
+bech32 = "0.11"
+hex = { workspace = true }
+rand = { workspace = true }
+rusqlite = { workspace = true }
+secp256k1 = { version = "0.29", features = ["serde", "recovery"] }
+secrecy = "0.8"
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = "0.10"
+thiserror = "1"
+toml = "0.8"
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Async + network
+futures-util = "0.3"
+hyper-util = { version = "0.1", features = ["tokio"] }
+tokio = { workspace = true, features = ["fs", "io-std", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-socks = "0.5"
+tonic = { version = "0.14", features = ["gzip", "tls-ring", "tls-webpki-roots"] }
+tower = { workspace = true }
+prost = "0.14"
+
+# Key derivation
+bip0039 = { version = "0.12", features = ["std", "all-languages"] }
+bip32 = { version = "=0.6.0-pre.1", default-features = false, features = ["secp256k1-ffi"] }
+ripemd = "0.1"
+nonempty = { version = "0.11", default-features = false }
+
+# Zcash
+orchard = { version = "0.14", default-features = false }
+pczt = "0.7"
+sapling = { package = "sapling-crypto", version = "0.7" }
+transparent = { workspace = true }
+zcash_address = { workspace = true }
+zcash_client_backend = { workspace = true }
+zcash_client_sqlite = { workspace = true }
+zcash_keys = { workspace = true }
+zcash_primitives = { workspace = true }
+zcash_proofs = { version = "0.28", features = ["bundled-prover"] }
+zcash_protocol = { workspace = true }
+zcash_script = "0.4"
+zip32 = { workspace = true }
+zip321 = { workspace = true }
+
+# Wraps the seed mnemonic on disk under the auto-generated age identity
+# (the `security-theater-key` file, legacy name `.id`; internal, the user never
+# sees it). NOTE: not an at-rest security boundary, since the key lives next to
+# the wrapped seed; see crates/zkv/src/config.rs.
+age = { version = "0.11", features = ["armor"] }
+
+# CLI-only deps. Gated behind the `cli` feature so library consumers
+# don't pull in clap or QR-code rendering.
+clap = { workspace = true, optional = true }
+qrcode = { version = "0.14", default-features = false, optional = true }
+terminal_size = { version = "0.4", optional = true }
+
+# GUI-only deps. Gated behind the `gui` feature so library/CLI consumers
+# that don't serve the web UI don't pull axum into their dependency tree.
+# Mirrors the HTTP stack the sibling `zkv-faucet` crate already uses.
+axum = { workspace = true, features = ["query"], optional = true }
+
+# GUI-only. The "Use our faucet" buttons POST to the hosted faucet from the
+# Rust backend (not the SPA), so the request isn't subject to browser CORS and
+# its failures are visible under RUST_LOG. rustls + webpki-roots matches the
+# project's TLS stack (tonic's tls-ring/tls-webpki-roots), avoiding OpenSSL.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots"], optional = true }
+
+# GUI-only. Decompresses the build-time-generated third-party license bundle,
+# which is embedded gzip-compressed (~96% smaller than the raw text) and
+# inflated lazily on first view.
+flate2 = { version = "1", optional = true }
+
+# Desktop-GUI dep. Gated behind the opt-in `desktop` feature so a plain
+# build needs no system webview libraries. The `zkv gui` window is just a
+# Tauri webview pointed at the `gui` feature's localhost server.
+tauri = { version = "2", optional = true }
+# Desktop-GUI native dialogs + external-link opening: the Settings "Save
+# licenses" file picker and the "view on GitHub" link. Only pulled in by
+# the `desktop` feature.
+tauri-plugin-dialog = { version = "2", optional = true }
+tauri-plugin-opener = { version = "2", optional = true }
+
+# Cross-platform advisory file locking (flock / LockFileEx). Used to keep two
+# zkv processes from operating on the same database concurrently. Default
+# `sync` feature only; no async runtime backend.
+fs4 = "1.1.0"
+
+# Logging
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, optional = true }
+
+[features]
+default = ["transparent-inputs", "default-subscriber", "cli", "gui"]
+transparent-inputs = ["zcash_client_sqlite/transparent-inputs"]
+# Adds `db::install_default_subscriber()`, which wires up a stderr
+# `tracing-subscriber` honoring `RUST_LOG`. Disable if your app installs
+# its own subscriber.
+default-subscriber = ["dep:tracing-subscriber"]
+# Required to build the `zkv` binary. Library consumers can disable
+# this (and `default-features = false`) to avoid pulling clap, qrcode,
+# terminal_size, and tracing-subscriber into their dependency tree.
+cli = ["dep:clap", "dep:qrcode", "dep:terminal_size", "default-subscriber"]
+# Enables `zkv::gui::serve` and the `zkv gui` subcommand: a localhost HTTP
+# server that serves the embedded web UI and a JSON API backed by
+# `db::Database`. Pulls in axum + qrcode (for scannable funding-address QR
+# codes rendered server-side). Independent of `cli` at the library level
+# (the `zkv gui` *command* additionally needs `cli`, which the binary always
+# has via `required-features`).
+gui = ["dep:axum", "dep:qrcode", "dep:flate2", "dep:reqwest"]
+# Opt-in (NOT default): enables the native desktop window behind `zkv gui`
+# (a Tauri webview onto the `gui` server). Pulls in `tauri` + `tauri-build`
+# and, on Linux, requires system webview dev libraries to compile
+# (libwebkit2gtk-4.1-dev, libgtk-3-dev, libsoup-3.0-dev, librsvg2-dev, …).
+desktop = ["dep:tauri", "dep:tauri-build", "dep:tauri-plugin-dialog", "dep:tauri-plugin-opener", "gui"]
+
+[build-dependencies]
+# Only compiled when the `desktop` feature is active (see build.rs).
+tauri-build = { version = "2", optional = true }
+# Used by build.rs (under the `gui` feature) to parse Cargo.lock and each
+# dependency's Cargo.toml while generating the third-party license bundle.
+# Non-optional: the build script always links it, and the `gui`-gated code
+# decides whether to use it.
+toml = "0.8"
+# Compresses the generated license bundle before it's embedded (gzip).
+flate2 = "1"

@@ -1,54 +1,131 @@
-name: CI checks
+name: ci
 
-on: [push, pull_request]
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
 
 jobs:
-  build:
-    name: Build on ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
+  ci:
+    name: fmt / clippy / test / deny (${{ matrix.os }})
+    # Linux is the primary target; Windows is exercised too so the
+    # platform-specific paths (data dir -> %APPDATA%, browser launch, the
+    # device-name guard) keep compiling and the tests keep passing there.
+    # The default feature set is used (no `desktop`/Tauri), so Windows needs
+    # no WebView2; just the MSVC toolchain the runner already ships.
     strategy:
+      fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macOS-latest]
-
-    steps:
-      - uses: actions/checkout@v4
-      - name: Build binary
-        run: cargo build
-      - name: Verify working directory is clean
-        run: git diff --exit-code
-
-  build-latest:
-    name: Build latest on ${{ matrix.os }}
+        os: [ubuntu-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    continue-on-error: true
-    strategy:
-      matrix:
-        os: [ubuntu-latest, windows-latest, macOS-latest]
     steps:
-      - uses: actions/checkout@v4
-      - name: Remove lockfile to build with latest dependencies
-        run: rm Cargo.lock
-      - name: Build binary
-        run: cargo build
-      - name: Verify working directory is clean (excluding lockfile)
-        run: git diff --exit-code ':!Cargo.lock'
+      - uses: actions/checkout@v5
 
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: Run Clippy
-        uses: auguwu/clippy-action@1.3.0
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          working-directory: ${{ inputs.target }}
-          deny: warnings
+          components: rustfmt, clippy
 
-  fmt:
-    name: Rustfmt
+      - uses: Swatinem/rust-cache@v2
+
+      # Formatting is host-independent; run it once, on Linux.
+      - name: cargo fmt
+        if: runner.os == 'Linux'
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      # cargo-deny inspects the dependency graph (licenses / advisories /
+      # bans), which is host-independent; run it once, on Linux.
+      - name: install cargo-deny
+        if: runner.os == 'Linux'
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny
+        if: runner.os == 'Linux'
+        run: cargo deny --all-features check
+
+  gui-typecheck:
+    name: gui typecheck (tsc)
+    runs-on: ubuntu-latest
+    # First Node in CI, isolated to its own job so the Rust `ci` job above
+    # stays Node-free (and `cargo build` never needs Node). esbuild only
+    # strips types, so this job is what actually type-checks the web UI.
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: crates/zkv/src/gui/assets/package-lock.json
+
+      - name: install
+        working-directory: crates/zkv/src/gui/assets
+        run: npm ci
+
+      - name: typecheck
+        working-directory: crates/zkv/src/gui/assets
+        run: npm run typecheck
+
+      # Guard the include_bytes! pipeline: the binary embeds the committed
+      # generated JS, so prove it still matches the sources. Regenerate and
+      # fail if anything drifted (i.e. someone edited a source without
+      # re-running scripts/build-gui-assets.sh).
+      - name: verify committed JS is in sync
+        run: |
+          scripts/build-gui-assets.sh
+          git diff --exit-code -- \
+            crates/zkv/src/gui/assets/js \
+            crates/zkv/src/gui/assets/api.js \
+            crates/zkv/src/gui/assets/forms.js
+
+  msrv:
+    name: msrv (1.88)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - name: Check formatting
-        run: cargo fmt --all -- --check
+      - uses: actions/checkout@v5
+
+      # Validates the declared `rust-version = "1.88"`. This is librustzcash's
+      # effective wallet-stack floor: zcash_client_backend's lightwalletd
+      # `tonic` (0.14.6) and zcash_proofs' `home` (0.5.12) both require 1.88, so
+      # any librustzcash wallet consumer needs it too. Default features (so the
+      # `gui`/axum path is included); `desktop`/Tauri is excluded as it needs
+      # system webview libs and isn't built in CI.
+      - uses: dtolnay/rust-toolchain@1.88
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo check
+        run: cargo check --workspace --all-targets
+
+  docs:
+    name: docs (zkv)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Build the `zkv` library docs and fail on any rustdoc warning (broken or
+      # private intra-doc links, bad doc HTML, etc.). Scoped to `zkv` (the
+      # facade + library); the binary-only sibling crates (faucet, oracles) are
+      # not part of the documented public surface. `--no-deps` keeps it to our
+      # own crate. The `gui` module is excluded (it's the web/desktop UI, not
+      # the library API): default features minus `gui`, which also drops the
+      # `desktop`/Tauri path that needs system webview libs.
+      - name: cargo doc
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: cargo doc --no-deps -p zkv --no-default-features --features transparent-inputs,default-subscriber,cli

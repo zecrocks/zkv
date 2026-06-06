@@ -1,0 +1,11 @@
+# Keep the docker build context small. The builder runs `cargo build` fresh,
+# so the host's compiled artifacts and local state are not needed.
+/target
+**/target
+/zec_sqlite_wallet*
+.git
+.env
+tmp-data
+*.tgz
+*.zip
+*.dmg

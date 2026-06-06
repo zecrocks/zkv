@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Merged into the generated bundle Info.plist by the macOS Tauri bundler
+	  (tauri build). The on-disk bundle name stays the filesystem-safe
+	  productName ("zkv" -> zkv.app, what Finder/Applications shows); these
+	  keys give the user-facing brand its colon back in the app switcher, Dock,
+	  and app menu; these surfaces read the display/bundle name, not the file.
+	  Only the desktop release build consumes this; default cargo builds ignore it.
+	-->
+	<key>CFBundleDisplayName</key>
+	<string>z:kv Browser</string>
+	<key>CFBundleName</key>
+	<string>z:kv Browser</string>
+</dict>
+</plist>

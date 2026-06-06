@@ -1,0 +1,39 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>z:kv</title>
+  <link rel="stylesheet" href="/styles.css">
+
+  <!-- Vendored runtime libs (bundled with the binary; no CDN, works offline). -->
+  <script src="/vendor/react.production.min.js"></script>
+  <script src="/vendor/react-dom.production.min.js"></script>
+  <script src="/vendor/lucide.min.js"></script>
+
+  <!-- Per-launch session token, injected by the server. The JSON API
+       rejects any request that doesn't carry it. The nonce matches the
+       per-response Content-Security-Policy so this is the only inline script
+       the browser will run (Tauri rewrites the nonce for the desktop build). -->
+  <script nonce="__ZKV_NONCE__">window.ZKV_TOKEN = "__ZKV_TOKEN__";</script>
+  <script src="/api.js"></script>
+  <!-- Native-desktop feel: kill spellcheck/autocorrect/autocomplete on
+       every field (current and React-mounted later). -->
+  <script src="/forms.js"></script>
+</head>
+<body data-screen-label="ZKV App">
+  <div id="root"></div>
+
+  <!-- Precompiled application (JSX → JS at build time; see
+       scripts/build-gui-assets.sh). Loaded in dependency order. -->
+  <script src="/js/icon.js"></script>
+  <script src="/js/chrome.js"></script>
+  <script src="/js/dashboard.js"></script>
+  <script src="/js/keys.js"></script>
+  <script src="/js/writeflow.js"></script>
+  <script src="/js/flows.js"></script>
+  <script src="/js/discover.js"></script>
+  <script src="/js/reference.js"></script>
+  <script src="/js/app.js"></script>
+</body>
+</html>
