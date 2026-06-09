@@ -224,6 +224,15 @@ code {
 .terminal-body .out { color: var(--slate-100); }
 .terminal-body .dim { color: var(--ink-50); }
 .terminal-body .ok { color: var(--green-300); }
+/* CLI example: real-terminal line spacing. The shared .terminal-body uses
+   white-space: pre-wrap, which renders the newlines *between* the source
+   <div>s as extra blank lines. Switch to normal so each <div> is one line
+   and let the long address wrap. */
+#cli .terminal-body {
+  line-height: 1.45;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
 
 /* ============================ SECTIONS ============================ */
 .section { padding: 72px 0; border-bottom: 1px solid var(--border-1); }

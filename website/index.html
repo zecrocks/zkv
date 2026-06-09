@@ -21,6 +21,7 @@
     <nav class="topnav">
       <a href="#download">Download</a>
       <a href="#screenshots">Screenshots</a>
+      <a href="#cli">CLI</a>
       <a href="#reference">Reference</a>
       <a href="#opcodes">Opcodes</a>
       <a href="#faq">FAQ</a>
@@ -123,15 +124,15 @@
       <p class="sec-lede">The z:kv desktop browser. Click any image to enlarge.</p>
       <div class="shot-grid">
         <button class="shot" type="button" data-full="assets/screenshots/screenshot-1.png">
-          <img src="assets/screenshots/screenshot-1.png" alt="z:kv Browser: Funding tab showing a confirmed deposit" loading="lazy" onerror="this.closest('.shot').classList.add('empty')" />
+          <img src="assets/screenshots/screenshot-1.png" alt="z:kv Browser: Browse tab listing keys with the detail panel for a key's current value" loading="lazy" onerror="this.closest('.shot').classList.add('empty')" />
           <span class="shot-ph">Screenshot 1</span>
         </button>
         <button class="shot" type="button" data-full="assets/screenshots/screenshot-2.png">
-          <img src="assets/screenshots/screenshot-2.png" alt="z:kv Browser: Rejections tab showing a dropped INIT memo" loading="lazy" onerror="this.closest('.shot').classList.add('empty')" />
+          <img src="assets/screenshots/screenshot-2.png" alt="z:kv Browser: Funding tab showing a confirmed deposit" loading="lazy" onerror="this.closest('.shot').classList.add('empty')" />
           <span class="shot-ph">Screenshot 2</span>
         </button>
         <button class="shot" type="button" data-full="assets/screenshots/screenshot-3.png">
-          <img src="assets/screenshots/screenshot-3.png" alt="z:kv Browser: History tab showing a signed SET write" loading="lazy" onerror="this.closest('.shot').classList.add('empty')" />
+          <img src="assets/screenshots/screenshot-3.png" alt="z:kv Browser: Rejections tab showing a dropped INIT memo" loading="lazy" onerror="this.closest('.shot').classList.add('empty')" />
           <span class="shot-ph">Screenshot 3</span>
         </button>
         <button class="shot" type="button" data-full="assets/screenshots/screenshot-4.png">
@@ -147,6 +148,53 @@
     <button class="modal-close" type="button" aria-label="Close">&times;</button>
     <img class="modal-img" id="shot-modal-img" src="" alt="" />
   </div>
+
+  <!-- ============================ CLI EXAMPLE ============================ -->
+  <section class="section alt" id="cli">
+    <div class="wrap">
+      <h2 class="sec-h">CLI Example</h2>
+      <p class="sec-note">
+        <a href="https://github.com/zecrocks/zkv/releases">Download the zkv CLI</a>
+        from the GitHub releases page.
+      </p>
+      <div class="terminal">
+        <div class="terminal-bar">
+          <span class="tl-dot"></span><span class="tl-dot"></span><span class="tl-dot"></span>
+          <span class="tl-title">watch a database</span>
+        </div>
+        <div class="terminal-body">
+<div><span class="prompt">$ </span><span class="cmd">zkv watch zkvtest1sv30yl48750pcp6vvp69gnyuwu3szkh7rd4c2fp697umvqctwushne0upxfz8mx6mutx5gcavuuwxgw72juzv2va3v0rxumgx36gjs0f66almkcwry2gga84w0z0tjdfp43vykckt2qu0nkz5c2c7efedkjddstdrsfzvrlgwtmnnw05v0rk5hng3dq3y3s22y6d5ct00u6g4vrranefw88jpjl9d7a2zfu3nwrxd2zsk4sff4dnx40s92nfx8e7fgr8uctwhgsjs3um4xg5a49ysx6cs3x9ar5vuum0kvdm07q68jnsag0xnaa43kmv7vkm9ek678dvppf2rh8ysafgtr432skfx2ytzwp2txf</span></div>
+<div class="ok">✓ Watching database "watch-st1tvm05" (now current)</div>
+<div class="dim">&nbsp;&nbsp;Syncing from birthday 4055623…&nbsp;&nbsp;<span class="ok">Done.</span></div>
+<div class="dim">&nbsp;&nbsp;Run `zkv get` to fetch state.</div>
+<div class="out">&nbsp;</div>
+<div><span class="prompt">$ </span><span class="cmd">zkv get</span></div>
+<div class="dim"># Database: watch-st1tvm05 (watch, testnet, sapling)</div>
+<div class="out">announce/0 = Governance polls are open, check the forum to participate.</div>
+<div class="out">feat/enable_flexa = 1</div>
+<div class="out">feat/enable_maya = 0</div>
+<div class="out">feat/enable_near = 1</div>
+<div class="out">feat/enable_orchard = 1</div>
+<div class="out">ios/latest_version = 3.5.3</div>
+<div class="out">ios/minimum_version = 3.5.0</div>
+<div class="out">servers/st/0 = eu.zec.stardust.rest:443</div>
+<div class="out">servers/st/1 = us.zec.stardust.rest:443</div>
+<div class="out">servers/zr/0 = zec.rocks:443</div>
+<div class="out">servers/zr/1 = eu.zec.rocks:443</div>
+<div class="out">servers/zr/2 = na.zec.rocks:443</div>
+<div class="out">servers/zr/3 = sa.zec.rocks:443</div>
+<div class="out">servers/zr/4 = ap.zec.rocks:443</div>
+<div class="out">servers/zr/tor/0 = vzzwzsmru5ybxkfqxefojbmkh5gefzeixvquyonleujiemhr3dypzoid.onion:443</div>
+<div class="out">servers/zr/tor/1 = kxn4wla7i4rczcpn7ljbtmtq4gd4xhtx6f6hxpze7qbfmu66atwsneqd.onion:443</div>
+<div class="out">&nbsp;</div>
+<div><span class="prompt">$ </span><span class="cmd">zkv set prices/zec_usd 1088.31</span></div>
+<div>→ <span class="cmd">SET</span> prices/zec_usd&nbsp;&nbsp;<span class="dim">broadcasting…</span></div>
+<div class="ok">✓ broadcast tx 9f7089c6…56d4df294</div>
+<div class="out">9f7089c6f9c5222eee213724c9d516a8828f69a3e24fcec4e4025cf56d4df294</div>
+        </div>
+      </div>
+    </div>
+  </section>
 
   <!-- ============================ REFERENCE ============================ -->
   <section class="section alt" id="reference">
