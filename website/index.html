@@ -219,11 +219,11 @@
           A "database" is a Unified Full Viewing Key plus a birthday height, living in
           a single shielded pool (Orchard by default, or Sapling). A write is a
           zero-value shielded output to the database's own address carrying a
-          <code>Memo::Text</code> that begins with the wire magic <code>ZKV1</code>.
+          <code>Memo::Text</code> that begins with the wire magic <code>ZKV0</code>.
           Same-block ordering is <code>(mined_height, txid, output_index)</code>; last
           write wins.
         </p>
-        <pre class="wire">ZKV1 SET zec_usd_price 1008.33
+        <pre class="wire">ZKV0 SET zec_usd_price 1008.33
 0285d48bd429fd9382bb54145ce66107c8faee6fb38c4e55fccb8d44f9c0bd542d…</pre>
         <h4 class="doc-sub">Snapshot + tail replay</h4>
         <p>
@@ -289,42 +289,42 @@
     <div class="wrap">
       <h2 class="sec-h">Opcodes</h2>
       <p class="sec-lede">
-        Every write is a <code>ZKV1</code> memo. The signature line is
+        Every write is a <code>ZKV0</code> memo. The signature line is
         <code>[seq]&lt;130 hex chars, a 65-byte recoverable ECDSA signature&gt;</code>;
         the optional <code>[seq]</code> prefix carries replay-protection state.
         Unauthorized and stale writes are <em>silently dropped</em> on replay.
       </p>
 
       <div class="op-grid">
-        <div class="op"><div class="op-head"><span class="op-name">SET</span><span class="tag data">Data</span></div><p>Set a key to a value (compact single-line form).</p><pre class="wire">ZKV1 SET &lt;key&gt; &lt;value&gt;
+        <div class="op"><div class="op-head"><span class="op-name">SET</span><span class="tag data">Data</span></div><p>Set a key to a value (compact single-line form).</p><pre class="wire">ZKV0 SET &lt;key&gt; &lt;value&gt;
 [seq]&lt;sig&gt;</pre><p class="op-auth">Owner, or a writer scoped CREATE / UPDATE.</p></div>
 
-        <div class="op"><div class="op-head"><span class="op-name">SETL</span><span class="tag data">Data</span></div><p>Length-framed set for empty, multi-line, or binary values.</p><pre class="wire">ZKV1 SETL &lt;key&gt; &lt;byte_len&gt;
+        <div class="op"><div class="op-head"><span class="op-name">SETL</span><span class="tag data">Data</span></div><p>Length-framed set for empty, multi-line, or binary values.</p><pre class="wire">ZKV0 SETL &lt;key&gt; &lt;byte_len&gt;
 &lt;value, exactly byte_len bytes&gt;
 [seq]&lt;sig&gt;</pre><p class="op-auth">Owner, or a writer scoped CREATE / UPDATE.</p></div>
 
-        <div class="op"><div class="op-head"><span class="op-name">DEL</span><span class="tag data">Data</span></div><p>Tombstone a key. The version counter survives the delete.</p><pre class="wire">ZKV1 DEL &lt;key&gt;
+        <div class="op"><div class="op-head"><span class="op-name">DEL</span><span class="tag data">Data</span></div><p>Tombstone a key. The version counter survives the delete.</p><pre class="wire">ZKV0 DEL &lt;key&gt;
 [seq]&lt;sig&gt;</pre><p class="op-auth">Owner, or a writer scoped DESTROY.</p></div>
 
-        <div class="op"><div class="op-head"><span class="op-name">INIT</span><span class="tag life">Lifecycle</span></div><p>Bootstrap the database. Root-signed, first-valid-wins.</p><pre class="wire">ZKV1 INIT &lt;zkv_addr&gt;
+        <div class="op"><div class="op-head"><span class="op-name">INIT</span><span class="tag life">Lifecycle</span></div><p>Bootstrap the database. Root-signed, first-valid-wins.</p><pre class="wire">ZKV0 INIT &lt;zkv_addr&gt;
 &lt;sig&gt;</pre><p class="op-auth">The root (UFVK-derived) key only; becomes owner #1 / creator.</p></div>
 
-        <div class="op"><div class="op-head"><span class="op-name">OWNERSET</span><span class="tag mgmt">Management</span></div><p>Grant (or re-affirm) owner authority.</p><pre class="wire">ZKV1 OWNERSET &lt;pubkey&gt;
+        <div class="op"><div class="op-head"><span class="op-name">OWNERSET</span><span class="tag mgmt">Management</span></div><p>Grant (or re-affirm) owner authority.</p><pre class="wire">ZKV0 OWNERSET &lt;pubkey&gt;
 [seq]&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
 
-        <div class="op"><div class="op-head"><span class="op-name">OWNERDEL</span><span class="tag mgmt">Management</span></div><p>Revoke owner authority. The last owner can't be removed.</p><pre class="wire">ZKV1 OWNERDEL &lt;pubkey&gt;
+        <div class="op"><div class="op-head"><span class="op-name">OWNERDEL</span><span class="tag mgmt">Management</span></div><p>Revoke owner authority. The last owner can't be removed.</p><pre class="wire">ZKV0 OWNERDEL &lt;pubkey&gt;
 [seq]&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
 
-        <div class="op"><div class="op-head"><span class="op-name">WRITERSET</span><span class="tag mgmt">Management</span></div><p>Grant (or overwrite) a scoped writer. Scope ⊆ CREATE,UPDATE,DESTROY.</p><pre class="wire">ZKV1 WRITERSET &lt;pubkey&gt; &lt;scope&gt;
+        <div class="op"><div class="op-head"><span class="op-name">WRITERSET</span><span class="tag mgmt">Management</span></div><p>Grant (or overwrite) a scoped writer. Scope ⊆ CREATE,UPDATE,DESTROY.</p><pre class="wire">ZKV0 WRITERSET &lt;pubkey&gt; &lt;scope&gt;
 [seq]&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
 
-        <div class="op"><div class="op-head"><span class="op-name">WRITERDEL</span><span class="tag mgmt">Management</span></div><p>Revoke a writer entirely (all-or-nothing).</p><pre class="wire">ZKV1 WRITERDEL &lt;pubkey&gt;
+        <div class="op"><div class="op-head"><span class="op-name">WRITERDEL</span><span class="tag mgmt">Management</span></div><p>Revoke a writer entirely (all-or-nothing).</p><pre class="wire">ZKV0 WRITERDEL &lt;pubkey&gt;
 [seq]&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
 
-        <div class="op"><div class="op-head"><span class="op-name">VERSION</span><span class="tag ver">Version</span></div><p>Announce the required client/protocol epoch (forward-compat gate).</p><pre class="wire">ZKV1 VERSION &lt;n&gt; &lt;flags&gt;
-[seq]&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
+        <div class="op"><div class="op-head"><span class="op-name">VERSION</span><span class="tag ver">Version</span></div><p>Announce the required client/protocol epoch (forward-compat gate).</p><pre class="wire">ZKV0 VERSION &lt;n&gt; &lt;flags&gt;
+&lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
 
-        <div class="op"><div class="op-head"><span class="op-name">FINALIZE</span><span class="tag life">Lifecycle</span></div><p>Permanently seal the database. A one-way latch.</p><pre class="wire">ZKV1 FINALIZE
+        <div class="op"><div class="op-head"><span class="op-name">FINALIZE</span><span class="tag life">Lifecycle</span></div><p>Permanently seal the database. A one-way latch.</p><pre class="wire">ZKV0 FINALIZE
 &lt;sig&gt;</pre><p class="op-auth">Owner-only.</p></div>
       </div>
     </div>
