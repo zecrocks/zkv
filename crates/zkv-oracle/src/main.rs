@@ -326,22 +326,23 @@ fn short(txid: &str) -> String {
     format!("{}…{}", &txid[..6], &txid[txid.len() - 6..])
 }
 
-/// One full publish cycle: fetch, sync, measure lag, write both keys, with
-/// bounded retries inside the tick.
+/// One full publish cycle: fetch, sync, measure lag, publish both keys in a
+/// single transaction, with bounded retries inside the tick.
 ///
-/// Each attempt **re-fetches** the price, so a write that is retried after a
-/// failure publishes a current quote, never one held over from the failed
-/// attempt: freshness over fee economy. Only keys that have not yet landed are
-/// (re-)written, so a key that already succeeded is not paid for twice. Retries
-/// are bounded by `tick_attempts` and never bleed past the next scheduled tick.
+/// Both keys are written in **one** "sendmany" transaction (one ZIP-317 fee,
+/// one txid) via `Database::set_many_no_sync`, so the publish is atomic: either
+/// the whole batch broadcasts or it doesn't. A failed batch is retried whole,
+/// and each attempt **re-fetches** the prices so a retry carries a current
+/// quote, never one held over from the failed attempt: freshness over fee
+/// economy. Retries are bounded by `tick_attempts` and never bleed past the
+/// next scheduled tick.
 ///
 /// Never returns an error and never panics; every failure is logged and
 /// recorded on `health`, and the loop simply carries on to the next tick.
 async fn run_tick(db: &Database, client: &reqwest::Client, cfg: &Config, health: &Health) {
     let ticker = db.network().ticker();
     let start = Instant::now();
-    // Keys still needing a successful write this tick.
-    let mut pending: Vec<&str> = vec![ZEC_KEY, BTC_KEY];
+    let mut published = false;
 
     for attempt in 1..=cfg.tick_attempts {
         // Re-fetch every attempt: a retried write must carry a fresh quote.
@@ -360,7 +361,7 @@ async fn run_tick(db: &Database, client: &reqwest::Client, cfg: &Config, health:
             }
         };
 
-        // A single sync covers both writes; cheaper than two `set()` calls.
+        // A single sync covers the whole batch; cheaper than per-key syncs.
         if let Err(e) = db.sync().await {
             tracing::warn!(
                 "sync failed (attempt {attempt}/{}): {e:#}",
@@ -375,52 +376,43 @@ async fn run_tick(db: &Database, client: &reqwest::Client, cfg: &Config, health:
 
         measure_lag(db, health).await;
 
-        // Write only the keys still pending, each with its just-fetched value.
-        let mut still_pending: Vec<&str> = Vec::new();
-        for &key in &pending {
-            let value = value_for(key, &prices);
-            match db.set_no_sync(key, value).await {
-                Ok(txid) => tracing::info!("✓ {key} = {value} (txid {})", short(&txid)),
-                Err(e) => {
-                    let detail = describe_write_error(&e, ticker);
-                    tracing::warn!(
-                        "write {key} failed (attempt {attempt}/{}): {detail}",
-                        cfg.tick_attempts
-                    );
-                    health.set_error(format!("write {key}: {detail}"));
-                    still_pending.push(key);
+        // Publish both keys in ONE transaction (one fee, one txid). The
+        // pre-broadcast sync is skipped: we already synced just above.
+        let pairs = [(ZEC_KEY, prices.0.as_str()), (BTC_KEY, prices.1.as_str())];
+        match db.set_many_no_sync(&pairs).await {
+            Ok(txid) => {
+                tracing::info!(
+                    "✓ {ZEC_KEY}={} {BTC_KEY}={} (txid {})",
+                    prices.0,
+                    prices.1,
+                    short(&txid)
+                );
+                health.mark_write_ok();
+                published = true;
+                break;
+            }
+            Err(e) => {
+                let detail = describe_write_error(&e, ticker);
+                tracing::warn!(
+                    "batch write failed (attempt {attempt}/{}): {detail}",
+                    cfg.tick_attempts
+                );
+                health.set_error(format!("write: {detail}"));
+                if !backoff_before_retry(attempt, cfg, start).await {
+                    break;
                 }
             }
         }
-        pending = still_pending;
-
-        if pending.is_empty() {
-            health.mark_write_ok();
-            break;
-        }
-        if !backoff_before_retry(attempt, cfg, start).await {
-            break;
-        }
     }
 
-    if !pending.is_empty() {
+    if !published {
         tracing::warn!(
-            "tick gave up after {} attempt(s); {} key(s) not published, retrying next tick",
+            "tick gave up after {} attempt(s); prices not published, retrying next tick",
             cfg.tick_attempts,
-            pending.len(),
         );
     }
 
     health.finish_tick();
-}
-
-/// The fresh value for `key` from a `(zec, btc)` fetch result.
-fn value_for<'a>(key: &str, prices: &'a (String, String)) -> &'a str {
-    if key == ZEC_KEY {
-        &prices.0
-    } else {
-        &prices.1
-    }
 }
 
 /// Sleep `retry_backoff` before the next in-tick attempt, returning whether a
@@ -668,12 +660,5 @@ mod tests {
     fn extract_price_rejects_non_positive() {
         let v: Value = serde_json::from_str(r#"{"zcash":{"usd":0}}"#).unwrap();
         assert!(extract_price(&v, "zcash").is_err());
-    }
-
-    #[test]
-    fn value_for_maps_each_key_to_its_price() {
-        let prices = ("23.4".to_owned(), "65000".to_owned());
-        assert_eq!(value_for(ZEC_KEY, &prices), "23.4");
-        assert_eq!(value_for(BTC_KEY, &prices), "65000");
     }
 }

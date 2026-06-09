@@ -23,14 +23,14 @@ syncing and reading those keys; see the library's `read_value` example.
   the seed, taking the network, birthday, and shielded pool from `ZKV_ADDRESS`
   (`Database::restore_admin_with_pool`). It does **not** broadcast INIT; the
   database is assumed already created and INITed on-chain for this seed.
-- Each tick: fetch both prices → one `sync()` → `set_no_sync()` each key. A
-  single sync covers both writes.
+- Each tick: fetch both prices → one `sync()` → one `set_many_no_sync()` that
+  publishes **both keys in a single transaction** (one ZIP-317 fee, one txid).
 - A transient fetch/sync/write failure is retried inside the same tick (up to
   `ZKV_TICK_ATTEMPTS`, `ZKV_RETRY_BACKOFF_SECS` apart) instead of going dark
-  until the next tick. Every retry **re-fetches** the price, so a retried write
-  never publishes a stale quote, and only keys that have not yet landed are
-  re-written (a key that already succeeded is not paid for twice). A tick never
-  crashes the process; on exhausted retries it just waits for the next tick.
+  until the next tick. The batch is atomic (all keys or none), so a failed tick
+  retries the whole publish, and every retry **re-fetches** the prices so it
+  never publishes a stale quote. A tick never crashes the process; on exhausted
+  retries it just waits for the next tick.
 - Exposes a **health gate** (`GET /health`, also `/healthz` and `/`) that returns
   HTTP 200 while healthy and 503 once the oracle drifts too far out of sync or
   stops landing writes, so a container orchestrator can restart it.
