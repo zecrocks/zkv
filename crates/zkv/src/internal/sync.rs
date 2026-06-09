@@ -72,7 +72,33 @@ const BATCH_SIZE: u32 = 10_000;
 /// pipeline pass on every read just to pick up a block the reader will ignore
 /// is wasted work. Write syncs keep a tolerance of 0 (an accurate tree to build
 /// a spend on), so this only relaxes the read path.
+///
+/// Used now only as the default for read syncs with no explicit confirmation
+/// depth (the facade `Database::sync`, `balance`, `show`, `watch`). Reads that
+/// carry a `--confirmations` derive their tolerance from it instead, via
+/// [`read_tip_tolerance`].
 pub const NEAR_TIP_TOLERANCE: u32 = 1;
+
+/// The fast-path skip tolerance for a read at `min_confs` confirmations: how
+/// many blocks behind the live tip the wallet may sit and still provably return
+/// the same *confirmed* state, so a re-scan would be wasted work.
+///
+/// A write mined in the not-yet-scanned region `(wallet_tip, rpc_tip]` has at
+/// most `behind = rpc_tip - wallet_tip` confirmations (its deepest block,
+/// `wallet_tip + 1`, sits `behind` blocks from the tip). So if
+/// `behind < min_confs`, none of those unscanned writes can reach the display
+/// threshold and the confirmed read is identical whether or not we scan; the
+/// exact safe bound is therefore `min_confs - 1`.
+///
+/// This both relaxes and tightens the old fixed [`NEAR_TIP_TOLERANCE`] of 1
+/// depending on the request: at the default `-c 3` it skips up to 2 blocks
+/// behind (was 1), while a low `-c 1`/`-c 0` correctly drops to 0 so a
+/// freshly-confirmed write is never skipped (the old fixed 1 could hide it). A
+/// mempool read (`-c 0`) pulls the mempool separately and wants the freshest
+/// tip, so 0 is right there too.
+pub fn read_tip_tolerance(min_confs: u32) -> u32 {
+    min_confs.saturating_sub(1)
+}
 
 /// Maximum age of the chain tip we'll accept before pinning a new wallet
 /// birthday (`zkv init`/`restore`) or treating an "uninitialized" verdict as
@@ -364,6 +390,28 @@ pub async fn run_sync_read(
     run_sync_tol(db_name, conn, fetch_mempool_too, NEAR_TIP_TOLERANCE).await
 }
 
+/// Read sync whose fast-path skip tolerance comes from the request's
+/// confirmation depth ([`read_tip_tolerance`]) instead of the fixed
+/// [`NEAR_TIP_TOLERANCE`]. Used by the confirmation-aware read commands
+/// (`zkv get`/`history`): a default `-c 3` read skips a re-scan when up to 2
+/// blocks behind the tip (those blocks can't yet hold a 3-confirmation write),
+/// while `-c 1`/`-c 0` tighten to an exact-tip skip so a just-confirmed write is
+/// never missed.
+pub async fn run_sync_read_confs(
+    db_name: &str,
+    conn: &ConnectionArgs,
+    min_confs: u32,
+    fetch_mempool_too: bool,
+) -> anyhow::Result<u32> {
+    run_sync_tol(
+        db_name,
+        conn,
+        fetch_mempool_too,
+        read_tip_tolerance(min_confs),
+    )
+    .await
+}
+
 /// Shared sync driver: the per-attempt spinner + reorg/corruption recovery
 /// loop, parameterized by how many blocks behind the live tip the fast-path
 /// skip will accept (`tip_tolerance`). See [`run_sync`] / [`run_sync_read`].
@@ -507,9 +555,10 @@ async fn run_sync_inner(
     }
     // If the chain has advanced no more than `tip_tolerance` blocks since our
     // last sync and there are no pending scan ranges, skip the whole pipeline.
-    // For reads (`tip_tolerance = NEAR_TIP_TOLERANCE`) this lets a tight loop
-    // avoid a full download/scan/enhance pass just to pick up the newest block
-    // or two, which confirmed reads ignore anyway; writes pass 0 so a spend
+    // For reads (`tip_tolerance` from the request's confirmation depth, see
+    // `read_tip_tolerance`, or `NEAR_TIP_TOLERANCE` when there is none) this lets
+    // a tight loop avoid a full download/scan/enhance pass just to pick up the
+    // newest block or two, which confirmed reads ignore anyway; writes pass 0 so a spend
     // always builds on the exact tip. Note: we intentionally ignore
     // `transaction_data_requests()` here; `TransactionsInvolvingAddress` for
     // transparent receivers gets re-emitted every sync, but with no new blocks
@@ -1078,9 +1127,23 @@ async fn fetch_mempool<P: Parameters>(
     Ok(())
 }
 
-/// After a sync pass, prune `pending.toml` entries whose tx the wallet has
-/// now indexed (mined or otherwise). The local cache is only meant to bridge
-/// the gap between `pay()` returning a txid and the next sync seeing it.
+/// After a sync pass, prune `pending.toml` entries whose tx the wallet has now
+/// indexed **with its memo decrypted**. The local cache bridges the gap between
+/// broadcast (we know the memo exists) and the read path seeing it on chain.
+///
+/// We deliberately require a decrypted memo (`v_tx_outputs.memo IS NOT NULL`),
+/// not just a mined tx: the compact-block scan records a tx as mined in
+/// `v_transactions` *before* `enhance` downloads the full tx and decrypts its
+/// memo into `v_tx_outputs`, and the tolerance-skip sync path runs this GC
+/// without scanning at all. Pruning on mined-only would drop the pending entry
+/// during that window, while the read path (which sources memos from
+/// `v_tx_outputs WHERE memo IS NOT NULL`) still can't see the write, so the
+/// state would flap (a confirming INIT briefly reverting to "uninitialized",
+/// or a just-set key vanishing) until the next enhance. Gating on the decrypted
+/// memo keeps the pending entry until the on-chain row can take over seamlessly.
+/// Every pending entry is a zkv write/INIT, which always carries a memo, so this
+/// never strands a legitimate entry (the staleness GC in `pending::load` is the
+/// backstop for a tx that never lands).
 fn gc_pending(db_name: &str, db_data_path: &Path) {
     let conn = match rusqlite::Connection::open(db_data_path) {
         Ok(c) => c,
@@ -1089,34 +1152,40 @@ fn gc_pending(db_name: &str, db_data_path: &Path) {
             return;
         }
     };
-    let mut stmt = match conn
-        .prepare("SELECT DISTINCT txid FROM v_transactions WHERE mined_height IS NOT NULL")
-    {
+    let seen = match mined_with_memo_txids(&conn) {
         Ok(s) => s,
-        Err(e) => {
-            tracing::debug!("pending GC: prepare: {e}");
-            return;
-        }
-    };
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let rows = match stmt.query_map([], |row| row.get::<_, Vec<u8>>(0)) {
-        Ok(r) => r,
         Err(e) => {
             tracing::debug!("pending GC: query: {e}");
             return;
         }
     };
-    for r in rows {
-        match r.ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
-            Some(arr) => {
-                seen.insert(TxId::from_bytes(arr).to_string());
-            }
-            None => continue,
-        }
-    }
     if let Err(e) = pending::prune(db_name, &seen) {
         tracing::warn!("pending GC failed: {e:#}");
     }
+}
+
+/// Txids the wallet has indexed **with a decrypted memo**: mined and present in
+/// `v_tx_outputs` with a non-NULL memo. This is exactly the set the read path
+/// can see (it sources memos from `v_tx_outputs WHERE memo IS NOT NULL`), so a
+/// pending entry whose txid is in this set can be dropped without the state
+/// flapping. A tx that is merely mined (compact-scanned) but not yet enhanced
+/// has a NULL memo and is deliberately excluded.
+fn mined_with_memo_txids(
+    conn: &rusqlite::Connection,
+) -> rusqlite::Result<std::collections::HashSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT v.txid FROM v_tx_outputs v \
+         JOIN v_transactions t ON t.txid = v.txid \
+         WHERE t.mined_height IS NOT NULL AND v.memo IS NOT NULL",
+    )?;
+    let mut seen = std::collections::HashSet::new();
+    let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+    for r in rows {
+        if let Some(arr) = r.ok().and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok()) {
+            seen.insert(TxId::from_bytes(arr).to_string());
+        }
+    }
+    Ok(seen)
 }
 
 async fn enhance<P: Parameters + Send + 'static>(
@@ -1190,7 +1259,77 @@ async fn enhance<P: Parameters + Send + 'static>(
 
 #[cfg(test)]
 mod tests {
-    use super::{tip_time_is_fresh, SyncProgress, TIP_MAX_AGE};
+    use super::{
+        mined_with_memo_txids, read_tip_tolerance, tip_time_is_fresh, SyncProgress, TIP_MAX_AGE,
+    };
+    use zcash_primitives::transaction::TxId;
+
+    // One stub row: (txid, mined_height, decrypted memo bytes).
+    type StubRow<'a> = (TxId, Option<i64>, Option<&'a [u8]>);
+
+    // Minimal stand-ins for the wallet's `v_transactions` / `v_tx_outputs`
+    // views: only the columns `mined_with_memo_txids` reads. Lets us exercise
+    // the pending-GC selection (mined AND memo decrypted) without the full
+    // zcash_client_sqlite schema.
+    fn stub_wallet_db(rows: &[StubRow]) -> rusqlite::Connection {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE v_transactions (txid BLOB, mined_height INTEGER);
+             CREATE TABLE v_tx_outputs (txid BLOB, memo BLOB);",
+        )
+        .unwrap();
+        for (txid, mined, memo) in rows {
+            let bytes = txid.as_ref().to_vec();
+            conn.execute(
+                "INSERT INTO v_transactions (txid, mined_height) VALUES (?1, ?2)",
+                rusqlite::params![bytes, mined],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO v_tx_outputs (txid, memo) VALUES (?1, ?2)",
+                rusqlite::params![bytes, memo],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    #[test]
+    fn pending_gc_keeps_mined_tx_until_its_memo_is_decrypted() {
+        // The regression: the compact-block scan records a tx as mined before
+        // `enhance` decrypts its memo, so pruning on mined-only drops the
+        // pending entry while the read path still can't see the write (a
+        // confirming INIT briefly reverting to "uninitialized"). Only a mined
+        // tx WITH a decrypted memo should be considered "seen".
+        let decrypted = TxId::from_bytes([1u8; 32]); // mined + memo  -> seen
+        let memo_pending = TxId::from_bytes([2u8; 32]); // mined, no memo -> NOT seen
+        let unmined = TxId::from_bytes([3u8; 32]); // memo but unmined -> NOT seen
+        let conn = stub_wallet_db(&[
+            (decrypted, Some(730), Some(b"ZKV0 INIT ...".as_slice())),
+            (memo_pending, Some(730), None),
+            (unmined, None, Some(b"ZKV0 SET k v".as_slice())),
+        ]);
+
+        let seen = mined_with_memo_txids(&conn).unwrap();
+        assert!(seen.contains(&decrypted.to_string()));
+        assert!(!seen.contains(&memo_pending.to_string()));
+        assert!(!seen.contains(&unmined.to_string()));
+        assert_eq!(seen.len(), 1);
+    }
+
+    #[test]
+    fn read_tip_tolerance_is_confs_minus_one() {
+        // Default `-c 3` read: the newest 2 blocks can't hold a 3-confirmation
+        // write, so a re-scan up to 2 blocks behind is skippable.
+        assert_eq!(read_tip_tolerance(3), 2);
+        // `-c 1`: a one-confirmation write in the very next block matters, so a
+        // skip is only safe at the exact tip.
+        assert_eq!(read_tip_tolerance(1), 0);
+        // `-c 0` (mempool read): never skip when behind; the mempool is pulled
+        // separately and the freshest tip is wanted.
+        assert_eq!(read_tip_tolerance(0), 0);
+        assert_eq!(read_tip_tolerance(10), 9);
+    }
 
     #[test]
     fn progress_label_is_bare_until_tip_and_scan_known() {

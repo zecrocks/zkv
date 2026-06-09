@@ -11,6 +11,13 @@ ignore = [
     # `zcash_client_backend`'s `time-core = "=0.1.2"` requirement, so we
     # can't bump until librustzcash relaxes it.
     "RUSTSEC-2026-0009",
+    # proc-macro-error2 is unmaintained. It is a build-time proc-macro
+    # dependency only (no runtime code path), pulled in transitively by
+    # orchard (via getset) and age (via i18n-embed-fl); there is no
+    # first-party use and "no safe upgrade is available" per the advisory.
+    # "Unmaintained" is informational, not a vulnerability. Revisit once the
+    # upstream Zcash/age crates migrate off it.
+    "RUSTSEC-2026-0173",
 ]
 
 [licenses]

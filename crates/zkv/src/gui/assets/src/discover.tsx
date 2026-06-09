@@ -499,8 +499,8 @@ const Settings = ({
       <div className="settings-section">
         <h3>Network</h3>
         <p className="lede">
-          The lightwalletd connection is chosen at launch, e.g.{' '}
-          <code style={{fontFamily:'var(--font-mono)', fontSize:11}}>zkv gui --mainnet-server 1.2.3</code>{' '}
+          The light wallet server connection is chosen at launch, e.g.{' '}
+          <code style={{fontFamily:'var(--font-mono)', fontSize:11}}>zkv gui --mainnet-server 1.2.3.4</code>{' '}
           (and <code style={{fontFamily:'var(--font-mono)', fontSize:11}}>--testnet-server</code>).
         </p>
         <div className="settings-card">

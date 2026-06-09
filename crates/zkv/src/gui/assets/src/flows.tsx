@@ -212,7 +212,7 @@ const DepositModal = ({ db, onClose, onCopy, onInited }: {
                 <Icon name="rocket" className="icon" /> {initLabel}
               </button>
             )}
-            {addr && (
+            {addr && db.network !== "mainnet" && (
               <button
                 className="btn secondary"
                 onClick={requestFaucet}
@@ -1043,7 +1043,9 @@ const CreateFlow = ({ onCancel, onCreate, onGeneratePhrase, onInit, pollDb, minI
             <div className="modal-foot">
               {counter}
               <div style={{ display: "flex", gap: 8 }}>
-                <button className="btn secondary" onClick={() => setStep(2)}>← Back</button>
+                {/* No "Back" here: the seed is already confirmed and the database
+                    persisted, so stepping back to Confirm/Seed would re-show a
+                    phrase the user already committed to. Forward only. */}
                 {network === "testnet" && (
                   <button className="btn secondary" onClick={doFaucetInit} disabled={faucetInitState !== "idle"}>
                     <Icon name="rocket" className="icon" /> {faucetInitLabel}
@@ -1146,7 +1148,7 @@ const CreateFlow = ({ onCancel, onCreate, onGeneratePhrase, onInit, pollDb, minI
 const ImportFlow = ({ onCancel, onWatch, onRestore, onComplete }: {
   onCancel: () => void;
   onWatch: (addr: string, nickname: string) => Promise<unknown>;
-  onRestore: (nickname: string, phrase: string, network: string, birthday?: number) => Promise<unknown>;
+  onRestore: (nickname: string, phrase: string, network: string, pool: string, birthday?: number) => Promise<unknown>;
   onComplete?: () => void;
 }) => {
   const [method, setMethod] = React.useState<"watch" | "restore" | null>(null);
@@ -1155,33 +1157,59 @@ const ImportFlow = ({ onCancel, onWatch, onRestore, onComplete }: {
   const [phrase, setPhrase] = React.useState("");
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState<any>(null);
-  // Restore: what the pasted zkv address resolves to (network/pool/birthday),
-  // resolved by the backend once the address parses. Drives the badge and
-  // supplies the network + birthday for the restore call, so the user only
-  // pastes the address and their phrase.
+  // Restore: the required second field accepts EITHER a zkv address (which pins
+  // the network/pool/birthday) OR a bare birthday height (used with the network
+  // toggle and the Orchard default). One of the two is required: without a
+  // birthday we'd have to scan for the INIT to recover the right database, which
+  // is future work. `network` is the toggle, used only in the height case.
+  const [addrOrHeight, setAddrOrHeight] = React.useState("");
+  const [network, setNetwork] = React.useState<"mainnet" | "testnet">("mainnet");
+  // What a pasted zkv address resolves to (network/pool/birthday), once the
+  // backend parses it. Drives the badge and supplies the restore parameters.
   const [addrInfo, setAddrInfo] = React.useState<ZkvAddrInfoResp | null>(null);
   const [inspecting, setInspecting] = React.useState(false);
+  // Whether the typed phrase actually controls the pasted address's database,
+  // checked by the backend. Only meaningful once an address is resolved;
+  // `null` means not-checked / not-applicable.
+  const [phraseMatch, setPhraseMatch] =
+    React.useState<"checking" | "match" | "mismatch" | "error" | null>(null);
 
-  // Sanity-check the zkv address shape. A zkv address is a single bech32m
-  // token (`zkv1…` on mainnet, `zkvtest1…` / `zkvregtest1…` on other networks)
-  // with the birthday encoded inside it, so we can't read the birthday here;
-  // the server resolves it on add. This is just a shape gate for the button;
-  // `parse_zkv_addr` on the backend is the authority.
-  const parseAddr = (a: string) => {
-    const s = a.trim().toLowerCase();
-    return /^zkv(test|regtest)?1[a-z0-9]{20,}$/.test(s) ? { ok: true } : null;
-  };
-  const parsed = parseAddr(addr);
+  // Shape-check a zkv address: a single bech32m token (`zkv1…` on mainnet,
+  // `zkvtest1…` / `zkvregtest1…` elsewhere). Returns a plain boolean (never a
+  // fresh object) so derived values can sit in effect dependency arrays without
+  // changing identity every render, which would re-run the effect forever and
+  // leave the network/pool probe spinning. `parse_zkv_addr` on the backend is
+  // the authority; this only gates the UI.
+  const isZkvAddr = (a: string) => /^zkv(test|regtest)?1[a-z0-9]{20,}$/.test(a.trim().toLowerCase());
+  const parsed = isZkvAddr(addr);
   const addrState = addr.length === 0 ? "empty" : parsed ? "parsed" : "invalid";
 
   const phraseWords = phrase.trim().split(/\s+/).filter(Boolean);
   const phraseOk = phraseWords.length === 24;
 
-  // When a shape-valid zkv address is pasted into the restore form, ask the
-  // backend to resolve its network, pool, and birthday. This both drives the
-  // network/pool badge and supplies the network + birthday for the restore.
+  // Classify the restore form's optional field: a zkv address, a bare block
+  // height, empty, or unusable. An address is authoritative for
+  // network/pool/birthday; a height just sets the birthday; empty falls back to
+  // the launch-window default the backend fills in.
+  const aoh = addrOrHeight.trim();
+  const aohIsHeight = /^\d{1,9}$/.test(aoh);
+  const aohState = aoh === "" ? "empty" : isZkvAddr(aoh) ? "addr" : aohIsHeight ? "height" : "invalid";
+  const fromAddr = aohState === "addr" && !!addrInfo;
+
+  // Effective restore parameters. The pasted address wins when resolved;
+  // otherwise the toggle drives the network and the pool defaults to Orchard
+  // (live on both networks post-NU6.2; paste a zkv address for a Sapling
+  // database). The birthday is the address's or the typed height: one is
+  // required, so there is no implicit default here.
+  const effNetwork = fromAddr ? addrInfo!.network : network;
+  const effPool = fromAddr ? addrInfo!.pool : "orchard";
+  const effBirthday = fromAddr ? addrInfo!.birthday : aohState === "height" ? Number(aoh) : undefined;
+
+  // When the optional field holds a shape-valid zkv address, resolve its
+  // network/pool/birthday. Deps are primitives, so no object-identity churn.
   React.useEffect(() => {
-    if (method !== "restore" || !parsed) {
+    const v = addrOrHeight.trim();
+    if (method !== "restore" || !isZkvAddr(v)) {
       setAddrInfo(null);
       setInspecting(false);
       return;
@@ -1190,14 +1218,41 @@ const ImportFlow = ({ onCancel, onWatch, onRestore, onComplete }: {
     setInspecting(true);
     setAddrInfo(null);
     window.zkvApi
-      .inspectAddress(addr.trim())
+      .inspectAddress(v)
       .then((info) => alive && setAddrInfo(info))
       .catch(() => alive && setAddrInfo(null))
       .finally(() => alive && setInspecting(false));
     return () => {
       alive = false;
     };
-  }, [method, addr, parsed]);
+  }, [method, addrOrHeight]);
+
+  // When both a resolved address and a full 24-word phrase are present, ask the
+  // backend whether the phrase actually controls that database, so a wrong
+  // phrase (or wrong address) is caught before submit. Deps are primitives.
+  React.useEffect(() => {
+    if (method !== "restore" || !fromAddr || !phraseOk) {
+      setPhraseMatch(null);
+      return;
+    }
+    let alive = true;
+    setPhraseMatch("checking");
+    window.zkvApi
+      .verifyPhrase(phrase.trim(), addrOrHeight.trim())
+      .then((ok) => alive && setPhraseMatch(ok ? "match" : "mismatch"))
+      .catch(() => alive && setPhraseMatch("error"));
+    return () => {
+      alive = false;
+    };
+  }, [method, fromAddr, phrase, phraseOk, addrOrHeight]);
+
+  // Restore is submittable with a full phrase, a nickname, a usable second
+  // field (empty / height / resolved address), and, when an address is pasted,
+  // a phrase that verifies against it.
+  const secondOk =
+    aohState === "height" || (aohState === "addr" && !!addrInfo && !inspecting);
+  const matchGate = !fromAddr || phraseMatch === "match";
+  const canRestore = phraseOk && !!nickname.trim() && secondOk && matchGate && !busy && !inspecting;
 
   const submitWatch = async () => {
     setBusy(true);
@@ -1212,11 +1267,11 @@ const ImportFlow = ({ onCancel, onWatch, onRestore, onComplete }: {
   };
 
   const submitRestore = async () => {
-    if (!addrInfo) return;
+    if (!canRestore) return;
     setBusy(true);
     setError(null);
     try {
-      await onRestore(nickname.trim(), phrase.trim(), addrInfo.network, addrInfo.birthday);
+      await onRestore(nickname.trim(), phrase.trim(), effNetwork, effPool, effBirthday);
       onComplete && onComplete();
     } catch (e) {
       setError(e);
@@ -1361,7 +1416,7 @@ const ImportFlow = ({ onCancel, onWatch, onRestore, onComplete }: {
             <div className="eyebrow">IMPORT · RESTORE</div>
             <h2 id="import-title">Restore admin access</h2>
             <div style={{ fontSize: 12.5, color: "var(--fg-3)", marginTop: 4 }}>
-              Paste the database's zkv address and your 24-word recovery phrase.
+              Enter your 24-word recovery phrase, plus the database's zkv address or its birthday height.
             </div>
           </div>
           {!busy && (
@@ -1381,29 +1436,73 @@ const ImportFlow = ({ onCancel, onWatch, onRestore, onComplete }: {
                 database's entire transaction history by design.
               </div>
             </div>
+            {/* Primary: the recovery phrase. */}
             <div className="field-block">
-              <label>zkv address</label>
+              <label>24-word recovery phrase</label>
               <textarea
-                className="input addr-input"
-                style={{ minHeight: 78, fontFamily: "var(--font-mono)" }}
-                value={addr}
-                onChange={(e) => setAddr(e.target.value)}
+                className="input phrase-input"
+                style={{ minHeight: 80, fontFamily: "var(--font-mono)" }}
+                value={phrase}
+                onChange={(e) => setPhrase(e.target.value)}
+                disabled={busy}
                 autoFocus
               />
-              <div className="addr-preview" data-state={addrInfo ? "parsed" : addrState} style={{ marginTop: 8 }}>
-                {addrState === "empty" && (
-                  <span className="prev-empty"><Icon name="link-2" size={12} /> paste the database's address, starting with <code>zkv1…</code></span>
+              <div className="hint">
+                {phraseWords.length > 0 && phraseWords.length < 24 && (
+                  <span style={{ color: "var(--amber-400)" }}>{phraseWords.length} / 24 words</span>
                 )}
-                {addrState === "invalid" && (
-                  <span className="prev-invalid"><Icon name="alert-circle" size={12} /> not a valid zkv address, expected a <code>zkv1…</code> token</span>
+                {phraseWords.length > 24 && (
+                  <span style={{ color: "var(--red-500)" }}><Icon name="x" size={11} /> {phraseWords.length} words, phrase is too long</span>
                 )}
-                {addrState === "parsed" && inspecting && (
+                {/* No address pasted: a plain 24-word confirmation. */}
+                {phraseOk && !fromAddr && (
+                  <span style={{ color: "var(--green-500)" }}><Icon name="check" size={11} /> 24 words detected</span>
+                )}
+                {/* Address pasted: report whether this phrase controls THAT database. */}
+                {phraseOk && fromAddr && (phraseMatch === "checking" || phraseMatch === null) && (
+                  <span style={{ color: "var(--fg-3)", display: "inline-flex", alignItems: "center", gap: 6 }}><div className="spinner" /> checking against address…</span>
+                )}
+                {phraseOk && fromAddr && phraseMatch === "match" && (
+                  <span style={{ color: "var(--green-500)" }}><Icon name="check" size={11} /> matches this address</span>
+                )}
+                {phraseOk && fromAddr && phraseMatch === "mismatch" && (
+                  <span style={{ color: "var(--red-500)" }}><Icon name="x" size={11} /> does not match this address</span>
+                )}
+                {phraseOk && fromAddr && phraseMatch === "error" && (
+                  <span style={{ color: "var(--amber-400)" }}><Icon name="alert-circle" size={11} /> couldn't verify against the address</span>
+                )}
+              </div>
+            </div>
+            {/* Required: a zkv address (pins network/pool/birthday) or a bare
+                birthday height (used with the network toggle + Orchard default). */}
+            <div className="field-block">
+              <label>zkv address or birthday height <span style={{ color: "var(--fg-3)", fontWeight: 400 }}>· required</span></label>
+              <textarea
+                className="input addr-input"
+                style={{ minHeight: 60, fontFamily: "var(--font-mono)" }}
+                value={addrOrHeight}
+                onChange={(e) => setAddrOrHeight(e.target.value)}
+                disabled={busy}
+              />
+              <div className="addr-preview" data-state={fromAddr || aohState === "height" ? "parsed" : aohState === "invalid" ? "invalid" : "empty"} style={{ marginTop: 8 }}>
+                {aohState === "empty" && (
+                  <span className="prev-empty"><Icon name="link-2" size={12} /> required: paste the database's <code>zkv1…</code> address, or enter its birthday height</span>
+                )}
+                {aohState === "invalid" && (
+                  <span className="prev-invalid"><Icon name="alert-circle" size={12} /> enter a <code>zkv1…</code> address or a block height</span>
+                )}
+                {aohState === "height" && (
+                  <span className="prev-ok" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
+                    <Icon name="check" size={12} /> birthday height {Number(aoh)}
+                  </span>
+                )}
+                {aohState === "addr" && inspecting && (
                   <span className="prev-empty"><div className="spinner" /> reading network and pool…</span>
                 )}
-                {addrState === "parsed" && !inspecting && !addrInfo && (
+                {aohState === "addr" && !inspecting && !addrInfo && (
                   <span className="prev-invalid"><Icon name="alert-circle" size={12} /> couldn't read this address; check it and try again</span>
                 )}
-                {addrState === "parsed" && !inspecting && addrInfo && (
+                {aohState === "addr" && !inspecting && addrInfo && (
                   <span className="prev-ok" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
                     <Icon name="check" size={12} />
                     <span className="net-badge" data-net={addrInfo.network}>{addrInfo.network}</span>
@@ -1413,29 +1512,26 @@ const ImportFlow = ({ onCancel, onWatch, onRestore, onComplete }: {
                 )}
               </div>
             </div>
-            <div className="field-block">
-              <label>24-word recovery phrase</label>
-              <textarea
-                className="input phrase-input"
-                style={{ minHeight: 120, fontFamily: "var(--font-mono)" }}
-                value={phrase}
-                onChange={(e) => setPhrase(e.target.value)}
-              />
-              <div className="hint">
-                {phraseWords.length > 0 && phraseWords.length < 24 && (
-                  <span style={{ color: "var(--amber-400)" }}>{phraseWords.length} / 24 words</span>
-                )}
-                {phraseWords.length === 24 && (
-                  <span style={{ color: "var(--green-500)" }}><Icon name="check" size={11} /> 24 words detected</span>
-                )}
-                {phraseWords.length > 24 && (
-                  <span style={{ color: "var(--red-500)" }}><Icon name="x" size={11} /> {phraseWords.length} words, phrase is too long</span>
-                )}
+            {/* Network: only when no address is pasted. A pasted address pins
+                the network and pool (shown in the badge above); in the height
+                case the toggle drives the network and the pool defaults to
+                Orchard. */}
+            {!fromAddr && (
+              <div className="field-block">
+                <label>Network</label>
+                <div className="seg">
+                  <button className={network === "mainnet" ? "on" : ""} disabled={busy} onClick={() => setNetwork("mainnet")}>
+                    <Icon name="globe" size={12} /> mainnet
+                  </button>
+                  <button className={network === "testnet" ? "on" : ""} disabled={busy} onClick={() => setNetwork("testnet")}>
+                    <Icon name="flask-conical" size={12} /> testnet
+                  </button>
+                </div>
               </div>
-            </div>
+            )}
             <div className="field-block">
               <label>Local database nickname</label>
-              <input className="input lg" value={nickname} onChange={(e) => setNickname(e.target.value)} maxLength={24} />
+              <input className="input lg" value={nickname} onChange={(e) => setNickname(e.target.value)} maxLength={24} disabled={busy} />
             </div>
           </div>
         </div>
@@ -1445,7 +1541,7 @@ const ImportFlow = ({ onCancel, onWatch, onRestore, onComplete }: {
           </div>
           <div style={{ display: "flex", gap: 8 }}>
             <button className="btn secondary" onClick={() => setMethod(null)} disabled={busy}>← Back</button>
-            <button className="btn primary" disabled={!phraseOk || !nickname.trim() || !addrInfo || busy} onClick={submitRestore}>
+            <button className="btn primary" disabled={!canRestore} onClick={submitRestore}>
               {busy ? <><div className="spinner" /> Restoring…</> : <><Icon name="key-round" className="icon" /> Restore</>}
             </button>
           </div>

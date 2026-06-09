@@ -89,8 +89,9 @@
     // Persist that onboarding has been completed/dismissed (state lives in .zkv).
     markOnboarded: () => call("mark_onboarded"),
     inspectAddress: (address) => call("inspect_address", { address }),
-    restore: (name, phrase, network, birthday) =>
-      call("restore", { name, phrase, network, birthday }),
+    verifyPhrase: (phrase, address) => call("verify_phrase", { phrase, address }),
+    restore: (name, phrase, network, pool, birthday) =>
+      call("restore", { name, phrase, network, pool, birthday }),
     setCurrent: (name) => call("set_current", { name }),
     // Permanently delete a database's local state (the on-chain writes remain).
     forget: (name) => call("forget", { name }),
@@ -223,8 +224,9 @@
     // Persist that onboarding has been completed/dismissed (state lives in .zkv).
     markOnboarded: () => req("POST", "/api/onboarded"),
     inspectAddress: (address) => req("POST", "/api/inspect-address", { address }),
-    restore: (name, phrase, network, birthday) =>
-      req("POST", "/api/restore", { name, phrase, network, birthday }),
+    verifyPhrase: (phrase, address) => req("POST", "/api/verify-phrase", { phrase, address }),
+    restore: (name, phrase, network, pool, birthday) =>
+      req("POST", "/api/restore", { name, phrase, network, pool, birthday }),
     setCurrent: (name) => req("POST", "/api/current", { name }),
     // Permanently delete a database's local state (the on-chain writes remain).
     forget: (name) => req("DELETE", "/api/databases/" + enc(name)),

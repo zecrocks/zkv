@@ -11,7 +11,7 @@ use crate::{
             AuditResult, AuditRow, HistoryEntry, HistoryResult, HistoryStatus, Op, RowOutcome,
         },
         state::{load_audit, load_history_page, load_state, HistoryOrder},
-        sync::run_sync_read,
+        sync::run_sync_read_confs,
     },
 };
 
@@ -141,7 +141,7 @@ impl Command {
 
         if !self.offline && !crate::commands::blocksync_skip(&name)? {
             let fetch_mempool_too = self.confirmations == 0;
-            run_sync_read(&name, &connection, fetch_mempool_too).await?;
+            run_sync_read_confs(&name, &connection, self.confirmations, fetch_mempool_too).await?;
         }
 
         // Version gate (authoritative post-sync state): warn if the database is
@@ -569,6 +569,8 @@ struct HistoryEntryJson<'a> {
     txid: &'a str,
     output_index: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     signature: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     signer: Option<&'a str>,
@@ -587,6 +589,7 @@ impl<'a> From<&'a HistoryEntry> for HistoryEntryJson<'a> {
             timestamp: e.timestamp,
             txid: &e.txid,
             output_index: e.output_index,
+            seq: e.seq,
             signature: e.signature.as_deref(),
             signer: e.signer.as_deref(),
             verified: e.verified,

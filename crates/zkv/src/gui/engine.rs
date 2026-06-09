@@ -211,6 +211,15 @@ pub struct DbDetail {
     /// Funds still confirming (subset of `balance`). `None` for watch-only.
     pub confirming: Option<u64>,
     pub synced: Option<u32>,
+    /// Authoritative "the wallet has scanned up to the live chain tip" verdict
+    /// (`Database::synced_to_tip`: within tip tolerance AND no outstanding scan
+    /// ranges). Computed via one lightwalletd round-trip, but **only** when the
+    /// read came back `uninitialized` (the sole case the frontend's first-sync
+    /// gate consults it); `false` otherwise. The frontend uses this to leave the
+    /// "Starting sync…" panel for the "needs initialization" state once it is
+    /// certain no INIT exists, even when the separate status-poll `chain_tip` is
+    /// momentarily unavailable.
+    pub synced_to_tip: bool,
     pub keys: Vec<KeyRow>,
     /// Whether the `/history` endpoint is wired up (it now is). The
     /// frontend keeps the flag so an older backend degrades gracefully.
@@ -253,6 +262,10 @@ pub struct HistoryEntryResp {
     pub txid: String,
     pub output_index: u32,
     pub signature: Option<String>,
+    /// The replay-protection sequence this write referenced on the wire (the
+    /// `[seq]` prefix on the signature line). `null` only for not-yet-cached
+    /// pending entries.
+    pub seq: Option<u64>,
     /// Compressed-hex of the signer that authored this write (a delegated
     /// owner/writer in a multi-signer database, which may differ from the
     /// database root). `null` for not-yet-confirmable pending entries.
@@ -539,6 +552,12 @@ pub struct RevealPhraseResp {
 #[derive(Serialize)]
 pub struct FaucetResp {
     pub outcome: String,
+    /// The broadcast txid, when the faucet returned one (the sponsored-INIT
+    /// path). `None` for the fund-only call or when the faucet's 2xx response
+    /// carried no txid. Lets the GUI's INIT receipt show the txid even though
+    /// the faucet, not the local wallet, created the transaction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub txid: Option<String>,
 }
 
 /// A signed-but-unbroadcast memo, produced by the Reference view's per-opcode
@@ -795,12 +814,21 @@ impl Engine {
     pub async fn detail(&self, name: String) -> Result<DbDetail, ZkvError> {
         let conn = self.conn.clone();
         let paused = self.paused.lock().unwrap().contains(&name);
-        run_blocking(move |_| {
+        run_blocking(move |h| {
             let cfg = WalletConfig::read(&name).map_err(|e| classify_unknown(e, &name))?;
             let db = Database::open(&name, conn.clone())?;
             let server = server_endpoint(&conn, db.network().into());
             let result = db.read(Confirmations::Default)?;
             let (init, init_done, init_required) = init_parts(&result.init);
+            // Only the uninitialized verdict is provisional (an INIT could still
+            // be sitting in not-yet-scanned blocks), so that is the only case
+            // worth a tip probe. For initialized/initializing the frontend's
+            // gate already treats the verdict as final, so skip the round-trip.
+            let synced_to_tip = if matches!(result.init, InitState::Uninitialized) {
+                h.block_on(db.synced_to_tip()).unwrap_or(false)
+            } else {
+                false
+            };
             let balance = match db.balance() {
                 Ok(b) => Some(b),
                 Err(ZkvError::WatchOnly) => None,
@@ -834,6 +862,7 @@ impl Engine {
                 balance,
                 confirming,
                 synced: db.synced_height()?,
+                synced_to_tip,
                 keys: key_rows(&result.state),
                 history_available: true,
                 paused,
@@ -997,6 +1026,7 @@ impl Engine {
         };
         Ok(FaucetResp {
             outcome: outcome.to_owned(),
+            txid: None,
         })
     }
 
@@ -1016,13 +1046,14 @@ impl Engine {
             Ok::<_, ZkvError>((p.memo_text, p.zkv_addr))
         })
         .await?;
+        let mut init_txid: Option<String> = None;
         let outcome = match faucet_call("/init", &serde_json::json!({ "memo": memo }), "init").await
         {
             FaucetCall::Ok(body) => {
                 match faucet_txid(&body) {
                     Some(txid) => {
                         let entry = pending::PendingEntry {
-                            txid,
+                            txid: txid.clone(),
                             op: "INIT".to_owned(),
                             key: zkv_addr,
                             value: None,
@@ -1032,6 +1063,7 @@ impl Engine {
                         if let Err(e) = pending::append(&name, entry) {
                             tracing::warn!(target: "zkv::gui::faucet", "recording pending faucet INIT: {e:#}");
                         }
+                        init_txid = Some(txid);
                     }
                     None => {
                         tracing::warn!(target: "zkv::gui::faucet", body = %body, "faucet init: 2xx but no txid in response")
@@ -1044,6 +1076,7 @@ impl Engine {
         };
         Ok(FaucetResp {
             outcome: outcome.to_owned(),
+            txid: init_txid,
         })
     }
 
@@ -1367,20 +1400,85 @@ impl Engine {
         .await
     }
 
-    /// Restore an admin database from a recovery phrase.
+    /// Check whether a 24-word recovery phrase actually controls the database
+    /// named by a `zkv1…` address: derive the phrase's account-0 UFVK on the
+    /// address's network and compare its receiver identity (under the address's
+    /// pool) to the address's own. The restore flow calls this when both an
+    /// address and a full phrase are present, so a wrong phrase (or a phrase
+    /// pasted against the wrong address) is caught before it spends a sync.
+    /// `Ok(true)` means the phrase is this database's admin seed; `Ok(false)` a
+    /// valid phrase for a *different* database; an error only if the phrase
+    /// isn't a valid BIP-39 mnemonic or the address won't parse.
+    pub async fn verify_phrase(&self, phrase: String, address: String) -> Result<bool, ZkvError> {
+        run_blocking(move |_| {
+            use bip0039::{English, Mnemonic};
+            use secrecy::Zeroize as _;
+            use zcash_keys::keys::UnifiedSpendingKey;
+            use zip32::AccountId;
+
+            let parsed =
+                crate::protocol::parse_zkv_addr(address.trim()).map_err(ZkvError::Other)?;
+            let params =
+                crate::protocol::network_from_type(parsed.network).map_err(ZkvError::Other)?;
+
+            let mut normalized = phrase
+                .to_lowercase()
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ");
+            let mnemonic: Mnemonic<English> = Mnemonic::from_phrase(&normalized)
+                .map_err(|e| ZkvError::Other(anyhow::anyhow!("invalid recovery phrase: {e}")))?;
+            normalized.zeroize();
+            let ufvk_seed = {
+                let mut seed = mnemonic.to_seed("");
+                let usk = UnifiedSpendingKey::from_seed(&params, &seed, AccountId::ZERO);
+                seed.zeroize();
+                usk.map_err(|e| ZkvError::Other(anyhow::anyhow!("derive key from phrase: {e}")))?
+                    .to_unified_full_viewing_key()
+            };
+
+            // Same seed ⟹ same single-pool receiver ⟹ same database identity.
+            let want = crate::protocol::receiver_domain(&parsed.ufvk, parsed.pool, parsed.network)
+                .map_err(ZkvError::Other)?;
+            let got = crate::protocol::receiver_domain(&ufvk_seed, parsed.pool, parsed.network)
+                .map_err(ZkvError::Other)?;
+            Ok::<_, ZkvError>(want == got)
+        })
+        .await
+    }
+
+    /// Restore an admin database from a recovery phrase. `pool` is the shielded
+    /// pool the original database lives in (Orchard by default; a pasted zkv
+    /// address pins it, so a Sapling database restores correctly). `birthday`
+    /// is required: the caller supplies it from the pasted address or an
+    /// explicit height. A `None` birthday is rejected rather than guessed, so a
+    /// restore never silently starts near the chain tip and misses history.
     pub async fn restore(
         &self,
         name: String,
         phrase: String,
         network: Network,
+        pool: ShieldedProtocol,
         birthday: Option<u32>,
     ) -> Result<AddDbResp, ZkvError> {
+        // A bare phrase (no zkv address, no height) has no safe starting point:
+        // recovering it would mean scanning for the INIT, which is future work.
+        let birthday = birthday.ok_or_else(|| {
+            ZkvError::Other(anyhow::anyhow!(
+                "restoring needs a birthday height or a zkv address"
+            ))
+        })?;
         let lock = self.db_lock(&name);
         let _guard = lock.lock().await;
         let conn = self.conn.clone();
         run_blocking(move |h| {
-            let db = h.block_on(Database::restore_admin(
-                &name, network, &phrase, birthday, conn,
+            let db = h.block_on(Database::restore_admin_with_pool(
+                &name,
+                network,
+                &phrase,
+                Some(birthday),
+                pool,
+                conn,
             ))?;
             // First user-created database claims the CLI `current` marker if it
             // is unset or still the bundled demo; see `create`. Best-effort.
@@ -1813,6 +1911,7 @@ fn history_resp(result: HistoryResult, auth: Option<&AuthRegistry>) -> HistoryRe
                 txid: e.txid,
                 output_index: e.output_index,
                 signature: e.signature,
+                seq: e.seq,
                 signer: e.signer,
                 signer_role,
                 verified: e.verified,
@@ -2064,6 +2163,7 @@ mod tests {
             txid: format!("tx-{key}"),
             output_index: 0,
             signature: Some("ab".to_owned()),
+            seq: Some(0),
             signer: Some("cafe".to_owned()),
             verified: Some(true),
             status,

@@ -11,7 +11,7 @@ use crate::{
         pending,
         protocol::{InitState, KeyState, PendingOp},
         state::load_state,
-        sync::run_sync_read,
+        sync::run_sync_read_confs,
     },
 };
 
@@ -71,7 +71,7 @@ impl Command {
 
         if !self.offline && !crate::commands::blocksync_skip(&name)? {
             let fetch_mempool_too = self.confirmations == 0;
-            run_sync_read(&name, &connection, fetch_mempool_too).await?;
+            run_sync_read_confs(&name, &connection, self.confirmations, fetch_mempool_too).await?;
         }
 
         let min_confs = self.confirmations;

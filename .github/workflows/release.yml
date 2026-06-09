@@ -7,14 +7,16 @@ name: release
 #                           (nothing is published), so the pipeline can be
 #                           exercised without cutting a tag.
 #
-# Artifacts (each with a matching `.sha256`). Filenames are STABLE across
+# Artifacts (each with a matching `.sha256` published alongside it in the
+# release, never packed inside an archive). Filenames are STABLE across
 # releases (no version), so `releases/latest/download/<name>` is a permanent
 # link; the version lives inside instead (the CLI archives unpack to a
 # `zkv-cli-<ver>-<label>/` folder, the GUI bundles carry it in their .app
-# Info.plist / .deb / .exe metadata). Filenames use a short platform label;
-# the build itself still uses the full Rust target triple.
-#   * Linux, x86_64 (build `x86_64-unknown-linux-gnu`, label `x86_64-linux`)
-#     and aarch64 (build `aarch64-unknown-linux-gnu`, label `aarch64-linux`),
+# Info.plist / .deb / .exe metadata). Filenames use a short
+# `<platform>-<arch>` label; the build itself still uses the full Rust target
+# triple.
+#   * Linux, x86_64 (build `x86_64-unknown-linux-gnu`, label `linux-x86_64`)
+#     and aarch64 (build `aarch64-unknown-linux-gnu`, label `linux-aarch64`),
 #     each built on a native runner (no cross-compile):
 #       - zkv-cli-<label>.tgz          : the lean `zkv` CLI (versioned folder inside).
 #       - zkv-browser-<label>.AppImage : desktop GUI, the portable single-file
@@ -25,11 +27,11 @@ name: release
 #       - zkv-cli-macos-arm.tgz      : the lean `zkv` CLI (versioned folder inside).
 #       - zkv-browser-macos-arm.dmg  : the native desktop GUI, a
 #         Tauri-bundled `.app` packaged in a `.dmg`.
-#   * Windows, x64 (build `x86_64-pc-windows-msvc`, label `x86_64-windows`):
-#       - zkv-cli-x86_64-windows.zip              : the lean `zkv.exe` (versioned folder inside).
-#       - zkv-browser-x86_64-windows-portable.exe : desktop GUI, the
+#   * Windows, x64 (build `x86_64-pc-windows-msvc`, label `windows-x86_64`):
+#       - zkv-cli-windows-x86_64.zip              : the lean `zkv.exe` (versioned folder inside).
+#       - zkv-browser-windows-x86_64-portable.exe : desktop GUI, the
 #         standalone single-file app (no installer; needs WebView2 present).
-#       - zkv-browser-x86_64-windows-setup.exe    : desktop GUI, NSIS
+#       - zkv-browser-windows-x86_64-setup.exe    : desktop GUI, NSIS
 #         installer (provisions WebView2). Not code-signed yet, so SmartScreen
 #         will warn.
 # To add more targets, extend the matrix (and add the matching runners).
@@ -72,14 +74,14 @@ jobs:
           platform="${{ inputs.platform || 'all' }}"
           all=$(cat <<'JSON'
           [
-            {"name":"zkv-cli-linux-x86_64","kind":"cli","bin":"zkv","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","label":"x86_64-linux","platform":"linux"},
-            {"name":"zkv-cli-linux-aarch64","kind":"cli","bin":"zkv","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","label":"aarch64-linux","platform":"linux"},
-            {"name":"zkv-browser-linux-x86_64","kind":"browser","bin":"zkv-browser","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","label":"x86_64-linux","platform":"linux"},
-            {"name":"zkv-browser-linux-aarch64","kind":"browser","bin":"zkv-browser","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","label":"aarch64-linux","platform":"linux"},
+            {"name":"zkv-cli-linux-x86_64","kind":"cli","bin":"zkv","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","label":"linux-x86_64","platform":"linux"},
+            {"name":"zkv-cli-linux-aarch64","kind":"cli","bin":"zkv","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","label":"linux-aarch64","platform":"linux"},
+            {"name":"zkv-browser-linux-x86_64","kind":"browser","bin":"zkv-browser","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","label":"linux-x86_64","platform":"linux"},
+            {"name":"zkv-browser-linux-aarch64","kind":"browser","bin":"zkv-browser","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","label":"linux-aarch64","platform":"linux"},
             {"name":"zkv-cli-macos-arm","kind":"cli","bin":"zkv","os":"macos-14","target":"aarch64-apple-darwin","label":"macos-arm","platform":"macos"},
             {"name":"zkv-browser-macos-arm","kind":"browser","bin":"zkv-browser","os":"macos-14","target":"aarch64-apple-darwin","label":"macos-arm","platform":"macos"},
-            {"name":"zkv-cli-windows","kind":"cli","bin":"zkv","os":"windows-2025","target":"x86_64-pc-windows-msvc","label":"x86_64-windows","platform":"windows"},
-            {"name":"zkv-browser-windows","kind":"browser","bin":"zkv-browser","os":"windows-2025","target":"x86_64-pc-windows-msvc","label":"x86_64-windows","platform":"windows"}
+            {"name":"zkv-cli-windows","kind":"cli","bin":"zkv","os":"windows-2025","target":"x86_64-pc-windows-msvc","label":"windows-x86_64","platform":"windows"},
+            {"name":"zkv-browser-windows","kind":"browser","bin":"zkv-browser","os":"windows-2025","target":"x86_64-pc-windows-msvc","label":"windows-x86_64","platform":"windows"}
           ]
           JSON
           )

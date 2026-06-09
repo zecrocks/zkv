@@ -243,6 +243,7 @@ const historyYaml = (e: HistoryEntryResp, signer: string | null, network: string
           : "0 " + window.currencyFor(network),
       ],
       ["fee", e.fee != null ? window.formatZats(e.fee, network) : null],
+      ["sequence", e.seq != null ? e.seq : null],
       ["signer", signer || null],
       ["signature", e.signature || null],
     ]) + "\n"
@@ -711,9 +712,6 @@ const KeyList = ({
                       ) : init === "uninitialized" ? (
                         <div>
                           <strong style={{ color: "var(--fg-1)" }}>Database not initialized.</strong>
-                          <div style={{ marginTop: 6, color: "var(--fg-3)", fontSize: 13, maxWidth: 320 }}>
-                            Broadcast an INIT before you begin using it.
-                          </div>
                           {isAdmin && (
                             <div style={{ marginTop: 14 }}>
                               <button className="btn primary sm" onClick={() => onWriteKey(null)}>
@@ -1398,6 +1396,12 @@ const HistoryDetail = ({ entry, creator, onCopy, timeZone, network, roles, onOpe
           <span className="value">
             <SignerLink pubkey={signer} role={signerRole} onOpenRole={onOpenRole} />
 
+          </span>
+        </div>
+        <div className="kv-row">
+          <span className="label" title="Replay-protection sequence this write referenced on the wire">Sequence</span>
+          <span className="value">
+            {entry.seq != null ? entry.seq : <span style={{ color: "var(--fg-3)" }}>—</span>}
           </span>
         </div>
         {entry.signature && (

@@ -124,6 +124,7 @@ declare global {
     balance: number | null;
     confirming: number | null;
     synced: number | null;
+    synced_to_tip: boolean;
     keys: KeyRow[];
     history_available: boolean;
     paused: boolean;
@@ -172,6 +173,7 @@ declare global {
     txid: string;
     output_index: number;
     signature: string | null;
+    seq: number | null; // replay-protection sequence referenced on the wire
     signer: string | null;
     signer_role: string | null;
     verified: boolean | null;
@@ -277,6 +279,9 @@ declare global {
   // later").
   interface FaucetResp {
     outcome: string;
+    /// The broadcast txid for the sponsored-INIT path, when the faucet returned
+    /// one. Absent for the fund-only call.
+    txid?: string | null;
   }
 
   interface CreateResp {
@@ -392,10 +397,12 @@ declare global {
     reimportDemo(): Promise<AddDbResp>;
     markOnboarded(): Promise<unknown>;
     inspectAddress(address: string): Promise<ZkvAddrInfoResp>;
+    verifyPhrase(phrase: string, address: string): Promise<boolean>;
     restore(
       name: string,
       phrase: string,
       network: string,
+      pool: string,
       birthday?: number,
     ): Promise<AddDbResp>;
     setCurrent(name: string): Promise<OkResp>;

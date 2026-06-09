@@ -681,8 +681,8 @@ function App() {
     openDb(r.name);
     return r;
   };
-  const onRestore = async (name: string, phrase: string, network: string, birthday?: number) => {
-    const r = await api.restore(name, phrase, network, birthday);
+  const onRestore = async (name: string, phrase: string, network: string, pool: string, birthday?: number) => {
+    const r = await api.restore(name, phrase, network, pool, birthday);
     await refreshDatabases();
     flash("Restored " + r.name);
     openDb(r.name);
@@ -1117,16 +1117,45 @@ function App() {
   // exists: a partial scan reads "uninitialized" only because the INIT block
   // isn't reached yet, then flips once it lands. That race made the panel
   // flicker "not initialized" before settling. We are sure once either the read
-  // already found an INIT (init != "uninitialized") OR the db's own scanned
-  // height (detail.synced, the height that produced this init verdict, not the
-  // racy status height) has reached the tip. Until then, hold every tab in a
-  // single syncing view. Gating on detail.synced (vs the live status height)
-  // is what keeps the verdict and the height from coming from different reads.
+  // already found an INIT (init != "uninitialized") OR the scan has reached the
+  // tip. Until then, hold every tab in a single syncing view.
+  //
+  // "Reached the tip" has two signals. The authoritative one is the backend's
+  // `detail.synced_to_tip` (computed in the same read that produced the
+  // uninitialized verdict: within tip tolerance AND no outstanding scan ranges).
+  // We prefer it because it does not depend on the separate status-poll
+  // `chain_tip`, which can be momentarily null (a failed/racy tip probe) and
+  // would otherwise pin a fully-scanned uninitialized db on "Starting sync…"
+  // forever. As a fallback (older backend without the field), compare the db's
+  // own scanned height against the live status tip; gating on detail.synced (vs
+  // the racy status height) keeps the verdict and the height from coming from
+  // different reads.
   const tipKnown = statusMatches && status.chain_tip != null && status.chain_tip > 0;
   const detailSynced = detailMatches && detail && detail.synced != null ? detail.synced : null;
   const initKnown = !!detail && detail.init !== "uninitialized";
-  const fullyScanned = !!(tipKnown && detailSynced != null && detailSynced >= (status!.chain_tip as number) - 1);
-  const firstSyncPending = !!detail && detailMatches && !initKnown && !fullyScanned;
+  const fullyScanned = !!(
+    detail &&
+    detailMatches &&
+    (detail.synced_to_tip === true ||
+      (tipKnown && detailSynced != null && detailSynced >= (status!.chain_tip as number) - 1))
+  );
+  // Latch the gate per database. It is a *one-time* first-import takeover, not
+  // an ongoing sync indicator: once we have reached a final verdict for this db
+  // (an INIT was found, or the scan reached the tip at least once), keep the
+  // full-screen panel dismissed. Without this latch the gate flaps on every new
+  // block: a freshly mined block leaves the wallet ~1 block behind the tip with
+  // a pending scan range, so `fullyScanned` momentarily reverts to false and the
+  // whole pane jumps back to "Starting sync…" until the next scan, every block.
+  // Ongoing block-by-block sync is shown by the status bar, not by re-taking the
+  // pane. Reset when the active db changes (the next db starts its own gate).
+  const firstSyncSettledRef = React.useRef<{ name: string | null; settled: boolean }>({ name: null, settled: false });
+  if (firstSyncSettledRef.current.name !== activeName) {
+    firstSyncSettledRef.current = { name: activeName, settled: false };
+  } else if (detailMatches && (initKnown || fullyScanned)) {
+    firstSyncSettledRef.current.settled = true;
+  }
+  const firstSyncPending =
+    !!detail && detailMatches && !initKnown && !fullyScanned && !firstSyncSettledRef.current.settled;
   const latency = statusMatches && status.latency_ms != null ? status.latency_ms : null;
   // The status-bar funds come from `detail` (there's no per-db balance in the
   // sidebar summary), so during a *cross-network* switch the stale balance and

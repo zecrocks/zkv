@@ -84,6 +84,11 @@ pub struct HistoryEntry {
     /// pending-from-`pending.toml` entries (the signature isn't cached
     /// locally; it reappears once the wallet decrypts its own broadcast).
     pub signature: Option<String>,
+    /// The replay-protection sequence this write referenced on the wire (the
+    /// `[seq]` prefix on the signature line; see [`encode_sig_line`]). `None`
+    /// only for pending-from-`pending.toml` entries whose signed memo wasn't
+    /// cached locally (older rows predating the `memo` field).
+    pub seq: Option<u64>,
     /// Compressed-hex of the signer recovered from this write's signature:
     /// the delegated owner/writer that authored it, which may differ from the
     /// database's root key. `None` for pending-from-`pending.toml` entries not
@@ -167,6 +172,7 @@ pub fn history_entry_from_memo(
         txid,
         output_index,
         signature: Some(cmd.sig_hex),
+        seq: Some(cmd.seq),
         // This helper has no authorization registry, so it cannot attribute
         // the per-entry signer or judge authorization; it is used only for the
         // `pending.toml` fallback where the entry is `Pending` (signer `None`).
@@ -270,6 +276,7 @@ pub fn history_entry_folding(
         txid,
         output_index,
         signature,
+        seq: Some(c.seq),
         signer,
         verified: Some(verified),
         status: hist_status,

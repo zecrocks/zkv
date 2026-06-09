@@ -119,7 +119,9 @@ const WriteFlow = ({ db, prefillKey, prefillValue, mode = 'set', synced, syncing
       const r = await window.zkvApi.faucetInit(db.name);
       if (r.outcome === 'outdated') { setFaucetInitState('outdated'); return; }
       if (r.outcome !== 'ok') { setFaucetInitState('retry'); return; }
-      setTxHash('');
+      // The faucet (not our wallet) created the tx, but it returns the txid so
+      // the receipt can show it just like the self-funded path.
+      setTxHash(r.txid || '');
       setInitPhase('done');
     } catch (_) {
       setFaucetInitState('retry');
@@ -429,7 +431,7 @@ const WriteFlow = ({ db, prefillKey, prefillValue, mode = 'set', synced, syncing
       <div className="modal-foot">
         <div className="cost">
           <Icon name="zap" size={11} />
-          <span>Recipient: this database's Zcash Orchard address</span>
+          <span>Recipient: this database's Zcash {db.pool === 'sapling' ? 'Sapling' : 'Orchard'} address</span>
         </div>
         <div style={{display:'flex', gap:8}}>
           <button className="btn secondary" onClick={() => setStep('form')}>← Back</button>

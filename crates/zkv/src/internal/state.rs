@@ -25,9 +25,10 @@ use crate::{
         account::account_keys,
         pending,
         protocol::{
-            history_entry_folding, history_entry_from_memo, render_memo_with_comment, replay_audit,
-            replay_with_seed, AuditEntry, AuditResult, HistoryEntry, HistoryResult, HistoryStatus,
-            InitState, Op, ReplayResult, VersionState, WriteStatus,
+            history_entry_folding, history_entry_from_memo, parse_text_memo,
+            render_memo_with_comment, replay_audit, replay_with_seed, AuditEntry, AuditResult,
+            HistoryEntry, HistoryResult, HistoryStatus, InitState, Op, ReplayResult, VersionState,
+            WriteStatus,
         },
         snapshot::{self, PromoteRow, SAFE_DEPTH},
     },
@@ -162,6 +163,27 @@ fn txid_blob_from_hex(hex_str: &str) -> Option<Vec<u8>> {
 /// init-flow poll loop (success after 1 confirmation, per the plan). Read
 /// commands keep their own `--confirmations` (default 3).
 pub const INIT_CONFIRMATIONS: u32 = 1;
+
+/// Effective confirmation threshold for one decoded memo row.
+///
+/// INIT is the database's genesis claim: signature-gated (a non-root signer is
+/// `ForgedInit`) and once-only, so it is treated as confirmed as soon as it is
+/// [`INIT_CONFIRMATIONS`] deep, independent of the read's stricter data-write
+/// depth. This matters for an INIT a faucet broadcast on our behalf: that memo
+/// is *externally received* (the faucet, not us, created the tx), so under the
+/// default 3-confirmation read it would be dropped while 1-2 blocks deep, and
+/// once the local pending record is pruned the database would flap back to
+/// "uninitialized" for a block or two before settling. Confirming INIT at its
+/// own depth keeps a freshly mined INIT visible the whole way through. Capped at
+/// `min_confs` so an explicit shallower read (e.g. mempool, `-c 0`) still wins.
+/// All other ops use `min_confs` unchanged.
+fn effective_min_confs(is_init: bool, min_confs: u32) -> u32 {
+    if is_init {
+        INIT_CONFIRMATIONS.min(min_confs)
+    } else {
+        min_confs
+    }
+}
 
 /// The database's required [`VersionState`] from the snapshot cache alone, without
 /// sync or full replay. See [`snapshot::cached_version`]. Lets command/facade
@@ -362,17 +384,22 @@ pub fn load_state_with_height(
             .as_deref()
             .map(|b| b == account_uuid_bytes.as_slice())
             .unwrap_or(false);
+        // INIT confirms at its own (shallower) depth so a faucet-broadcast
+        // (externally-received) INIT isn't dropped below the data-write
+        // threshold; see `effective_min_confs`.
+        let is_init = parse_text_memo(&text).is_some_and(|c| c.op == Op::Init);
+        let eff_confs = effective_min_confs(is_init, min_confs);
         let status = if is_mempool {
             WriteStatus::Confirming {
                 done: 0,
-                required: min_confs,
+                required: eff_confs,
             }
-        } else if confs >= min_confs {
+        } else if confs >= eff_confs {
             WriteStatus::Confirmed
         } else if is_self_sent {
             WriteStatus::Confirming {
                 done: confs,
-                required: min_confs,
+                required: eff_confs,
             }
         } else {
             // Externally-received memo below the caller's confirmation
@@ -527,16 +554,21 @@ pub fn load_history_page(
             .as_deref()
             .map(|b| b == account_uuid_bytes.as_slice())
             .unwrap_or(false);
+        // INIT confirms at its own (shallower) depth so a faucet-broadcast
+        // (externally-received) INIT isn't dropped below the data-write
+        // threshold; see `effective_min_confs`.
+        let is_init = parse_text_memo(&text).is_some_and(|c| c.op == Op::Init);
+        let eff_confs = effective_min_confs(is_init, min_confs);
         let status = if is_mempool {
             HistoryStatus::Pending
-        } else if confs >= min_confs {
+        } else if confs >= eff_confs {
             HistoryStatus::Confirmed {
                 confirmations: confs,
             }
         } else if is_self_sent {
             HistoryStatus::Confirming {
                 done: confs,
-                required: min_confs,
+                required: eff_confs,
             }
         } else {
             continue; // externally-received below threshold: drop
@@ -628,6 +660,7 @@ pub fn load_history_page(
             txid: entry.txid.clone(),
             output_index: 0,
             signature: None,
+            seq: None,
             signer: None,
             verified: None,
             status: HistoryStatus::Pending,
@@ -715,6 +748,7 @@ pub fn load_history_page(
             txid: txid_hex(&row.txid),
             output_index: row.output_index,
             signature: Some(row.signature),
+            seq: Some(row.seq),
             signer: Some(row.signer),
             verified: Some(true),
             status: HistoryStatus::Confirmed { confirmations },
@@ -952,6 +986,20 @@ fn fill_tx_fee_and_output(
 mod tests {
     use super::*;
     use crate::internal::snapshot::SAFE_DEPTH;
+
+    #[test]
+    fn effective_min_confs_confirms_init_at_its_own_depth() {
+        // INIT confirms at INIT_CONFIRMATIONS (1), independent of the read's
+        // stricter data-write depth, so a faucet-broadcast (externally-received)
+        // INIT isn't dropped while 1-2 blocks deep under a default -c 3 read.
+        assert_eq!(effective_min_confs(true, 3), INIT_CONFIRMATIONS);
+        assert_eq!(effective_min_confs(true, 1), 1);
+        // Capped at the caller's depth: a mempool / -c 0 read still wins.
+        assert_eq!(effective_min_confs(true, 0), 0);
+        // Non-INIT ops are unchanged.
+        assert_eq!(effective_min_confs(false, 3), 3);
+        assert_eq!(effective_min_confs(false, 0), 0);
+    }
 
     #[test]
     fn promote_cutoff_uses_reorg_margin_when_fully_synced() {

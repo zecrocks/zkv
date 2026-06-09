@@ -157,6 +157,7 @@ fn router(state: Arc<AppState>) -> Router {
         .route("/reimport-demo", post(handle_reimport_demo))
         .route("/onboarded", post(handle_mark_onboarded))
         .route("/inspect-address", post(handle_inspect_address))
+        .route("/verify-phrase", post(handle_verify_phrase))
         .route("/restore", post(handle_restore))
         .route("/current", post(handle_current))
         .route("/settings", post(handle_settings))
@@ -321,8 +322,17 @@ struct RestoreReq {
     phrase: String,
     #[serde(default = "default_network")]
     network: String,
+    /// `"sapling"` or `"orchard"`; absent means Orchard (the default).
+    #[serde(default)]
+    pool: Option<String>,
     #[serde(default)]
     birthday: Option<u32>,
+}
+
+#[derive(Deserialize)]
+struct VerifyPhraseReq {
+    phrase: String,
+    address: String,
 }
 
 #[derive(Deserialize)]
@@ -588,15 +598,28 @@ async fn handle_inspect_address(
     Ok(Json(state.engine.inspect_address(body.address).await?))
 }
 
+async fn handle_verify_phrase(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<VerifyPhraseReq>,
+) -> Result<Json<bool>, ApiError> {
+    Ok(Json(
+        state
+            .engine
+            .verify_phrase(body.phrase, body.address)
+            .await?,
+    ))
+}
+
 async fn handle_restore(
     State(state): State<Arc<AppState>>,
     Json(body): Json<RestoreReq>,
 ) -> Result<Json<AddDbResp>, ApiError> {
     let network = parse_network(&body.network)?;
+    let pool = parse_pool(body.pool.as_deref())?;
     Ok(Json(
         state
             .engine
-            .restore(body.name, body.phrase, network, body.birthday)
+            .restore(body.name, body.phrase, network, pool, body.birthday)
             .await?,
     ))
 }

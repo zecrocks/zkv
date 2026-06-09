@@ -16,6 +16,38 @@ use zcash_protocol::consensus::Network;
 
 use crate::socks::SocksConnector;
 
+/// Bound the TCP+TLS handshake. A fresh connect right after a laptop wakes
+/// from sleep (network not yet back, DNS stalled) fails fast and the caller
+/// reconnects on the next cycle, instead of hanging on a handshake that may
+/// never complete.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// HTTP/2 PING keepalive interval. With [`KEEPALIVE_TIMEOUT`], a connection
+/// whose peer has silently gone away (laptop slept mid-sync, NAT rebind, a
+/// server that idle-closed the socket) is detected within roughly the sum of
+/// the two, so a long-lived streaming RPC (block download) fails with an error
+/// instead of blocking forever on a socket that will never produce another
+/// byte. This is the core fix for "the GUI stops syncing after the laptop has
+/// been asleep and never recovers until restarted": the dead-connection RPC now
+/// errors out, the auto-sync worker returns, and the loop reconnects fresh.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(20);
+/// How long to wait for a keepalive PING ack before declaring the connection
+/// dead. See [`KEEPALIVE_INTERVAL`].
+const KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Apply the shared connect-timeout + keepalive settings to an endpoint, so
+/// both the direct and SOCKS paths detect a dead connection (rather than hang)
+/// and bound the handshake. Keepalives are sent even while idle so a connection
+/// that died between requests is noticed too.
+fn tune_endpoint(endpoint: Endpoint) -> Endpoint {
+    endpoint
+        .connect_timeout(CONNECT_TIMEOUT)
+        .tcp_keepalive(Some(KEEPALIVE_INTERVAL))
+        .http2_keep_alive_interval(KEEPALIVE_INTERVAL)
+        .keep_alive_timeout(KEEPALIVE_TIMEOUT)
+        .keep_alive_while_idle(true)
+}
+
 const ECC_TESTNET: &[Server<'_>] = &[Server::fixed("lightwalletd.testnet.electriccoin.co", 9067)];
 
 const YWALLET_MAINNET: &[Server<'_>] = &[
@@ -141,19 +173,20 @@ impl Server<'_> {
     pub async fn connect_direct(&self) -> anyhow::Result<CompactTxStreamerClient<Channel>> {
         info!("Connecting to {}", self);
 
-        let channel = Channel::from_shared(self.endpoint())?;
-        let channel = if self.use_tls() {
-            channel.tls_config(
+        let endpoint = Channel::from_shared(self.endpoint())?;
+        let endpoint = if self.use_tls() {
+            endpoint.tls_config(
                 ClientTlsConfig::new()
                     .domain_name(self.host.to_string())
                     .assume_http2(true)
                     .with_webpki_roots(),
             )?
         } else {
-            channel
+            endpoint
         };
+        let endpoint = tune_endpoint(endpoint);
 
-        Ok(CompactTxStreamerClient::new(channel.connect().await?))
+        Ok(CompactTxStreamerClient::new(endpoint.connect().await?))
     }
 
     pub async fn connect_over_socks(
@@ -165,9 +198,8 @@ impl Server<'_> {
         let connector = SocksConnector::new(proxy_addr);
         let uri: Uri = self.endpoint().parse()?;
 
-        let mut endpoint = Endpoint::from(uri.clone())
-            .connect_timeout(Duration::from_secs(10))
-            .timeout(Duration::from_secs(30));
+        let mut endpoint =
+            tune_endpoint(Endpoint::from(uri.clone())).timeout(Duration::from_secs(30));
 
         if self.use_tls() {
             endpoint = endpoint.tls_config(

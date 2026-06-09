@@ -10,7 +10,9 @@ use crate::{
     commands::connection_args::ConnectionCliArgs,
     config::{parse_pool, WalletConfig},
     data::{db_dir, init_dbs, Network},
-    internal::protocol::{encode_zkv_addr, zkv_verifying_pubkey},
+    internal::protocol::{
+        encode_zkv_addr, network_from_type, parse_zkv_addr, receiver_domain, zkv_verifying_pubkey,
+    },
     ui,
 };
 
@@ -19,18 +21,29 @@ pub(crate) struct Command {
     /// Database name. Defaults to "default".
     pub(crate) name: Option<String>,
 
-    /// Network: "mainnet" (default) or "testnet".
+    /// The database's zkv address (`zkv1…`). When given, the network, pool, and
+    /// birthday are read from it, and the recovery phrase is checked against it:
+    /// a phrase that does not control this database is rejected before anything
+    /// is written. Supplying this OR `--birthday` is required.
+    #[arg(long)]
+    pub(crate) address: Option<String>,
+
+    /// Network: "mainnet" (default) or "testnet". Ignored when `--address` is
+    /// given (the address carries the network).
     #[arg(long, default_value = "mainnet", value_parser = Network::parse)]
     pub(crate) network: Network,
 
-    /// Birthday height; defaults to ~10 blocks below the chain tip (you'll miss
-    /// older memos with the default, pass your original birthday for full history).
+    /// Birthday height to start scanning from. Required unless `--address` is
+    /// given (which carries the birthday); pass the lowest height that still
+    /// covers your INIT. With `--address`, an explicit `--birthday` overrides
+    /// the address's.
     #[arg(long)]
     pub(crate) birthday: Option<u32>,
 
     /// Shielded pool of the database being restored: "orchard" (default) or
     /// "sapling". Must match the pool chosen at the original `zkv init`, or the
     /// reconstructed zkv address won't match and the database will look empty.
+    /// Ignored when `--address` is given (the address carries the pool).
     #[arg(long, default_value = "orchard", value_parser = parse_pool)]
     pub(crate) pool: ShieldedProtocol,
 
@@ -40,8 +53,36 @@ pub(crate) struct Command {
 
 impl Command {
     pub(crate) async fn run(self, _db: Option<String>) -> anyhow::Result<()> {
+        // Restoring needs a pinned starting point: either a zkv address (which
+        // carries network, pool, and birthday) or an explicit birthday height.
+        // Without one we'd have to scan for the INIT to recover the right
+        // database; that is future work, so require the caller to pin it.
+        if self.address.is_none() && self.birthday.is_none() {
+            anyhow::bail!(
+                "restoring needs a starting point: pass --address <zkv1…> \
+                 (carries network, pool, and birthday) or --birthday <height>"
+            );
+        }
+
         let name = self.name.clone().unwrap_or_else(|| "default".to_owned());
-        let params: consensus::Network = self.network.into();
+
+        // A zkv address is authoritative for network and pool (and lets us
+        // verify the phrase below); otherwise fall back to the flags.
+        let parsed_addr = match &self.address {
+            Some(addr) => {
+                Some(parse_zkv_addr(addr).map_err(|e| anyhow!("invalid zkv address: {e}"))?)
+            }
+            None => None,
+        };
+        let network: Network = match &parsed_addr {
+            Some(p) => network_from_type(p.network)?.into(),
+            None => self.network,
+        };
+        let pool = match &parsed_addr {
+            Some(p) => p.pool,
+            None => self.pool,
+        };
+        let params: consensus::Network = network.into();
 
         let dir = db_dir(&name)?;
         if dir.join("keys.toml").exists() {
@@ -63,10 +104,36 @@ impl Command {
         let mnemonic: Mnemonic<English> =
             Mnemonic::from_phrase(&phrase).map_err(|e| anyhow!("invalid phrase: {e}"))?;
 
+        // With a zkv address, verify the phrase actually controls that database
+        // (same seed => same single-pool receiver) before writing anything, so a
+        // wrong phrase or a phrase pasted against the wrong address fails loudly
+        // instead of silently building an empty database. This is offline, so it
+        // runs before the network round-trip below.
+        if let Some(p) = &parsed_addr {
+            use zcash_keys::keys::UnifiedSpendingKey;
+            use zip32::AccountId;
+            let ufvk_seed = {
+                let mut seed = mnemonic.to_seed("");
+                let usk = UnifiedSpendingKey::from_seed(&params, &seed, AccountId::ZERO);
+                seed.zeroize();
+                usk.map_err(|e| anyhow!("derive key from phrase: {e}"))?
+                    .to_unified_full_viewing_key()
+            };
+            let want = receiver_domain(&p.ufvk, p.pool, p.network)?;
+            let got = receiver_domain(&ufvk_seed, p.pool, p.network)?;
+            if want != got {
+                phrase.zeroize();
+                line.zeroize();
+                anyhow::bail!(
+                    "the recovery phrase does not control the database at this zkv address \
+                     (different seed, pool, or network)"
+                );
+            }
+        }
+
         // Refuse to import the same database (same seed, pool, network) twice
         // under a different name.
-        if let Some(existing) = zkv::db::find_duplicate_database(&phrase, self.pool, self.network)?
-        {
+        if let Some(existing) = zkv::db::find_duplicate_database(&phrase, pool, network)? {
             anyhow::bail!(
                 "this database is already imported as {existing:?}; \
                  switch to it with `zkv use {existing}` instead of importing it again"
@@ -74,17 +141,17 @@ impl Command {
         }
 
         let connection = self.connection.into_inner();
-        // Restore re-derives an existing database from its seed; the birthday is
-        // not part of that identity, so honor an explicit `--birthday` verbatim
-        // and otherwise default to tip − safety buffer (you'll miss older memos
-        // with the default). Refuses a stale/unreachable tip either way.
+        // Birthday: an explicit `--birthday` wins (honored verbatim); otherwise
+        // the address carries it. One of the two is always present (checked at
+        // the top). Refuses a stale/unreachable tip either way.
+        let birthday_height = self
+            .birthday
+            .or_else(|| parsed_addr.as_ref().map(|p| p.birthday))
+            .expect("address or birthday is required (checked above)");
         let mut client = connection.connect(params).await?;
-        let birthday = match self.birthday {
-            Some(height) => crate::internal::sync::pinned_birthday(&mut client, height).await?,
-            None => crate::internal::sync::near_tip_birthday(&mut client).await?,
-        };
+        let birthday = crate::internal::sync::pinned_birthday(&mut client, birthday_height).await?;
 
-        WalletConfig::init_admin(&name, &mnemonic, birthday.height(), params, self.pool)?;
+        WalletConfig::init_admin(&name, &mnemonic, birthday.height(), params, pool)?;
 
         let seed = {
             let mut s = mnemonic.to_seed("");
@@ -103,12 +170,12 @@ impl Command {
         let ufvk = zcash_client_backend::data_api::Account::ufvk(&account)
             .ok_or_else(|| anyhow!("no UFVK"))?;
         zkv_verifying_pubkey(ufvk)?;
-        let zkv_addr = encode_zkv_addr(ufvk, &params, self.pool, u32::from(birthday.height()))?;
+        let zkv_addr = encode_zkv_addr(ufvk, &params, pool, u32::from(birthday.height()))?;
 
         ui::success(format!(
             "Imported database {:?} ({}, birthday {})",
             name,
-            self.network.name(),
+            network.name(),
             u32::from(birthday.height()),
         ));
         eprintln!();

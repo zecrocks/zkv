@@ -382,15 +382,31 @@ mod ipc {
     }
 
     #[tauri::command(rename_all = "snake_case")]
+    pub async fn verify_phrase(
+        engine: E<'_>,
+        phrase: String,
+        address: String,
+    ) -> Result<bool, CmdError> {
+        Ok(engine.verify_phrase(phrase, address).await?)
+    }
+
+    #[tauri::command(rename_all = "snake_case")]
     pub async fn restore(
         engine: E<'_>,
         name: String,
         phrase: String,
         network: Option<String>,
+        pool: Option<String>,
         birthday: Option<u32>,
     ) -> Result<AddDbResp, CmdError> {
         Ok(engine
-            .restore(name, phrase, parse_network(network)?, birthday)
+            .restore(
+                name,
+                phrase,
+                parse_network(network)?,
+                parse_pool(pool)?,
+                birthday,
+            )
             .await?)
     }
 
@@ -484,6 +500,7 @@ pub fn run(runtime: tokio::runtime::Runtime, conn: ConnectionArgs) -> anyhow::Re
             ipc::reimport_demo,
             ipc::mark_onboarded,
             ipc::inspect_address,
+            ipc::verify_phrase,
             ipc::restore,
             ipc::set_current,
             ipc::forget,

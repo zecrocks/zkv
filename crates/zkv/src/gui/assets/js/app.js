@@ -483,8 +483,8 @@ function App() {
     openDb(r.name);
     return r;
   };
-  const onRestore = async (name, phrase, network, birthday) => {
-    const r = await api.restore(name, phrase, network, birthday);
+  const onRestore = async (name, phrase, network, pool, birthday) => {
+    const r = await api.restore(name, phrase, network, pool, birthday);
     await refreshDatabases();
     flash("Restored " + r.name);
     openDb(r.name);
@@ -745,8 +745,14 @@ function App() {
   const tipKnown = statusMatches && status.chain_tip != null && status.chain_tip > 0;
   const detailSynced = detailMatches && detail && detail.synced != null ? detail.synced : null;
   const initKnown = !!detail && detail.init !== "uninitialized";
-  const fullyScanned = !!(tipKnown && detailSynced != null && detailSynced >= status.chain_tip - 1);
-  const firstSyncPending = !!detail && detailMatches && !initKnown && !fullyScanned;
+  const fullyScanned = !!(detail && detailMatches && (detail.synced_to_tip === true || tipKnown && detailSynced != null && detailSynced >= status.chain_tip - 1));
+  const firstSyncSettledRef = React.useRef({ name: null, settled: false });
+  if (firstSyncSettledRef.current.name !== activeName) {
+    firstSyncSettledRef.current = { name: activeName, settled: false };
+  } else if (detailMatches && (initKnown || fullyScanned)) {
+    firstSyncSettledRef.current.settled = true;
+  }
+  const firstSyncPending = !!detail && detailMatches && !initKnown && !fullyScanned && !firstSyncSettledRef.current.settled;
   const latency = statusMatches && status.latency_ms != null ? status.latency_ms : null;
   const statusBarDb = view === "keys" && activeDb && (detailMatches || activeDb.network === netName) ? activeDb : null;
   const outOfDate = !!(status && status.build_out_of_date);
