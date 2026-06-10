@@ -56,6 +56,7 @@ axum = { version = "0.7", default-features = false, features = ["tokio", "http1"
 # Zcash ecosystem: version-locked as a set.
 transparent = { package = "zcash_transparent", version = "0.8" }
 zcash_address = "0.12"
+zcash_note_encryption = "0.4"
 zcash_client_backend = { version = "0.23", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt"] }
 zcash_client_sqlite = { version = "0.21", features = ["unstable", "orchard", "serde"] }
 zcash_keys = { version = "0.14", features = ["orchard", "unstable"] }

@@ -12,7 +12,7 @@ mod commands;
 // `zkv-faucet` binary (a separate crate) can reach it. Re-bind it at the
 // binary's crate root so existing `crate::config::*`, `crate::internal::*`
 // etc. references in `commands/*` continue to compile.
-use zkv::{config, data, db, demo, internal, remote, ui};
+use zkv::{config, data, db, demo, internal, remote, shallow, ui};
 
 /// `<pkg-version> (<git-sha>)`, e.g. `0.0.1 (eda2d7f)`. The SHA is captured at
 /// build time by `build.rs` (`-dirty` suffix for an unclean tree, `unknown`
@@ -103,6 +103,9 @@ enum Command {
     /// Owner-only administration: finalize, plus the `sign`/`verify` memo tools.
     Admin(commands::admin::Command),
 
+    /// Read recent updates by scanning only a shallow block window (no full sync).
+    Shallow(commands::shallow::Command),
+
     /// Force a sync (commands that need fresh chain state auto-sync by default).
     Sync(commands::sync::Command),
 
@@ -171,6 +174,7 @@ fn main() -> Result<(), anyhow::Error> {
 
     runtime.block_on(async move {
         let db = cli.db;
+        let verbose = cli.verbose;
 
         // First run: provision the bundled "demo-oracles" watch-only database
         // once (best effort, never fatal). The GUI commands provision it via
@@ -204,6 +208,7 @@ fn main() -> Result<(), anyhow::Error> {
             Command::Send(c) => c.run(db).await,
             Command::Roles(c) => c.run(db).await,
             Command::Admin(c) => c.run(db).await,
+            Command::Shallow(c) => c.run(db, verbose).await,
             Command::Sync(c) => c.run(db).await,
             Command::Balance(c) => c.run(db).await,
             #[cfg(feature = "gui")]

@@ -6,6 +6,7 @@ pub(crate) mod balance;
 pub(crate) mod connection_args;
 pub(crate) mod del;
 pub(crate) mod get;
+pub(crate) mod glob;
 #[cfg(feature = "gui")]
 pub(crate) mod gui;
 #[cfg(feature = "gui")]
@@ -21,6 +22,7 @@ pub(crate) mod restore;
 pub(crate) mod roles;
 pub(crate) mod send;
 pub(crate) mod set;
+pub(crate) mod shallow;
 pub(crate) mod show;
 pub(crate) mod sign;
 pub(crate) mod sync;

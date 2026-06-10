@@ -1050,7 +1050,7 @@ async fn refresh_utxos<P: Parameters>(
 
 // ---- Enhance pass ----
 
-fn parse_raw_transaction<P: Parameters>(
+pub(crate) fn parse_raw_transaction<P: Parameters>(
     params: &P,
     chain_tip: BlockHeight,
     tx: RawTransaction,
@@ -1064,7 +1064,7 @@ fn parse_raw_transaction<P: Parameters>(
     Ok((tx, mined_height))
 }
 
-async fn fetch_transaction<P: Parameters>(
+pub(crate) async fn fetch_transaction<P: Parameters>(
     client: &mut CompactTxStreamerClient<Channel>,
     params: &P,
     chain_tip: BlockHeight,

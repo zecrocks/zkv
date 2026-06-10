@@ -32,6 +32,13 @@
 //!   you only need address validation, signature verification, or to
 //!   feed your own memo stream through the replay logic.
 //!
+//! - **Shallow read client (experimental):** [`shallow`]. Chain-window
+//!   reads without a local wallet: scan only the last N blocks (or walk
+//!   back from the tip until a key is found) from a bare `zkv1…` address,
+//!   validating signatures statelessly. Built for price-oracle consumers.
+//!   Public but **not yet semver-covered**; read the module docs' trust
+//!   model before depending on it.
+//!
 //! - **Unstable wallet plumbing:** [`config`], [`data`], [`internal`],
 //!   [`remote`]. Public so the sibling `zkv-faucet` crate (and any
 //!   other Rust consumer with niche needs) can reach the underlying
@@ -49,6 +56,15 @@
 
 pub mod db;
 pub mod protocol;
+
+// NOTE: no outer `///` doc here on purpose. The `shallow` module carries a rich
+// inner `//!` doc block whose intra-doc links use bare type names
+// (`ShallowClient`, `ShallowWarning`, ...). An outer doc comment on this
+// declaration would be concatenated with those inner docs and force the whole
+// block to resolve in *this* (crate-root) scope, where those names aren't
+// visible, breaking the links. Keeping the summary in the module's own `//!`
+// lets the links resolve in the module's scope.
+pub mod shallow;
 
 /// Build-freshness check ([`freshness::build_out_of_date`]) and the shared
 /// out-of-date notice ([`freshness::OUT_OF_DATE_MESSAGE`]), used by both the

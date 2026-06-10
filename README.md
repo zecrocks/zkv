@@ -68,6 +68,11 @@ get [key]
 keys [glob]              * wildcard
 history [key] [--op ...] [--order asc|desc] [--limit N | --all]
 
+# shallow read (recent block window only; no full sync, no wallet)
+shallow scan [--depth N] [--address zkv1…]
+shallow get <key|glob>... [--max-depth N] [--address zkv1…]
+shallow follow <key|glob>... [--depth N] [--interval S] [--address zkv1…]
+
 # write (auto-sync; --no-sync to skip)
 set <key> <value>        SET/SETL
 del <key>
@@ -176,6 +181,66 @@ only after the first valid INIT at the caller's confirmation depth. No INIT →
 - The blockchain always allows writes, zkv verifies sequence, signature,
   and the signer's authorization.
 
+## Shallow sync (oracle reads)
+
+A full read scans the chain from the database birthday through the wallet
+stack; minutes of work when all you want is the latest `prices/zec_usd`.
+`zkv shallow` reads only a recent block window instead: it streams compact
+blocks straight from lightwalletd, trial-decrypts them with the address's
+viewing key, fetches the few matching transactions, and verifies each memo's
+signature statelessly. No wallet database, no local state mutated, and it can
+run while a full sync holds the database lock.
+
+```
+# every validated update in the last ~hour (48 blocks), straight from an address
+zkv shallow scan --address zkv1… --depth 48
+
+# walk back from the tip until the key is found (a single key prints the bare value)
+zkv shallow get prices/zec_usd
+
+# print current values, then watch the tip for new ones; globs work, so this
+# follows every key under prices/ as `key = value` lines
+zkv shallow follow 'prices/*'
+```
+
+Key arguments to `get`/`follow` may be Redis `KEYS`-style globs (the `*`
+wildcard; quote them so your shell doesn't expand them). A single exact key to
+`get` prints just the value (like `zkv get`); multiple keys, a glob, or any
+`follow` output is labeled `key = value`.
+
+Shallow stays shallow: `get` searches at most `--max-depth` blocks back
+(default 48 ≈ 1 hour), walking newest-first and stopping as soon as every
+requested key or pattern resolves, so a recently-updated oracle key costs a
+handful of transaction fetches. Raise `--max-depth` explicitly for keys
+updated less often.
+
+Works against the current database (read-only) or, with `--address`, with no
+local database at all. By default it first verifies the database's **INIT
+anchor** (a root-signed INIT memo near the birthday) so a never-initialized or
+wrong address can't masquerade as a real database; the result is cached in the
+database directory (`shallow_init.toml`, safe to delete) and `--no-verify-init`
+skips it. Library consumers use `zkv::shallow::ShallowClient`
+(`from_address` / `from_db`, then `scan` / `find` / `poll`).
+
+**Shallow trust model.** Weaker than a full sync in specific, surfaced ways:
+
+- **Values can't be forged.** Every memo's recoverable signature is verified
+  against the address-derived root key; entries are marked `verified` only
+  when the signer checks out.
+- **No replay high-water.** A verified *old* memo re-broadcast inside the
+  window can masquerade as fresh. Mitigations: chain-order last-write-wins,
+  every result carries `seq` and `signer` (enforce monotonic sequence yourself
+  if you need strictness), and a `SeqOrderMismatch` warning flags the
+  rebroadcast tell.
+- **Delegated writers show `verified: false`** (the owner/writer registry
+  needs a full replay); their writes never win a key.
+- **Role/lifecycle changes are not applied.** OWNER*/WRITER*/FINALIZE/VERSION
+  memos in the window surface as warnings only.
+- **lightwalletd is trusted for completeness**: it can't forge values, but it
+  can omit blocks or transactions.
+- Only keys updated inside the window are visible; shallow shows "the latest
+  update in the window", not authoritative state.
+
 ## Library
 
 ```toml
@@ -222,7 +287,8 @@ the network; reads are pure-local. Errors are structured (`InsufficientFunds`,
 `WatchOnly`, `NotInitialized`, `Initializing`, `Unauthorized`, …). The
 `protocol` module exposes the pure primitives (address parse, sign/verify, memo
 encode, `replay_with_seed`). Worked examples in `crates/zkv/examples/`:
-`quickstart`, `verify_signature`, `read_value`, `set_value`, `oracle`. Run with
+`quickstart`, `verify_signature`, `read_value`, `set_value`, `oracle`,
+`shallow_read` (db-less oracle reads via `zkv::shallow`). Run with
 `cargo run -p zkv --example <name>`. Browse the full API docs locally with
 `cargo doc -p zkv --no-deps --open`.
 
