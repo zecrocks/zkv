@@ -33,7 +33,7 @@ struct OwnerArgs {
 impl Command {
     pub(crate) async fn run(self, db: Option<String>) -> anyhow::Result<()> {
         let (verb, args, grant) = match self.action {
-            Action::Add(a) => ("OWNERSET", a, true),
+            Action::Add(a) => ("OWNERADD", a, true),
             Action::Remove(a) => ("OWNERDEL", a, false),
         };
         let name = resolve_db(db.as_deref())?;

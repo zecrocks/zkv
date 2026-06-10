@@ -109,7 +109,7 @@ impl AuthRegistry {
             return Err(DropReason::InvalidTargetPubkey);
         };
         match op {
-            Op::OwnerSet => {
+            Op::OwnerAdd => {
                 self.insert_owner(target);
                 Ok(())
             }
@@ -129,7 +129,7 @@ impl AuthRegistry {
                     Ok(())
                 }
             }
-            Op::WriterSet => {
+            Op::WriterAdd => {
                 let Some(scope) = value.and_then(Scope::parse) else {
                     return Err(DropReason::InvalidScope);
                 };

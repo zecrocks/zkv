@@ -268,9 +268,9 @@ struct CheckAddrReq {
 
 /// Body for `POST /databases/:name/sign`: the Reference builder's "sign this
 /// memo without broadcasting" request. `op` is the opcode (`SET`, `SETL`,
-/// `DEL`, `INIT`, `OWNERSET`/`OWNERDEL`/`WRITERSET`/`WRITERDEL`/`FINALIZE`);
+/// `DEL`, `INIT`, `OWNERADD`/`OWNERDEL`/`WRITERADD`/`WRITERDEL`/`FINALIZE`);
 /// `key` is the data key or, for management ops, the target pubkey; `scope` is
-/// the `WRITERSET` capability string.
+/// the `WRITERADD` capability string.
 #[derive(Deserialize)]
 struct SignMemoReq {
     op: String,

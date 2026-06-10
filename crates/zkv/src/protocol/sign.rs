@@ -111,7 +111,7 @@ pub const VERSION_WINDOW: u64 = 256;
 /// sequence `seq` the writer referenced.
 ///
 /// - **Data ops** (`SET`/`SETL`/`DEL`) and **management ops**
-///   (`OWNERSET`/`OWNERDEL`/`WRITERSET`/`WRITERDEL`): `"<receiver>:<seq>"`, where
+///   (`OWNERADD`/`OWNERDEL`/`WRITERADD`/`WRITERDEL`): `"<receiver>:<seq>"`, where
 ///   `seq` is the count of honored writes to the entity (the data key, or the
 ///   target pubkey) so far. This is the replay-protection counter; a tombstone
 ///   *retains* its sequence, so a deleted key / revoked target cannot be
@@ -125,9 +125,9 @@ pub fn signing_domain(receiver: &str, op: Op, seq: u64) -> String {
         Op::Set
         | Op::SetL
         | Op::Del
-        | Op::OwnerSet
+        | Op::OwnerAdd
         | Op::OwnerDel
-        | Op::WriterSet
+        | Op::WriterAdd
         | Op::WriterDel => format!("{receiver}:{seq}"),
         // INIT/VERSION/FINALIZE are not version-CAS'd (INIT is first-valid-wins;
         // VERSION uses its own transition rule; FINALIZE is a one-way latch).

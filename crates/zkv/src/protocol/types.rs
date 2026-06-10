@@ -67,15 +67,15 @@ pub enum Op {
     Init,
     /// Grant (or re-affirm) owner authority to a public key. Owner-only.
     /// Wire `key` is the target's canonical `zkvid1…` pubkey; no value.
-    OwnerSet,
+    OwnerAdd,
     /// Revoke owner authority from a public key. Owner-only. The last
     /// remaining owner cannot be removed (the database must stay manageable).
     OwnerDel,
     /// Grant (or overwrite) a scoped writer. Owner-only. Wire `key` is the
     /// target pubkey; `value` is the comma-separated capability scope
-    /// (`CREATE`, `UPDATE`, `DESTROY`). A later `WRITERSET` for the same key
+    /// (`CREATE`, `UPDATE`, `DESTROY`). A later `WRITERADD` for the same key
     /// replaces the previous scope wholesale.
-    WriterSet,
+    WriterAdd,
     /// Revoke a scoped writer entirely. Owner-only. Any scope argument is
     /// ignored; removal is all-or-nothing.
     WriterDel,
@@ -102,9 +102,9 @@ impl Op {
             Op::SetL => "SETL",
             Op::Del => "DEL",
             Op::Init => "INIT",
-            Op::OwnerSet => "OWNERSET",
+            Op::OwnerAdd => "OWNERADD",
             Op::OwnerDel => "OWNERDEL",
-            Op::WriterSet => "WRITERSET",
+            Op::WriterAdd => "WRITERADD",
             Op::WriterDel => "WRITERDEL",
             Op::Finalize => "FINALIZE",
             Op::Version => "VERSION",
@@ -117,9 +117,9 @@ impl Op {
             "SETL" => Some(Op::SetL),
             "DEL" => Some(Op::Del),
             "INIT" => Some(Op::Init),
-            "OWNERSET" => Some(Op::OwnerSet),
+            "OWNERADD" => Some(Op::OwnerAdd),
             "OWNERDEL" => Some(Op::OwnerDel),
-            "WRITERSET" => Some(Op::WriterSet),
+            "WRITERADD" => Some(Op::WriterAdd),
             "WRITERDEL" => Some(Op::WriterDel),
             "FINALIZE" => Some(Op::Finalize),
             "VERSION" => Some(Op::Version),
@@ -133,7 +133,7 @@ impl Op {
     pub fn is_management(self) -> bool {
         matches!(
             self,
-            Op::OwnerSet | Op::OwnerDel | Op::WriterSet | Op::WriterDel | Op::Finalize
+            Op::OwnerAdd | Op::OwnerDel | Op::WriterAdd | Op::WriterDel | Op::Finalize
         )
     }
 
@@ -153,9 +153,9 @@ impl Op {
             Op::Set
                 | Op::SetL
                 | Op::Del
-                | Op::OwnerSet
+                | Op::OwnerAdd
                 | Op::OwnerDel
-                | Op::WriterSet
+                | Op::WriterAdd
                 | Op::WriterDel
         )
     }
@@ -389,7 +389,7 @@ pub enum MemoFormat {
     WrongArity { op: Op },
     /// A `SET`/`SETL` carried no value (or an empty one in the `SET` form).
     MissingValue,
-    /// A `WRITERSET` carried no scope token.
+    /// A `WRITERADD` carried no scope token.
     MissingScope,
     /// A `VERSION` carried no block-flags token.
     MissingVersionFlag,
@@ -420,7 +420,7 @@ impl fmt::Display for MemoFormat {
                 write!(f, "wrong number of parameters for {}", op.as_str())
             }
             MemoFormat::MissingValue => write!(f, "SET requires a non-empty value"),
-            MemoFormat::MissingScope => write!(f, "WRITERSET requires a scope"),
+            MemoFormat::MissingScope => write!(f, "WRITERADD requires a scope"),
             MemoFormat::MissingVersionFlag => write!(f, "VERSION requires block flags"),
             MemoFormat::MissingSignature => write!(f, "missing signature"),
             MemoFormat::BadSignatureFraming => write!(f, "signature not 130 hex chars"),
@@ -493,11 +493,11 @@ pub enum DropReason {
     NotOwner,
     /// An `OWNERDEL` that would remove the last remaining owner.
     LastOwnerProtected,
-    /// A `WRITERSET` targeting a pubkey that is already an owner.
+    /// A `WRITERADD` targeting a pubkey that is already an owner.
     WriterTargetIsOwner,
     /// A management op whose target is not a valid secp256k1 public key.
     InvalidTargetPubkey,
-    /// A `WRITERSET` whose value did not parse as a non-empty capability scope.
+    /// A `WRITERADD` whose value did not parse as a non-empty capability scope.
     InvalidScope,
     /// Any write after a confirmed `FINALIZE` sealed the database, including a
     /// second `FINALIZE`. The latch is one-way; nothing more is ever applied.

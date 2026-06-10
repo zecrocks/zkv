@@ -49,7 +49,7 @@ const DROP = {
   },
   WriterTargetIsOwner: {
     t: "WriterTargetIsOwner",
-    d: "WRITERSET targets a pubkey that is already an owner; owner already subsumes any writer scope."
+    d: "WRITERADD targets a pubkey that is already an owner; owner already subsumes any writer scope."
   },
   InvalidTargetPubkey: {
     t: "InvalidTargetPubkey",
@@ -57,7 +57,7 @@ const DROP = {
   },
   InvalidScope: {
     t: "InvalidScope",
-    d: "The WRITERSET scope did not parse as a non-empty subset of CREATE,UPDATE,DESTROY."
+    d: "The WRITERADD scope did not parse as a non-empty subset of CREATE,UPDATE,DESTROY."
   },
   VersionNotNumeric: {
     t: "VersionNotNumeric",
@@ -164,16 +164,16 @@ ${v.value || ""}`,
     errors: ["ForgedInit", "InitAddressInvalid", "InitNetworkMismatch", "InitAddressMismatch", "DuplicateInit"]
   },
   {
-    id: "ownerset",
-    name: "OWNERSET",
+    id: "owneradd",
+    name: "OWNERADD",
     kind: "Management",
     summary: "Grant (or re-affirm) owner authority.",
     authz: "Owner-only.",
-    wire: "ZKV0 OWNERSET <pubkey>\n" + SIG_LINE,
+    wire: "ZKV0 OWNERADD <pubkey>\n" + SIG_LINE,
     desc: "Adds a pubkey to the owner set. Owners may write any key and add/remove owners and writers. Promoting a writer to owner clears its writer entry (owner subsumes it). The target is the canonical zkvid1\u2026 pubkey; raw hex is normalized before signing.",
     inputs: [{ name: "key", label: "Target pubkey", ph: "zkvid1\u2026 (or raw hex)" }],
-    unsigned: (v) => `ZKV0 OWNERSET ${v.key || "<zkvid1\u2026>"}`,
-    api: (v) => ({ op: "OWNERSET", key: v.key || "" }),
+    unsigned: (v) => `ZKV0 OWNERADD ${v.key || "<zkvid1\u2026>"}`,
+    api: (v) => ({ op: "OWNERADD", key: v.key || "" }),
     signable: true,
     errors: ["NotOwner", "InvalidTargetPubkey", "StaleVersion"]
   },
@@ -192,19 +192,19 @@ ${v.value || ""}`,
     errors: ["NotOwner", "InvalidTargetPubkey", "LastOwnerProtected", "StaleVersion"]
   },
   {
-    id: "writerset",
-    name: "WRITERSET",
+    id: "writeradd",
+    name: "WRITERADD",
     kind: "Management",
     summary: "Grant (or overwrite) a scoped writer.",
     authz: "Owner-only.",
-    wire: "ZKV0 WRITERSET <pubkey> <scope>\n" + SIG_LINE,
-    desc: 'Grants a writer a capability scope, a subset of CREATE, UPDATE, DESTROY (canonical order). WRITERSET overwrites the scope wholesale; it is not additive. Reads are public to anyone holding the address, so there is no read capability ("CRUD minus R").',
+    wire: "ZKV0 WRITERADD <pubkey> <scope>\n" + SIG_LINE,
+    desc: 'Grants a writer a capability scope, a subset of CREATE, UPDATE, DESTROY (canonical order). WRITERADD overwrites the scope wholesale; it is not additive. Reads are public to anyone holding the address, so there is no read capability ("CRUD minus R").',
     inputs: [
       { name: "key", label: "Target pubkey", ph: "zkvid1\u2026 (or raw hex)" },
       { name: "scope", label: "Scope", type: "scope" }
     ],
-    unsigned: (v) => `ZKV0 WRITERSET ${v.key || "<zkvid1\u2026>"} ${v.scope || "<scope>"}`,
-    api: (v) => ({ op: "WRITERSET", key: v.key || "", scope: v.scope || "" }),
+    unsigned: (v) => `ZKV0 WRITERADD ${v.key || "<zkvid1\u2026>"} ${v.scope || "<scope>"}`,
+    api: (v) => ({ op: "WRITERADD", key: v.key || "", scope: v.scope || "" }),
     signable: true,
     errors: ["NotOwner", "InvalidTargetPubkey", "InvalidScope", "WriterTargetIsOwner", "StaleVersion"]
   },

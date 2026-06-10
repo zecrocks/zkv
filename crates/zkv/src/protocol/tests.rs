@@ -459,12 +459,12 @@ fn pending_management_advances_target_window() {
             (init_memo(&root_sk, addr), WriteStatus::Confirmed),
             // Grant CREATE (pending, target seq 0).
             (
-                op_memo_v(&root_sk, addr, Op::WriterSet, &w, Some("CREATE"), 0),
+                op_memo_v(&root_sk, addr, Op::WriterAdd, &w, Some("CREATE"), 0),
                 confirming.clone(),
             ),
             // Immediately overwrite the scope (pending, target seq 1).
             (
-                op_memo_v(&root_sk, addr, Op::WriterSet, &w, Some("UPDATE"), 1),
+                op_memo_v(&root_sk, addr, Op::WriterAdd, &w, Some("UPDATE"), 1),
                 confirming.clone(),
             ),
         ],
@@ -2452,7 +2452,7 @@ fn confirmed_finalize_seals_database_against_all_writes() {
                 WriteStatus::Confirmed,
             ),
             (
-                op_memo(&root_sk, addr, Op::OwnerSet, &pk_hex(&owner2_pk), None),
+                op_memo(&root_sk, addr, Op::OwnerAdd, &pk_hex(&owner2_pk), None),
                 WriteStatus::Confirmed,
             ),
             // A second FINALIZE is also dropped; the latch is one-way.
@@ -2473,7 +2473,7 @@ fn confirmed_finalize_seals_database_against_all_writes() {
         result.state.get("k").unwrap().confirmed.as_deref(),
         Some("v")
     );
-    // The post-FINALIZE OWNERSET never took effect.
+    // The post-FINALIZE OWNERADD never took effect.
     assert!(!result.auth.is_owner(&pk_hex(&owner2_pk)));
     assert_eq!(result.auth.owners().count(), 1);
 }
@@ -2577,7 +2577,7 @@ fn owner_can_add_second_owner_who_can_then_write() {
             (init_memo(&root_sk, addr), WriteStatus::Confirmed),
             // Root grants owner #2.
             (
-                op_memo(&root_sk, addr, Op::OwnerSet, &pk_hex(&owner2_pk), None),
+                op_memo(&root_sk, addr, Op::OwnerAdd, &pk_hex(&owner2_pk), None),
                 WriteStatus::Confirmed,
             ),
             // Owner #2 writes a key; allowed because owners write anything.
@@ -2612,7 +2612,7 @@ fn writer_create_update_destroy_within_scope() {
                 op_memo(
                     &root_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&w_pk),
                     Some("CREATE,UPDATE,DESTROY"),
                 ),
@@ -2674,7 +2674,7 @@ fn writer_create_only_cannot_update_existing_key() {
                 op_memo(
                     &root_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&w_pk),
                     Some("CREATE"),
                 ),
@@ -2731,7 +2731,7 @@ fn writer_update_only_cannot_create_new_key() {
                 op_memo(
                     &root_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&w_pk),
                     Some("UPDATE"),
                 ),
@@ -2780,7 +2780,7 @@ fn writer_without_destroy_cannot_delete() {
                 op_memo(
                     &root_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&w_pk),
                     Some("CREATE,UPDATE"),
                 ),
@@ -2855,7 +2855,7 @@ fn writer_cannot_grant_owners_or_writers() {
                 op_memo(
                     &root_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&w_pk),
                     Some("CREATE,UPDATE,DESTROY"),
                 ),
@@ -2863,7 +2863,7 @@ fn writer_cannot_grant_owners_or_writers() {
             ),
             // Writer tries to promote itself to owner.
             (
-                op_memo(&w_sk, addr, Op::OwnerSet, &pk_hex(&w_pk), None),
+                op_memo(&w_sk, addr, Op::OwnerAdd, &pk_hex(&w_pk), None),
                 WriteStatus::Confirmed,
             ),
             // Writer tries to grant a confederate.
@@ -2871,7 +2871,7 @@ fn writer_cannot_grant_owners_or_writers() {
                 op_memo(
                     &w_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&confederate_pk),
                     Some("CREATE,UPDATE,DESTROY"),
                 ),
@@ -2917,7 +2917,7 @@ fn revoked_writer_loses_access() {
                 op_memo(
                     &root_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&w_pk),
                     Some("CREATE,UPDATE"),
                 ),
@@ -2966,11 +2966,11 @@ fn revoked_owner_cannot_write_or_manage() {
         vec![
             (init_memo(&root_sk, addr), WriteStatus::Confirmed),
             (
-                op_memo(&root_sk, addr, Op::OwnerSet, &pk_hex(&owner2_pk), None),
+                op_memo(&root_sk, addr, Op::OwnerAdd, &pk_hex(&owner2_pk), None),
                 WriteStatus::Confirmed,
             ),
             // Root removes owner #2 (root remains, so this is allowed). The
-            // target's version is 1 after the OWNERSET above.
+            // target's version is 1 after the OWNERADD above.
             (
                 op_memo_v(&root_sk, addr, Op::OwnerDel, &pk_hex(&owner2_pk), None, 1),
                 WriteStatus::Confirmed,
@@ -2985,7 +2985,7 @@ fn revoked_owner_cannot_write_or_manage() {
                 op_memo(
                     &owner2_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&writer_pk),
                     Some("CREATE"),
                 ),
@@ -3067,7 +3067,7 @@ fn replayed_self_ownerdel_cannot_remove_owner_after_second_owner_seated() {
             (ownerdel_root_v0.clone(), WriteStatus::Confirmed),
             // (2) root later seats a second owner (bumps owner2's counter).
             (
-                op_memo(&root_sk, addr, Op::OwnerSet, &owner2_hex, None),
+                op_memo(&root_sk, addr, Op::OwnerAdd, &owner2_hex, None),
                 WriteStatus::Confirmed,
             ),
             // (3) attacker replays the original seq-0 OWNERDEL of root. With
@@ -3104,7 +3104,7 @@ fn root_owner_is_removable_once_a_second_owner_exists() {
         vec![
             (init_memo(&root_sk, addr), WriteStatus::Confirmed),
             (
-                op_memo(&root_sk, addr, Op::OwnerSet, &pk_hex(&owner2_pk), None),
+                op_memo(&root_sk, addr, Op::OwnerAdd, &pk_hex(&owner2_pk), None),
                 WriteStatus::Confirmed,
             ),
             // Owner #2 removes the root key.
@@ -3142,7 +3142,7 @@ fn root_owner_is_removable_once_a_second_owner_exists() {
 
 #[test]
 fn pending_management_op_confers_no_authority_yet() {
-    // A WRITERSET that is only Confirming (in mempool) must not yet let
+    // A WRITERADD that is only Confirming (in mempool) must not yet let
     // the named writer act. The data write in the same batch is dropped
     // because the grant hasn't confirmed.
     let (root_sk, root_pk) = keypair();
@@ -3157,7 +3157,7 @@ fn pending_management_op_confers_no_authority_yet() {
                 op_memo(
                     &root_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&w_pk),
                     Some("CREATE"),
                 ),
@@ -3179,7 +3179,7 @@ fn pending_management_op_confers_no_authority_yet() {
     .unwrap();
     assert!(
         result.auth.authority_of(&pk_hex(&w_pk)).is_none(),
-        "an unconfirmed WRITERSET must not seat the writer",
+        "an unconfirmed WRITERADD must not seat the writer",
     );
     assert!(
         result.state.is_empty(),
@@ -3188,8 +3188,8 @@ fn pending_management_op_confers_no_authority_yet() {
 }
 
 #[test]
-fn writerset_overwrites_scope_wholesale() {
-    // A second WRITERSET for the same key replaces the scope entirely;
+fn writeradd_overwrites_scope_wholesale() {
+    // A second WRITERADD for the same key replaces the scope entirely;
     // it is not additive. Narrowing CREATE,UPDATE,DESTROY down to CREATE
     // must strip UPDATE and DESTROY.
     let (root_sk, root_pk) = keypair();
@@ -3203,7 +3203,7 @@ fn writerset_overwrites_scope_wholesale() {
                 op_memo(
                     &root_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&w_pk),
                     Some("CREATE,UPDATE,DESTROY"),
                 ),
@@ -3219,7 +3219,7 @@ fn writerset_overwrites_scope_wholesale() {
                 op_memo_v(
                     &root_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&w_pk),
                     Some("CREATE"),
                     1,
@@ -3253,7 +3253,7 @@ fn writerset_overwrites_scope_wholesale() {
 }
 
 #[test]
-fn ownerset_on_existing_writer_promotes_and_clears_scope() {
+fn owneradd_on_existing_writer_promotes_and_clears_scope() {
     // Promoting a writer to owner removes its writer entry (an owner has
     // full authority; the scoped row would just be shadowed). The pubkey
     // ends up an owner, not both.
@@ -3269,7 +3269,7 @@ fn ownerset_on_existing_writer_promotes_and_clears_scope() {
                 op_memo(
                     &root_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pk_hex(&p_pk),
                     Some("CREATE"),
                 ),
@@ -3277,7 +3277,7 @@ fn ownerset_on_existing_writer_promotes_and_clears_scope() {
             ),
             // Promote the same target to owner (target version 1).
             (
-                op_memo_v(&root_sk, addr, Op::OwnerSet, &pk_hex(&p_pk), None, 1),
+                op_memo_v(&root_sk, addr, Op::OwnerAdd, &pk_hex(&p_pk), None, 1),
                 WriteStatus::Confirmed,
             ),
         ],
@@ -3300,7 +3300,7 @@ fn ownerset_on_existing_writer_promotes_and_clears_scope() {
 #[test]
 fn management_ops_dropped_before_init() {
     // Pre-INIT management memos are noise, just like pre-INIT writes.
-    // Even a root-signed OWNERSET before INIT must not seat anyone.
+    // Even a root-signed OWNERADD before INIT must not seat anyone.
     let (root_sk, root_pk) = keypair();
     let (owner2_sk, owner2_pk) = keypair_from(0x55);
     let _ = owner2_sk;
@@ -3308,9 +3308,9 @@ fn management_ops_dropped_before_init() {
 
     let result = replay(
         vec![
-            // OWNERSET before INIT: dropped.
+            // OWNERADD before INIT: dropped.
             (
-                op_memo(&root_sk, addr, Op::OwnerSet, &pk_hex(&owner2_pk), None),
+                op_memo(&root_sk, addr, Op::OwnerAdd, &pk_hex(&owner2_pk), None),
                 WriteStatus::Confirmed,
             ),
             (init_memo(&root_sk, addr), WriteStatus::Confirmed),
@@ -3322,22 +3322,22 @@ fn management_ops_dropped_before_init() {
     .unwrap();
     assert!(
         !result.auth.is_owner(&pk_hex(&owner2_pk)),
-        "pre-INIT OWNERSET must not take effect",
+        "pre-INIT OWNERADD must not take effect",
     );
     assert!(result.auth.is_owner(&pk_hex(&root_pk)));
 }
 
 #[test]
 fn malformed_target_pubkey_in_management_is_dropped() {
-    // An OWNERSET whose target isn't a valid pubkey is a no-op; it can
+    // An OWNERADD whose target isn't a valid pubkey is a no-op; it can
     // never correspond to a real signer, so nothing is seated. Build the
     // memo by hand because the key just needs to be non-whitespace.
     let (root_sk, root_pk) = keypair();
     let addr = "zkv1test1";
     let bogus = "not-a-pubkey";
-    let payload = signed_payload(addr, Op::OwnerSet, bogus, None);
+    let payload = signed_payload(addr, Op::OwnerAdd, bogus, None);
     let sig = sign_command(&root_sk, &payload);
-    let memo = build_memo(Op::OwnerSet, bogus, None, 0, &sig).unwrap();
+    let memo = build_memo(Op::OwnerAdd, bogus, None, 0, &sig).unwrap();
     let text = match Memo::try_from(memo).unwrap() {
         Memo::Text(t) => t.to_string(),
         _ => unreachable!(),
@@ -3378,8 +3378,8 @@ fn scope_parse_and_wire_round_trip() {
 }
 
 #[test]
-fn writerset_with_invalid_scope_is_dropped() {
-    // A WRITERSET whose scope value is unparseable seats no writer.
+fn writeradd_with_invalid_scope_is_dropped() {
+    // A WRITERADD whose scope value is unparseable seats no writer.
     let (root_sk, root_pk) = keypair();
     let (w_sk, w_pk) = keypair_from(0x33);
     let _ = w_sk;
@@ -3389,7 +3389,7 @@ fn writerset_with_invalid_scope_is_dropped() {
         vec![
             (init_memo(&root_sk, addr), WriteStatus::Confirmed),
             (
-                op_memo(&root_sk, addr, Op::WriterSet, &pk_hex(&w_pk), Some("READ")),
+                op_memo(&root_sk, addr, Op::WriterAdd, &pk_hex(&w_pk), Some("READ")),
                 WriteStatus::Confirmed,
             ),
         ],
@@ -3400,7 +3400,7 @@ fn writerset_with_invalid_scope_is_dropped() {
     .unwrap();
     assert!(
         result.auth.authority_of(&pk_hex(&w_pk)).is_none(),
-        "WRITERSET with an unrecognized scope must seat no writer",
+        "WRITERADD with an unrecognized scope must seat no writer",
     );
 }
 
@@ -3418,14 +3418,14 @@ fn owner_data_and_management_ops_round_trip_through_seed_split() {
     let entries: Vec<(String, WriteStatus)> = vec![
         (init_memo(&root_sk, addr), WriteStatus::Confirmed),
         (
-            op_memo(&root_sk, addr, Op::OwnerSet, &pk_hex(&owner2_pk), None),
+            op_memo(&root_sk, addr, Op::OwnerAdd, &pk_hex(&owner2_pk), None),
             WriteStatus::Confirmed,
         ),
         (
             op_memo(
                 &owner2_sk,
                 addr,
-                Op::WriterSet,
+                Op::WriterAdd,
                 &pk_hex(&w_pk),
                 Some("CREATE,UPDATE"),
             ),
@@ -3526,12 +3526,12 @@ fn history_folding_attributes_delegated_writer_and_authorization() {
     assert_eq!(e.signer.as_deref(), Some(root_hex.as_str()));
     assert_eq!(e.verified, Some(true));
 
-    // WRITERSET folds into the registry but is not a write-log entry.
+    // WRITERADD folds into the registry but is not a write-log entry.
     assert!(
         fold(op_memo(
             &root_sk,
             addr,
-            Op::WriterSet,
+            Op::WriterAdd,
             &w_hex,
             Some("CREATE,UPDATE")
         ))
@@ -3567,7 +3567,7 @@ fn audit_row_signer_splits_unauthorized_from_bad_signature() {
         confirmed_entry(op_memo(
             &root_sk,
             addr,
-            Op::WriterSet,
+            Op::WriterAdd,
             &pk_hex(&w_pk),
             Some("CREATE"),
         )),
@@ -3610,11 +3610,11 @@ fn revoked_roles_reports_owner_and_writer_tombstones() {
 
     let entries = vec![
         confirmed_entry(init_memo(&root_sk, addr)),
-        confirmed_entry(op_memo(&root_sk, addr, Op::OwnerSet, &o2, None)),
+        confirmed_entry(op_memo(&root_sk, addr, Op::OwnerAdd, &o2, None)),
         confirmed_entry(op_memo(
             &root_sk,
             addr,
-            Op::WriterSet,
+            Op::WriterAdd,
             &w,
             Some("CREATE,UPDATE"),
         )),
@@ -3664,12 +3664,12 @@ fn revoked_roles_clears_tombstone_on_regrant() {
     // pubkey, so the target version advances every time.
     let entries = vec![
         confirmed_entry(init_memo(&root_sk, addr)),
-        confirmed_entry(op_memo(&root_sk, addr, Op::WriterSet, &w, Some("CREATE"))),
+        confirmed_entry(op_memo(&root_sk, addr, Op::WriterAdd, &w, Some("CREATE"))),
         confirmed_entry(op_memo_v(&root_sk, addr, Op::WriterDel, &w, None, 1)),
         confirmed_entry(op_memo_v(
             &root_sk,
             addr,
-            Op::WriterSet,
+            Op::WriterAdd,
             &w,
             Some("UPDATE"),
             2,
@@ -3685,7 +3685,7 @@ fn revoked_roles_clears_tombstone_on_regrant() {
 
 #[test]
 fn granted_roles_reports_creator_and_active_grants_with_provenance() {
-    // INIT makes root the creator (`via_init`); later OWNERSET/WRITERSET
+    // INIT makes root the creator (`via_init`); later OWNERADD/WRITERADD
     // record the granting owner. A revoked key drops out entirely, and the
     // survivors are exactly the complement of the tombstones.
     let (root_sk, root_pk) = keypair();
@@ -3700,18 +3700,18 @@ fn granted_roles_reports_creator_and_active_grants_with_provenance() {
 
     let entries = vec![
         confirmed_entry(init_memo(&root_sk, addr)),
-        confirmed_entry(op_memo(&root_sk, addr, Op::OwnerSet, &o2, None)),
+        confirmed_entry(op_memo(&root_sk, addr, Op::OwnerAdd, &o2, None)),
         confirmed_entry(op_memo(
             &root_sk,
             addr,
-            Op::WriterSet,
+            Op::WriterAdd,
             &w,
             Some("CREATE,UPDATE"),
         )),
         confirmed_entry(op_memo(
             &root_sk,
             addr,
-            Op::WriterSet,
+            Op::WriterAdd,
             &gone,
             Some("DESTROY"),
         )),
@@ -3841,7 +3841,7 @@ fn history_reports_non_owner_management() {
     let res = replay_audit(
         vec![
             confirmed_entry(init_memo(&root_sk, addr)),
-            confirmed_entry(op_memo(&stranger_sk, addr, Op::OwnerSet, &target, None)),
+            confirmed_entry(op_memo(&stranger_sk, addr, Op::OwnerAdd, &target, None)),
         ],
         addr,
         &root_pk,
@@ -3884,12 +3884,12 @@ fn history_reports_writer_target_is_owner() {
         vec![
             confirmed_entry(init_memo(&root_sk, addr)),
             // Promote a second owner (target version 0)...
-            confirmed_entry(op_memo(&root_sk, addr, Op::OwnerSet, &second, None)),
+            confirmed_entry(op_memo(&root_sk, addr, Op::OwnerAdd, &second, None)),
             // ...then try to seat that owner as a scoped writer (version 1).
             confirmed_entry(op_memo_v(
                 &root_sk,
                 addr,
-                Op::WriterSet,
+                Op::WriterAdd,
                 &second,
                 Some("CREATE"),
                 1,
@@ -3913,7 +3913,7 @@ fn history_reports_invalid_scope() {
     let res = replay_audit(
         vec![
             confirmed_entry(init_memo(&root_sk, addr)),
-            confirmed_entry(op_memo(&root_sk, addr, Op::WriterSet, &w, Some("NONSENSE"))),
+            confirmed_entry(op_memo(&root_sk, addr, Op::WriterAdd, &w, Some("NONSENSE"))),
         ],
         addr,
         &root_pk,
@@ -3931,7 +3931,7 @@ fn history_reports_invalid_target_pubkey() {
     let res = replay_audit(
         vec![
             confirmed_entry(init_memo(&root_sk, addr)),
-            confirmed_entry(op_memo(&root_sk, addr, Op::OwnerSet, "not-a-pubkey", None)),
+            confirmed_entry(op_memo(&root_sk, addr, Op::OwnerAdd, "not-a-pubkey", None)),
         ],
         addr,
         &root_pk,
@@ -3952,7 +3952,7 @@ fn history_reports_out_of_scope_and_key_exists_flip() {
     let res = replay_audit(
         vec![
             confirmed_entry(init_memo(&root_sk, addr)),
-            confirmed_entry(op_memo(&root_sk, addr, Op::WriterSet, &w, Some("CREATE"))),
+            confirmed_entry(op_memo(&root_sk, addr, Op::WriterAdd, &w, Some("CREATE"))),
             // First SET creates the key: allowed (version 0 → key v1).
             confirmed_entry(op_memo(&w_sk, addr, Op::Set, "k", Some("v1"))),
             // Second SET would be an update: out of scope. It is dropped
@@ -4001,7 +4001,7 @@ fn history_reports_stale_version_replay() {
             confirmed_entry(op_memo(
                 &root_sk,
                 addr,
-                Op::WriterSet,
+                Op::WriterAdd,
                 &w,
                 Some("CREATE,UPDATE"),
             )),
@@ -4022,19 +4022,19 @@ fn history_reports_stale_version_replay() {
     assert!(!DropReason::StaleVersion.is_signature_failure());
     assert_eq!(res.state.get("k").unwrap().confirmed.as_deref(), Some("v2"));
 
-    // A management replay is caught too: OWNERSET a second owner (target
-    // v0), then re-broadcast that exact OWNERSET after its version moved on.
+    // A management replay is caught too: OWNERADD a second owner (target
+    // v0), then re-broadcast that exact OWNERADD after its version moved on.
     let (_o2_sk, o2_pk) = keypair_from(0x55);
     let o2 = pubkey_bech32(&o2_pk);
-    let ownerset_v0 = op_memo(&root_sk, addr, Op::OwnerSet, &o2, None);
+    let owneradd_v0 = op_memo(&root_sk, addr, Op::OwnerAdd, &o2, None);
     let res2 = replay_audit(
         vec![
             confirmed_entry(init_memo(&root_sk, addr)),
-            confirmed_entry(ownerset_v0.clone()),
+            confirmed_entry(owneradd_v0.clone()),
             // Bump the target's version with an OWNERDEL (v1)...
             confirmed_entry(op_memo_v(&root_sk, addr, Op::OwnerDel, &o2, None, 1)),
-            // ...then replay the original OWNERSET verbatim.
-            confirmed_entry(ownerset_v0),
+            // ...then replay the original OWNERADD verbatim.
+            confirmed_entry(owneradd_v0),
         ],
         addr,
         &root_pk,
@@ -4112,12 +4112,12 @@ fn history_confirming_management_is_pending_then_applied_when_confirmed() {
     let (_, w_pk) = keypair_from(6);
     let addr = "zkv1test1";
     let w = pubkey_bech32(&w_pk);
-    // A confirming WRITERSET confers no authority yet → Pending, no change.
+    // A confirming WRITERADD confers no authority yet → Pending, no change.
     let res = replay_audit(
         vec![
             confirmed_entry(init_memo(&root_sk, addr)),
             confirming_entry(
-                op_memo(&root_sk, addr, Op::WriterSet, &w, Some("CREATE")),
+                op_memo(&root_sk, addr, Op::WriterAdd, &w, Some("CREATE")),
                 1,
                 3,
             ),
@@ -4132,7 +4132,7 @@ fn history_confirming_management_is_pending_then_applied_when_confirmed() {
     let res = replay_audit(
         vec![
             confirmed_entry(init_memo(&root_sk, addr)),
-            confirmed_entry(op_memo(&root_sk, addr, Op::WriterSet, &w, Some("CREATE"))),
+            confirmed_entry(op_memo(&root_sk, addr, Op::WriterAdd, &w, Some("CREATE"))),
         ],
         addr,
         &root_pk,
@@ -4154,7 +4154,7 @@ fn history_matches_replay_on_applied_subset() {
     let w = pubkey_bech32(&w_pk);
     let texts = vec![
         init_memo(&root_sk, addr),
-        op_memo(&root_sk, addr, Op::WriterSet, &w, Some("CREATE,UPDATE")),
+        op_memo(&root_sk, addr, Op::WriterAdd, &w, Some("CREATE,UPDATE")),
         op_memo(&w_sk, addr, Op::Set, "k", Some("v1")),
         op_memo(&w_sk, addr, Op::Set, "k", Some("v2")),
         op_memo(&root_sk, addr, Op::Del, "k", None),
@@ -4336,7 +4336,7 @@ fn parse_detailed_missing_value_and_scope() {
         parse_text_memo_detailed(&set),
         Err(MemoReject::Malformed(MemoFormat::MissingValue))
     );
-    let wset = format!("ZKV0 WRITERSET k\n{}", sig_hex_stub());
+    let wset = format!("ZKV0 WRITERADD k\n{}", sig_hex_stub());
     assert_eq!(
         parse_text_memo_detailed(&wset),
         Err(MemoReject::Malformed(MemoFormat::MissingScope))
@@ -4733,7 +4733,7 @@ fn version_signature_binds_opcode() {
     // The signed payload commits to the opcode string, so recovery yields a
     // different (non-owner) pubkey and the memo is dropped; the version is
     // left untouched.
-    let payload = signed_payload(addr, Op::OwnerSet, "2", Some("blockwrite"));
+    let payload = signed_payload(addr, Op::OwnerAdd, "2", Some("blockwrite"));
     let sig = sign_command(&root_sk, &payload);
     let forged = render_memo_text(Op::Version, "2", Some("blockwrite"), 0, &hex::encode(sig));
     let res = replay_audit(
@@ -4931,8 +4931,8 @@ fn seq_in_window_is_the_single_replay_protection_rule() {
     let mut tgt: BTreeMap<String, u64> = BTreeMap::new();
     tgt.insert("k".into(), 100);
     assert!(seq_in_window(Op::Set, "k", 5, &kv, &tgt)); // data → kv (=5)
-    assert!(!seq_in_window(Op::OwnerSet, "k", 5, &kv, &tgt)); // mgmt → target (=100)
-    assert!(seq_in_window(Op::OwnerSet, "k", 100, &kv, &tgt));
+    assert!(!seq_in_window(Op::OwnerAdd, "k", 5, &kv, &tgt)); // mgmt → target (=100)
+    assert!(seq_in_window(Op::OwnerAdd, "k", 100, &kv, &tgt));
 
     // Non-versioned ops (INIT / VERSION / FINALIZE) are always in window.
     assert!(seq_in_window(Op::Init, "k", 0, &kv, &tgt));

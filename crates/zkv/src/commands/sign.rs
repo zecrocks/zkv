@@ -58,7 +58,7 @@ struct OwnerArgs {
 
 #[derive(Debug, Subcommand)]
 enum OwnerAction {
-    /// Sign an OWNERSET (grant/re-affirm owner authority).
+    /// Sign an OWNERADD (grant/re-affirm owner authority).
     Add { pubkey: String },
     /// Sign an OWNERDEL (revoke owner authority).
     Remove { pubkey: String },
@@ -72,7 +72,7 @@ struct WriterArgs {
 
 #[derive(Debug, Subcommand)]
 enum WriterAction {
-    /// Sign a WRITERSET (grant/overwrite a scoped writer).
+    /// Sign a WRITERADD (grant/overwrite a scoped writer).
     Add {
         pubkey: String,
         /// Capability scope: a comma-separated subset of CREATE,UPDATE,DESTROY.
@@ -94,7 +94,7 @@ impl Command {
             }
             Action::Del(a) => write_and_print(&name, Op::Del, &a.key, None),
             Action::Owner(o) => match o.action {
-                OwnerAction::Add { pubkey } => manage_and_print(&name, Op::OwnerSet, &pubkey, None),
+                OwnerAction::Add { pubkey } => manage_and_print(&name, Op::OwnerAdd, &pubkey, None),
                 OwnerAction::Remove { pubkey } => {
                     manage_and_print(&name, Op::OwnerDel, &pubkey, None)
                 }
@@ -107,7 +107,7 @@ impl Command {
                              CREATE,UPDATE,DESTROY"
                         )
                     })?;
-                    manage_and_print(&name, Op::WriterSet, &pubkey, Some(&scope.to_wire()))
+                    manage_and_print(&name, Op::WriterAdd, &pubkey, Some(&scope.to_wire()))
                 }
                 WriterAction::Remove { pubkey } => {
                     manage_and_print(&name, Op::WriterDel, &pubkey, None)

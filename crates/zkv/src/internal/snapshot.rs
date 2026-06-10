@@ -346,7 +346,7 @@ fn load_auth(conn: &Connection) -> Result<AuthRegistry> {
             // hold even if the table somehow contains a writer row for a key
             // also listed as owner (owners load first only by query order, so
             // be defensive).
-            let _ = auth.apply_management(Op::WriterSet, &pubkey_bech32, Some(&scope.to_wire()));
+            let _ = auth.apply_management(Op::WriterAdd, &pubkey_bech32, Some(&scope.to_wire()));
         }
     }
     Ok(auth)
@@ -719,7 +719,7 @@ fn apply_row(
                     },
                 )?;
             }
-            Op::OwnerSet | Op::OwnerDel | Op::WriterSet | Op::WriterDel => {
+            Op::OwnerAdd | Op::OwnerDel | Op::WriterAdd | Op::WriterDel => {
                 let result = auth.apply_management(cmd.op, &cmd.key, cmd.value.as_deref());
                 // Advance the target's high-water for EVERY owner-authorized,
                 // in-window management op, even a policy no-op
@@ -1824,7 +1824,7 @@ mod tests {
                 memo_text: op_memo_text(
                     &root_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pubkey_bech32(&w_pk),
                     Some("CREATE,UPDATE"),
                 ),
@@ -1839,7 +1839,7 @@ mod tests {
         ];
         promote(&mut conn, &rows, addr, &root_pk).unwrap();
 
-        // Only the data write is in kv_history (WRITERSET is a management op),
+        // Only the data write is in kv_history (WRITERADD is a management op),
         // attributed to the writer.
         let all = history_page(&conn, Some("price"), None, false, None, 0).unwrap();
         assert_eq!(all.len(), 1);
@@ -2277,7 +2277,7 @@ mod tests {
                     memo_text: op_memo_text(
                         &root_sk,
                         addr,
-                        Op::OwnerSet,
+                        Op::OwnerAdd,
                         &pubkey_bech32(&owner2_pk),
                         None,
                     ),
@@ -2290,7 +2290,7 @@ mod tests {
                     memo_text: op_memo_text(
                         &root_sk,
                         addr,
-                        Op::WriterSet,
+                        Op::WriterAdd,
                         &pubkey_bech32(&w_pk),
                         Some("CREATE,UPDATE"),
                     ),
@@ -2448,7 +2448,7 @@ mod tests {
                     memo_text: op_memo_text(
                         &root_sk,
                         addr,
-                        Op::WriterSet,
+                        Op::WriterAdd,
                         &pubkey_bech32(&w_pk),
                         Some("CREATE"),
                     ),
@@ -2565,7 +2565,7 @@ mod tests {
                     memo_text: op_memo_text(
                         &root_sk,
                         addr,
-                        Op::WriterSet,
+                        Op::WriterAdd,
                         &pubkey_bech32(&w_pk),
                         Some("CREATE"),
                     ),
@@ -2576,7 +2576,7 @@ mod tests {
                     txid: synth_txid(3),
                     output_index: 0,
                     block_time: None,
-                    memo_text: op_memo_text(&w_sk, addr, Op::OwnerSet, &pubkey_bech32(&w_pk), None),
+                    memo_text: op_memo_text(&w_sk, addr, Op::OwnerAdd, &pubkey_bech32(&w_pk), None),
                 },
             ],
             addr,
@@ -2608,7 +2608,7 @@ mod tests {
                 op_memo_text(
                     &root_sk,
                     addr,
-                    Op::OwnerSet,
+                    Op::OwnerAdd,
                     &pubkey_bech32(&owner2_pk),
                     None,
                 ),
@@ -2619,7 +2619,7 @@ mod tests {
                 op_memo_text(
                     &owner2_sk,
                     addr,
-                    Op::WriterSet,
+                    Op::WriterAdd,
                     &pubkey_bech32(&w_pk),
                     Some("CREATE,UPDATE"),
                 ),
@@ -2685,7 +2685,7 @@ mod tests {
                 "1",
                 Some("blocksync,blockwrite"),
             ),
-            op_memo_text(&root_sk, addr, Op::WriterSet, &w_hex, Some("CREATE,UPDATE")),
+            op_memo_text(&root_sk, addr, Op::WriterAdd, &w_hex, Some("CREATE,UPDATE")),
             // "k": CREATE (v0), then UPDATE (v1). The stranger's write is
             // unauthorized: signed at the correct version 2, it drops on
             // authority (identically on both paths), not on signature.

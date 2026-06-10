@@ -436,7 +436,7 @@ where
 /// With recoverable signatures, every memo's signer is recovered from its
 /// signature (no pubkey on the wire) and checked against the registry:
 ///
-/// - **Owners** (`OWNERSET`/`OWNERDEL`/`WRITERSET`/`WRITERDEL` and any
+/// - **Owners** (`OWNERADD`/`OWNERDEL`/`WRITERADD`/`WRITERDEL` and any
 ///   `SET`/`SETL`/`DEL`): an owner may do anything. Only owners may issue
 ///   management ops; a management op signed by a non-owner is dropped. The
 ///   last remaining owner cannot be removed.
@@ -730,9 +730,9 @@ pub fn decide(
         // They share the init + owner gate; their distinct effects (registry
         // mutation, the finalized latch, or the VERSION transition) are applied
         // and may refine to Dropped later.
-        Op::OwnerSet
+        Op::OwnerAdd
         | Op::OwnerDel
-        | Op::WriterSet
+        | Op::WriterAdd
         | Op::WriterDel
         | Op::Finalize
         | Op::Version => {
@@ -1042,7 +1042,7 @@ fn apply_in_memory(
                     auth.insert_owner(root_hex.to_owned());
                     RowOutcome::Applied
                 }
-                Op::OwnerSet | Op::OwnerDel | Op::WriterSet | Op::WriterDel => {
+                Op::OwnerAdd | Op::OwnerDel | Op::WriterAdd | Op::WriterDel => {
                     let target = c.key.as_deref().unwrap_or("");
                     let result = auth.apply_management(op, target, c.value.as_deref());
                     // Advance the target's high-water for EVERY owner-authorized,
@@ -1133,7 +1133,7 @@ fn apply_in_memory(
                     // writer's back-to-back management ops to the same target each
                     // sign the next sequence and all verify in the live tail rather
                     // than the second colliding on a stale sequence.
-                    Op::OwnerSet | Op::OwnerDel | Op::WriterSet | Op::WriterDel => {
+                    Op::OwnerAdd | Op::OwnerDel | Op::WriterAdd | Op::WriterDel => {
                         bump_hw(target_versions, c.key.clone().unwrap_or_default(), c.seq);
                     }
                     // FINALIZE and VERSION are not version-CAS'd and confer no
@@ -1306,7 +1306,7 @@ pub struct RevokedRole {
 
 /// Derive the set of revoked roles from an [`AuditResult`] by replaying its
 /// *applied* management ops in chain order: every pubkey that was granted
-/// authority (`INIT`/`OWNERSET`/`WRITERSET`) and later revoked
+/// authority (`INIT`/`OWNERADD`/`WRITERADD`) and later revoked
 /// (`OWNERDEL`/`WRITERDEL`) without being re-granted. Newest revocation first.
 ///
 /// Only `Applied` rows count (a pending/below-threshold or dropped management
@@ -1339,7 +1339,7 @@ pub fn revoked_roles(audit: &AuditResult) -> Vec<RevokedRole> {
                     tombstones.remove(by);
                 }
             }
-            Op::OwnerSet => {
+            Op::OwnerAdd => {
                 if let Some(target) = row.key.as_deref() {
                     held.insert(
                         target.to_owned(),
@@ -1351,7 +1351,7 @@ pub fn revoked_roles(audit: &AuditResult) -> Vec<RevokedRole> {
                     tombstones.remove(target);
                 }
             }
-            Op::WriterSet => {
+            Op::WriterAdd => {
                 if let Some(target) = row.key.as_deref() {
                     let capabilities = row
                         .value
@@ -1402,7 +1402,7 @@ pub fn revoked_roles(audit: &AuditResult) -> Vec<RevokedRole> {
 
 /// A pubkey that currently holds authority, paired with the provenance of the
 /// grant that established its present role: the `INIT` (for the creator) or the
-/// most recent `OWNERSET`/`WRITERSET` that set it.
+/// most recent `OWNERADD`/`WRITERADD` that set it.
 ///
 /// The complement of [`revoked_roles`]: these are the survivors (the
 /// tombstones are revoked), so together they partition every pubkey that ever
@@ -1432,7 +1432,7 @@ pub struct GrantedRole {
 
 /// Derive the currently-authorized roles and their grant provenance from an
 /// [`AuditResult`] by replaying its *applied* management ops in chain order:
-/// every pubkey granted authority (`INIT`/`OWNERSET`/`WRITERSET`) and not since
+/// every pubkey granted authority (`INIT`/`OWNERADD`/`WRITERADD`) and not since
 /// revoked, carrying the height/timestamp/signer of the grant that set its
 /// current role. See [`GrantedRole`].
 ///
@@ -1464,7 +1464,7 @@ pub fn granted_roles(audit: &AuditResult) -> Vec<GrantedRole> {
                     );
                 }
             }
-            Op::OwnerSet => {
+            Op::OwnerAdd => {
                 if let Some(target) = row.key.as_deref() {
                     held.insert(
                         target.to_owned(),
@@ -1480,7 +1480,7 @@ pub fn granted_roles(audit: &AuditResult) -> Vec<GrantedRole> {
                     );
                 }
             }
-            Op::WriterSet => {
+            Op::WriterAdd => {
                 if let Some(target) = row.key.as_deref() {
                     let capabilities = row
                         .value

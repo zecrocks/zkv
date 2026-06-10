@@ -223,7 +223,7 @@ fn inflight_count(db_name: &str, result: &ReplayResult, key: &str, ops: &[&str])
 /// Data ops that share the per-key replay-protection version.
 const DATA_OPS: &[&str] = &["SET", "SETL", "DEL"];
 /// Management ops that share the per-target replay-protection version.
-const MGMT_OPS: &[&str] = &["OWNERSET", "OWNERDEL", "WRITERSET", "WRITERDEL"];
+const MGMT_OPS: &[&str] = &["OWNERADD", "OWNERDEL", "WRITERADD", "WRITERDEL"];
 
 /// Build a single zero-value memo output (the unit of a zkv write). Shared by
 /// the single-write path ([`build_request`]) and the batch path
@@ -479,9 +479,9 @@ pub fn prepare_batch(db_name: &str, ops: &[BatchItem<'_>]) -> anyhow::Result<Pre
     })
 }
 
-/// Sign + build an owner/writer management memo (`OWNERSET`/`OWNERDEL`/
-/// `WRITERSET`/`WRITERDEL`). `target` is the affected pubkey (`zkvid1…` or
-/// hex); `scope` is the capability string for `WRITERSET` (ignored
+/// Sign + build an owner/writer management memo (`OWNERADD`/`OWNERDEL`/
+/// `WRITERADD`/`WRITERDEL`). `target` is the affected pubkey (`zkvid1…` or
+/// hex); `scope` is the capability string for `WRITERADD` (ignored
 /// otherwise). Bails if the database isn't initialized or this signing key is
 /// not a current owner. Does NOT broadcast.
 pub fn prepare_management(
@@ -522,7 +522,7 @@ pub fn prepare_management(
         pubkey_bech32(&target_pk)
     };
     let value = match op {
-        Op::WriterSet => Some(scope.ok_or_else(|| anyhow!("WRITERSET requires a scope"))?),
+        Op::WriterAdd => Some(scope.ok_or_else(|| anyhow!("WRITERADD requires a scope"))?),
         _ => None,
     };
 
@@ -729,7 +729,7 @@ pub async fn write_many_and_broadcast(
 
 /// Sync (unless `no_sync`), prepare, and broadcast an owner/writer management
 /// memo. `target` is the affected pubkey (zkvid1… or hex); `scope` is the
-/// capability string for `WRITERSET`. Returns the broadcast txid. `no_sync`
+/// capability string for `WRITERADD`. Returns the broadcast txid. `no_sync`
 /// only skips the pre-broadcast sync; the memo is still broadcast immediately.
 ///
 /// Management ops are recorded in `pending.toml` with the op name, the target
@@ -825,7 +825,7 @@ pub fn write_and_print(
 /// Sign and print an owner/writer management memo (`OWNER*`/`WRITER*`) only;
 /// no sync, no broadcast. Backs `zkv sign owner …` / `zkv sign writer …`.
 /// `target` is the affected pubkey; `scope` is the capability string for
-/// `WRITERSET` (ignored otherwise).
+/// `WRITERADD` (ignored otherwise).
 pub fn manage_and_print(
     db_name: &str,
     op: Op,

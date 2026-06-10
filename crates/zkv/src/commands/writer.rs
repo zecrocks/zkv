@@ -65,7 +65,7 @@ impl Command {
                 let database = Database::open(&name, a.connection.into_inner())?;
                 ui::arrow(format!(
                     "{} {} [{}]  {}",
-                    ui::bold("WRITERSET"),
+                    ui::bold("WRITERADD"),
                     a.pubkey,
                     scope.to_wire(),
                     ui::dim("broadcasting…"),

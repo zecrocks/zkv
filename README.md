@@ -118,9 +118,9 @@ ZKV0 INIT      <zkv_addr>            root key only; first valid wins
 ZKV0 SET       <key> <value>         compact form (non-empty, newline-free)
 ZKV0 SETL      <key> <byte_len>      length-framed form (empty / multiline)
 ZKV0 DEL       <key>
-ZKV0 OWNERSET  <pubkey>              owner only; grant owner
+ZKV0 OWNERADD  <pubkey>              owner only; grant owner
 ZKV0 OWNERDEL  <pubkey>              owner only; revoke owner (last owner kept)
-ZKV0 WRITERSET <pubkey> <scope>      owner only; grant/overwrite scoped writer
+ZKV0 WRITERADD <pubkey> <scope>      owner only; grant/overwrite scoped writer
 ZKV0 WRITERDEL <pubkey>              owner only; revoke writer
 ZKV0 FINALIZE                        owner only; seal db; all later writes drop
 ZKV0 VERSION   <n> <flags>           owner only; gate client epoch (honor-only)

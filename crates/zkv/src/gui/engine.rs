@@ -312,7 +312,7 @@ pub struct RoleRow {
     /// order). Empty for owners, who can write any key.
     pub capabilities: Vec<String>,
     /// Mined height of the grant that established this role (the `INIT` for the
-    /// creator, otherwise the `OWNERSET`/`WRITERSET`), or null if unmined or
+    /// creator, otherwise the `OWNERADD`/`WRITERADD`), or null if unmined or
     /// the grant couldn't be located.
     pub height: Option<u32>,
     /// Block timestamp (unix seconds) of that grant, or null. The Roles detail
@@ -1200,22 +1200,22 @@ impl Engine {
                 "SETL" => db.prepare_setl(&need_key()?, value.as_deref().unwrap_or(""))?,
                 "DEL" => db.prepare_del(&need_key()?)?,
                 "INIT" => db.prepare_init()?,
-                "OWNERSET" => db.prepare_management(Op::OwnerSet, &need_key()?, None)?,
+                "OWNERADD" => db.prepare_management(Op::OwnerAdd, &need_key()?, None)?,
                 "OWNERDEL" => db.prepare_management(Op::OwnerDel, &need_key()?, None)?,
                 "WRITERDEL" => db.prepare_management(Op::WriterDel, &need_key()?, None)?,
                 // FINALIZE is header-only (no key/target); an owner-only seal.
                 "FINALIZE" => db.prepare_management(Op::Finalize, "", None)?,
-                "WRITERSET" => {
+                "WRITERADD" => {
                     let s = scope
                         .as_deref()
-                        .ok_or_else(|| bad("WRITERSET requires a scope".into()))?;
+                        .ok_or_else(|| bad("WRITERADD requires a scope".into()))?;
                     let parsed = Scope::parse(s).ok_or_else(|| {
                         bad(format!(
                             "invalid scope {s:?}: expected a comma-separated subset of \
                              CREATE,UPDATE,DESTROY"
                         ))
                     })?;
-                    db.prepare_management(Op::WriterSet, &need_key()?, Some(&parsed))?
+                    db.prepare_management(Op::WriterAdd, &need_key()?, Some(&parsed))?
                 }
                 other => return Err(bad(format!("opcode {other:?} cannot be signed"))),
             };
@@ -2278,7 +2278,7 @@ mod tests {
 
         let mut auth = AuthRegistry::default();
         auth.insert_owner(owner_key.clone());
-        let _ = auth.apply_management(Op::WriterSet, &writer_key, Some("CREATE,DESTROY"));
+        let _ = auth.apply_management(Op::WriterAdd, &writer_key, Some("CREATE,DESTROY"));
 
         let resp = roles_resp(&auth, Vec::new(), Vec::new(), Some(owner_key.clone()));
 

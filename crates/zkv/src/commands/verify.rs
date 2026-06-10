@@ -224,7 +224,7 @@ fn print_fail_json(f: &VerifyFail) {
 fn key_label(op: Op) -> &'static str {
     match op {
         Op::Init => "Address",
-        Op::OwnerSet | Op::OwnerDel | Op::WriterSet | Op::WriterDel => "Target",
+        Op::OwnerAdd | Op::OwnerDel | Op::WriterAdd | Op::WriterDel => "Target",
         Op::Version => "Version",
         _ => "Key",
     }

@@ -1188,7 +1188,7 @@ impl Database {
     /// Grant (or re-affirm) owner authority to `pubkey` (a zkvid1… key or hex).
     /// Owner-only; broadcast by this database's signing key. Returns the txid.
     pub async fn grant_owner(&self, pubkey: &str) -> Result<String> {
-        self.do_manage(false, Op::OwnerSet, pubkey, None).await
+        self.do_manage(false, Op::OwnerAdd, pubkey, None).await
     }
 
     /// Revoke owner authority from `pubkey`. Owner-only. The last remaining
@@ -1200,7 +1200,7 @@ impl Database {
     /// Grant (or overwrite) a scoped writer. `scope` is the capability set;
     /// a later call replaces it wholesale. Owner-only. Returns the txid.
     pub async fn grant_writer(&self, pubkey: &str, scope: &Scope) -> Result<String> {
-        self.do_manage(false, Op::WriterSet, pubkey, Some(scope.to_wire()))
+        self.do_manage(false, Op::WriterAdd, pubkey, Some(scope.to_wire()))
             .await
     }
 
@@ -1214,7 +1214,7 @@ impl Database {
     /// broadcasts immediately; the wallet must already hold spendable funds
     /// for the fee.
     pub async fn grant_owner_no_sync(&self, pubkey: &str) -> Result<String> {
-        self.do_manage(true, Op::OwnerSet, pubkey, None).await
+        self.do_manage(true, Op::OwnerAdd, pubkey, None).await
     }
 
     /// Like [`Database::revoke_owner`] but skips the pre-broadcast sync.
@@ -1224,7 +1224,7 @@ impl Database {
 
     /// Like [`Database::grant_writer`] but skips the pre-broadcast sync.
     pub async fn grant_writer_no_sync(&self, pubkey: &str, scope: &Scope) -> Result<String> {
-        self.do_manage(true, Op::WriterSet, pubkey, Some(scope.to_wire()))
+        self.do_manage(true, Op::WriterAdd, pubkey, Some(scope.to_wire()))
             .await
     }
 
@@ -1641,7 +1641,7 @@ fn merge_pending(db_name: &str, result: &mut ReplayResult, min_confs: u32) {
                 required: min_confs.max(1),
                 txid: entry.txid.clone(),
             },
-            // Management ops (OWNERSET/OWNERDEL/WRITERSET/WRITERDEL) confer
+            // Management ops (OWNERADD/OWNERDEL/WRITERADD/WRITERDEL) confer
             // no per-key pending state; their effect only shows once
             // confirmed, via the registry.
             _ => continue,
@@ -1840,7 +1840,7 @@ mod tests {
         assert!(matches!(map_write_error(unauth), ZkvError::Unauthorized(_)));
 
         let owner_only = anyhow::Error::new(WriteError::OwnerOnly {
-            op: "OWNERSET".to_owned(),
+            op: "OWNERADD".to_owned(),
         });
         assert!(matches!(
             map_write_error(owner_only),

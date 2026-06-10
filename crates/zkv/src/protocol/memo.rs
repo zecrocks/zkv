@@ -13,7 +13,7 @@ use super::*;
 /// [`render_memo_text`] (which reconstructs a memo from already-validated
 /// stored fields). For INIT, `key` is the embedded zkv_addr and `value` is the
 /// optional reserved-tokens string; for the management ops `key` is the
-/// target's canonical `zkvid1…` pubkey and (for WRITERSET) `value` is the scope.
+/// target's canonical `zkvid1…` pubkey and (for WRITERADD) `value` is the scope.
 fn memo_line1(op: Op, key: &str, value: Option<&str>) -> String {
     match op {
         Op::Set => match value {
@@ -31,14 +31,14 @@ fn memo_line1(op: Op, key: &str, value: Option<&str>) -> String {
             Some(v) => format!("{WIRE_MAGIC} INIT {key} {v}"),
             None => format!("{WIRE_MAGIC} INIT {key}"),
         },
-        // Registry-management ops. WRITERSET carries the scope as its value;
-        // the others carry no value (a missing WRITERSET value is unreachable
+        // Registry-management ops. WRITERADD carries the scope as its value;
+        // the others carry no value (a missing WRITERADD value is unreachable
         // via `build_memo`, which bails first).
-        Op::OwnerSet => format!("{WIRE_MAGIC} OWNERSET {key}"),
+        Op::OwnerAdd => format!("{WIRE_MAGIC} OWNERADD {key}"),
         Op::OwnerDel => format!("{WIRE_MAGIC} OWNERDEL {key}"),
-        Op::WriterSet => match value {
-            Some(v) => format!("{WIRE_MAGIC} WRITERSET {key} {v}"),
-            None => format!("{WIRE_MAGIC} WRITERSET {key}"),
+        Op::WriterAdd => match value {
+            Some(v) => format!("{WIRE_MAGIC} WRITERADD {key} {v}"),
+            None => format!("{WIRE_MAGIC} WRITERADD {key}"),
         },
         Op::WriterDel => format!("{WIRE_MAGIC} WRITERDEL {key}"),
         // FINALIZE is header-only: no key, no value.
@@ -151,9 +151,9 @@ pub fn build_memo_with_comment(
         (Op::Set, None) => bail!("SET requires a value"),
         (Op::SetL, None) => bail!("SETL requires a value"),
         (Op::Del, Some(_)) => bail!("DEL takes no value"),
-        (Op::OwnerSet, Some(_)) => bail!("OWNERSET takes no value"),
+        (Op::OwnerAdd, Some(_)) => bail!("OWNERADD takes no value"),
         (Op::OwnerDel, Some(_)) => bail!("OWNERDEL takes no value"),
-        (Op::WriterSet, None) => bail!("WRITERSET requires a scope value"),
+        (Op::WriterAdd, None) => bail!("WRITERADD requires a scope value"),
         (Op::WriterDel, Some(_)) => bail!("WRITERDEL takes no value"),
         (Op::Finalize, Some(_)) => bail!("FINALIZE takes no value"),
         (Op::Version, None) => bail!("VERSION requires a block-flags value"),
@@ -197,11 +197,11 @@ pub struct ZkvCommand {
 /// Wire forms (`<sig>` is the 130-char hex of a 65-byte recoverable
 /// signature; see [`SIG_LEN`]):
 ///
-/// - `SET` / `DEL` / `INIT` / `OWNERSET` / `OWNERDEL` / `WRITERSET` /
+/// - `SET` / `DEL` / `INIT` / `OWNERADD` / `OWNERDEL` / `WRITERADD` /
 ///   `WRITERDEL`: `"ZKV0 OP KEY [VALUE]\n<sig>"`. Some broadcaster wallets
 ///   normalize newlines into whitespace; for these ops we fall back to taking
 ///   the trailing hex run as the signature. For `OWNER*`/`WRITER*`, `KEY` is
-///   the target's canonical `zkvid1…` pubkey and `VALUE` (WRITERSET only) is
+///   the target's canonical `zkvid1…` pubkey and `VALUE` (WRITERADD only) is
 ///   the capability scope.
 /// - `FINALIZE`: `"ZKV0 FINALIZE\n<sig>"` (header-only, carrying no key and
 ///   no value; the same collapsed-newline fallback applies).
@@ -282,7 +282,7 @@ pub fn looks_like_zkv(text: &str) -> bool {
 }
 
 /// The trailing signature line for the two-section header-only / `SET` /
-/// `WRITERSET` / `INIT` forms: `rest` (trimmed) is the compact `(seq, sig)`
+/// `WRITERADD` / `INIT` forms: `rest` (trimmed) is the compact `(seq, sig)`
 /// blob: any leading big-endian sequence prefix followed by the fixed
 /// [`SIG_HEX_LEN`]-char signature (see [`parse_sig_line`]).
 fn parse_trailing_sig(rest: &str) -> Result<(u64, String), MemoReject> {
@@ -381,7 +381,7 @@ fn parse_two_section(line1: &str, rest: &str) -> Result<ZkvCommand, MemoReject> 
             let (seq, sig) = parse_trailing_sig(rest)?;
             (Some(v.to_owned()), seq, sig)
         }
-        Op::Del | Op::OwnerSet | Op::OwnerDel | Op::WriterDel => {
+        Op::Del | Op::OwnerAdd | Op::OwnerDel | Op::WriterDel => {
             // Header-only ops: `key` (target pubkey for OWNER*/WRITER*) and
             // nothing past it. Any trailing token is a protocol violation.
             if tokens.next().is_some() {
@@ -390,11 +390,11 @@ fn parse_two_section(line1: &str, rest: &str) -> Result<ZkvCommand, MemoReject> 
             let (seq, sig) = parse_trailing_sig(rest)?;
             (None, seq, sig)
         }
-        // WRITERSET carries a non-empty scope value as its 4th token; VERSION
+        // WRITERADD carries a non-empty scope value as its 4th token; VERSION
         // carries its block-flags token in the same position. The token's
         // *content* is validated later (Scope::parse / BlockSet::parse); here
         // we only require it to be present and non-empty.
-        Op::WriterSet => {
+        Op::WriterAdd => {
             let v = tokens
                 .next()
                 .ok_or(MemoReject::Malformed(MemoFormat::MissingScope))?;
@@ -523,7 +523,7 @@ fn parse_collapsed(text: &str) -> Result<ZkvCommand, MemoReject> {
             }
             Some(v.to_owned())
         }
-        Op::WriterSet => {
+        Op::WriterAdd => {
             let v = tokens
                 .next()
                 .ok_or(MemoReject::Malformed(MemoFormat::MissingScope))?;
@@ -541,7 +541,7 @@ fn parse_collapsed(text: &str) -> Result<ZkvCommand, MemoReject> {
             }
             Some(v.to_owned())
         }
-        Op::Del | Op::OwnerSet | Op::OwnerDel | Op::WriterDel => {
+        Op::Del | Op::OwnerAdd | Op::OwnerDel | Op::WriterDel => {
             if tokens.next().is_some() {
                 return Err(MemoReject::Malformed(MemoFormat::WrongArity { op }));
             }
