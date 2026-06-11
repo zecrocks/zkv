@@ -12,7 +12,7 @@ name = "zkv-version-oracle"
 path = "src/main.rs"
 
 [dependencies]
-zkv = { path = "../zkv", version = "0.0.1-rc2" }
+zkv = { path = "../zkv", version = "0.0.1-rc3" }
 
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "string"] }

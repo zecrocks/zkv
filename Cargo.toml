@@ -35,7 +35,7 @@ members = ["crates/zkv", "crates/zkv-oracle", "crates/zkv-version-oracle"]
 [workspace.dependencies]
 # Internal crate (path resolved relative to the workspace root, so the faucet
 # and these root tests reference it identically).
-zkv = { path = "crates/zkv", version = "0.0.1-rc2" }
+zkv = { path = "crates/zkv", version = "0.0.1-rc3" }
 
 # Shared third-party deps. Versions live here so the member crates (and the
 # workspace-root integration tests) can't drift; per-crate feature sets and
