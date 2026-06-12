@@ -418,8 +418,18 @@ const FirstSyncPanel = ({ detail, chainTip }: any) => {
   const bday = (detail && detail.birthday) || 0;
   const tip = chainTip || 0;
   const synced = (detail && detail.synced) || 0;
-  const cur = tip > 0 ? Math.min(tip, Math.max(synced, bday)) : synced;
   const span = tip - bday;
+  // Prefer the wallet's note-count scan ratio over the contiguous `synced`
+  // frontier: the scanner works out of priority order (tip region first, then
+  // the historic sweep), so `synced` can sit at the birthday for most of a
+  // first import while real progress is being committed. The ratio grows with
+  // every committed batch; map it onto the block span for the height readout.
+  const sp = detail && detail.scan_progress;
+  const ratio = sp && sp[1] > 0 ? Math.min(1, sp[0] / sp[1]) : null;
+  let cur = tip > 0 ? Math.min(tip, Math.max(synced, bday)) : synced;
+  if (ratio != null && tip > 0 && span > 0) {
+    cur = Math.max(cur, Math.min(tip, bday + Math.round(ratio * span)));
+  }
   const pct = span > 0 ? Math.max(0, Math.min(100, Math.round(((cur - bday) / span) * 100))) : 0;
   return (
     <div className="dt-wrap">

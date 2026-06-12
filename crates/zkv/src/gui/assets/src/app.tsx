@@ -319,18 +319,8 @@ function App() {
     return () => ids.forEach(clearTimeout);
   }, [refreshDatabases]);
 
-  // Poll ambient status periodically. The server auto-syncs every database in
-  // the background, so we also reload the open db's detail + the sidebar list
-  // here to surface that fresh state without any manual action.
-  React.useEffect(() => {
-    const tick = () => {
-      refreshStatus();
-      if (activeName) loadDetail(activeName!);
-      refreshDatabases();
-    };
-    const id = setInterval(tick, 10000);
-    return () => clearInterval(id);
-  }, [refreshStatus, loadDetail, refreshDatabases, activeName]);
+  // The ambient status/detail/sidebar poll lives further down, after
+  // `firstSyncPending` is computed, because its cadence depends on it.
 
   // Only keyboard shortcut: ⌘K / Ctrl-K toggles the search palette (Esc closes
   // it). Arrow-key list navigation lives in its own effect below. No others.
@@ -1156,6 +1146,23 @@ function App() {
   }
   const firstSyncPending =
     !!detail && detailMatches && !initKnown && !fullyScanned && !firstSyncSettledRef.current.settled;
+  // Poll ambient status periodically. The server auto-syncs every database in
+  // the background, so we also reload the open db's detail + the sidebar list
+  // here to surface that fresh state without any manual action. While the
+  // first-sync gate is up, tighten the cadence so the gate's progress ticks
+  // promptly after every committed scan batch; the reads are local-only and
+  // WAL keeps them from contending with the scanner, so 2s is cheap. (This
+  // effect lives down here, after `firstSyncPending`, because it depends on
+  // it.)
+  React.useEffect(() => {
+    const tick = () => {
+      refreshStatus();
+      if (activeName) loadDetail(activeName!);
+      refreshDatabases();
+    };
+    const id = setInterval(tick, firstSyncPending ? 2000 : 10000);
+    return () => clearInterval(id);
+  }, [refreshStatus, loadDetail, refreshDatabases, activeName, firstSyncPending]);
   const latency = statusMatches && status.latency_ms != null ? status.latency_ms : null;
   // The status-bar funds come from `detail` (there's no per-db balance in the
   // sidebar summary), so during a *cross-network* switch the stale balance and

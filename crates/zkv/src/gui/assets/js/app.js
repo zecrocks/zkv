@@ -227,15 +227,6 @@ function App() {
     return () => ids.forEach(clearTimeout);
   }, [refreshDatabases]);
   React.useEffect(() => {
-    const tick = () => {
-      refreshStatus();
-      if (activeName) loadDetail(activeName);
-      refreshDatabases();
-    };
-    const id = setInterval(tick, 1e4);
-    return () => clearInterval(id);
-  }, [refreshStatus, loadDetail, refreshDatabases, activeName]);
-  React.useEffect(() => {
     const onKey = (e) => {
       const mod = e.metaKey || e.ctrlKey;
       if (mod && e.key.toLowerCase() === "k") {
@@ -753,6 +744,15 @@ function App() {
     firstSyncSettledRef.current.settled = true;
   }
   const firstSyncPending = !!detail && detailMatches && !initKnown && !fullyScanned && !firstSyncSettledRef.current.settled;
+  React.useEffect(() => {
+    const tick = () => {
+      refreshStatus();
+      if (activeName) loadDetail(activeName);
+      refreshDatabases();
+    };
+    const id = setInterval(tick, firstSyncPending ? 2e3 : 1e4);
+    return () => clearInterval(id);
+  }, [refreshStatus, loadDetail, refreshDatabases, activeName, firstSyncPending]);
   const latency = statusMatches && status.latency_ms != null ? status.latency_ms : null;
   const statusBarDb = view === "keys" && activeDb && (detailMatches || activeDb.network === netName) ? activeDb : null;
   const outOfDate = !!(status && status.build_out_of_date);

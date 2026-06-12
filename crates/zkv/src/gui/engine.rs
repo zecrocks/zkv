@@ -211,6 +211,13 @@ pub struct DbDetail {
     /// Funds still confirming (subset of `balance`). `None` for watch-only.
     pub confirming: Option<u64>,
     pub synced: Option<u32>,
+    /// Note-count scan progress toward the chain tip, `[scanned, total]`
+    /// (`Database::scan_progress`). Grows with every committed scan batch
+    /// even while the out-of-order scanner leaves the contiguous `synced`
+    /// frontier sitting at the birthday, so the first-sync gate can show
+    /// real progress. Null before the wallet's first summary exists; the
+    /// total can be zero (no shielded notes in the window yet).
+    pub scan_progress: Option<(u64, u64)>,
     /// Authoritative "the wallet has scanned up to the live chain tip" verdict
     /// (`Database::synced_to_tip`: within tip tolerance AND no outstanding scan
     /// ranges). Computed via one lightwalletd round-trip, but **only** when the
@@ -862,6 +869,7 @@ impl Engine {
                 balance,
                 confirming,
                 synced: db.synced_height()?,
+                scan_progress: db.scan_progress()?,
                 synced_to_tip,
                 keys: key_rows(&result.state),
                 history_available: true,

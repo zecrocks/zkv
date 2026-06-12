@@ -712,6 +712,41 @@ impl Database {
         Ok(h)
     }
 
+    /// Note-count scan progress toward the chain tip as a `(scanned, total)`
+    /// ratio, or `None` before the wallet's first summary exists. Read
+    /// straight from the wallet DB; no network.
+    ///
+    /// This is the wallet's own progress metric
+    /// (`WalletSummary::progress()`): shielded outputs trial-decrypted so far
+    /// over the total in the birthday→tip window, with the scan and recovery
+    /// segments combined. Unlike [`synced_height`](Database::synced_height) —
+    /// the *contiguous* fully-scanned frontier, which sits still while the
+    /// scanner works out of priority order (the tip region is scanned before
+    /// the historic sweep) — this ratio grows with every committed scan batch
+    /// wherever it lands, so it is the number to drive a progress bar with.
+    ///
+    /// The denominator can be zero (no shielded notes in the window yet);
+    /// callers must use checked division.
+    pub fn scan_progress(&self) -> Result<Option<(u64, u64)>> {
+        use zcash_client_backend::data_api::{wallet::ConfirmationsPolicy, WalletRead};
+
+        let (_, db_data_path) = crate::data::get_db_paths(&self.name).map_err(ZkvError::Other)?;
+        let db_data = crate::data::open_wallet_db(db_data_path, self.cfg.network)
+            .map_err(|e| ZkvError::Other(anyhow::anyhow!("open wallet db: {e}")))?;
+        Ok(db_data
+            .get_wallet_summary(ConfirmationsPolicy::default())
+            .map_err(|e| ZkvError::Other(anyhow::anyhow!("wallet summary: {e}")))?
+            .map(|s| {
+                let p = s.progress();
+                let scan = p.scan();
+                let (num, den) = (*scan.numerator(), *scan.denominator());
+                match p.recovery() {
+                    Some(r) => (num + r.numerator(), den + r.denominator()),
+                    None => (num, den),
+                }
+            }))
+    }
+
     /// Ask lightwalletd for the current chain tip height. One network
     /// round-trip; does not touch the local wallet.
     pub async fn chain_tip(&self) -> Result<u32> {

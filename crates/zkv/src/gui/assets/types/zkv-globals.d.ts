@@ -124,6 +124,11 @@ declare global {
     balance: number | null;
     confirming: number | null;
     synced: number | null;
+    // Note-count scan progress toward the tip, [scanned, total]. Grows with
+    // every committed scan batch even while `synced` (the contiguous
+    // fully-scanned frontier) sits at the birthday during a first import.
+    // Null before the wallet's first summary; total can be zero.
+    scan_progress: [number, number] | null;
     synced_to_tip: boolean;
     keys: KeyRow[];
     history_available: boolean;

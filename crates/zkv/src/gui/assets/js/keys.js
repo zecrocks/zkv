@@ -244,8 +244,13 @@ const FirstSyncPanel = ({ detail, chainTip }) => {
   const bday = detail && detail.birthday || 0;
   const tip = chainTip || 0;
   const synced = detail && detail.synced || 0;
-  const cur = tip > 0 ? Math.min(tip, Math.max(synced, bday)) : synced;
   const span = tip - bday;
+  const sp = detail && detail.scan_progress;
+  const ratio = sp && sp[1] > 0 ? Math.min(1, sp[0] / sp[1]) : null;
+  let cur = tip > 0 ? Math.min(tip, Math.max(synced, bday)) : synced;
+  if (ratio != null && tip > 0 && span > 0) {
+    cur = Math.max(cur, Math.min(tip, bday + Math.round(ratio * span)));
+  }
   const pct = span > 0 ? Math.max(0, Math.min(100, Math.round((cur - bday) / span * 100))) : 0;
   return /* @__PURE__ */ React.createElement("div", { className: "dt-wrap" }, /* @__PURE__ */ React.createElement("div", { className: "empty", style: { padding: "64px 24px" } }, /* @__PURE__ */ React.createElement("div", null, /* @__PURE__ */ React.createElement("div", { className: "glyph", style: { marginBottom: 4 } }, /* @__PURE__ */ React.createElement(Icon, { name: "loader", size: 28 })), /* @__PURE__ */ React.createElement("strong", { style: { color: "var(--fg-1)" } }, tip > 0 ? `Syncing ${cur.toLocaleString()} / ${tip.toLocaleString()} (${pct}%)\u2026` : "Starting sync\u2026"), /* @__PURE__ */ React.createElement("div", { style: { marginTop: 6, color: "var(--fg-3)", fontSize: 13, maxWidth: 360, marginLeft: "auto", marginRight: "auto" } }, "Scanning the chain from this database's birthday to the tip to determine its state."), tip > 0 && span > 0 && /* @__PURE__ */ React.createElement(
     "div",
