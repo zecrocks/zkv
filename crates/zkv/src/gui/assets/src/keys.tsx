@@ -583,7 +583,11 @@ const KeyList = ({
             Sync
           </button>
         )}
-        {isAdmin && (
+        {/* While the first birthday->tip scan is still running the init
+            verdict is provisional (an INIT may sit in not-yet-scanned
+            blocks), so offering Initialize would invite a double-INIT;
+            hide the primary action until the gate settles. */}
+        {isAdmin && !firstSyncPending && (
           (detail && detail.init === "uninitialized") ? (
             <button className="btn primary sm" onClick={() => onWriteKey(null)} title="Broadcast INIT to open this database for writes">
               <Icon name="zap" className="icon" /> Initialize
