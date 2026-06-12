@@ -184,8 +184,10 @@ const DepositModal = ({ db, onClose, onCopy, onInited }: {
               <div className="kv-row" style={{ marginTop: 10 }}>
                 <span className="label" style={{ minWidth: 110 }}>Spendable</span>
                 <span className="value mono">
+                  {/* `balance` IS the spendable figure (confirming is reported
+                      disjointly by the backend), so no subtraction here. */}
                   {db.balance != null
-                    ? window.formatZats(Math.max(0, db.balance - (db.confirming || 0)), db.network)
+                    ? window.formatZats(db.balance, db.network)
                     : "—"}
                   {db.confirming ? (
                     <span style={{ color: "var(--fg-3)" }}> (+ {window.formatZats(db.confirming, db.network)} confirming)</span>
@@ -353,7 +355,9 @@ const SendModal = ({ db, onClose, onCopy, onDeposit, onDone }: {
                   : ""}
               </span>
               <span style={{ color: "var(--green-500)", fontFamily: "var(--font-mono)" }}>
-                balance {haveBal ? window.formatZats(db.balance, db.network) : "—"}
+                {/* `balance` is the spendable figure; label it as such so a
+                    wallet with funds still confirming isn't confusing here. */}
+                spendable {haveBal ? window.formatZats(db.balance, db.network) : "—"}
               </span>
             </div>
           </div>
@@ -675,8 +679,9 @@ const CreateFlow = ({ onCancel, onCreate, onGeneratePhrase, onInit, pollDb, minI
     };
   }, [step, created, pollDb]);
 
-  // Only *spendable* funds can pay for the INIT; the rest is still confirming.
-  const spendable = balance != null ? Math.max(0, balance - (confirming || 0)) : 0;
+  // Only *spendable* funds can pay for the INIT. `balance` is already the
+  // spendable figure (the backend reports confirming disjointly).
+  const spendable = balance != null ? balance : 0;
   const funded = balance != null && spendable >= minInitZats;
   // Funding-step state, drives the status callout + button.
   const fundingState =

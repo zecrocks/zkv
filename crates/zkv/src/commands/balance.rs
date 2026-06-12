@@ -39,14 +39,28 @@ impl Command {
             .get_wallet_summary(ConfirmationsPolicy::default())?
             .ok_or_else(|| anyhow!("no wallet summary yet, try running `zkv sync`"))?;
 
-        let total_zat: u64 = summary
-            .account_balances()
-            .values()
-            .map(|b| u64::from(b.total()))
-            .sum();
+        // Spendable and confirming reported separately (never summed), the
+        // same split the GUI shows: usable now on one side, about to become
+        // usable on the other.
+        let (spendable, total) = summary.account_balances().values().fold(
+            (0u64, 0u64),
+            |(s, t), b| {
+                (
+                    s + u64::from(b.spendable_value()),
+                    t + u64::from(b.total()),
+                )
+            },
+        );
+        let confirming = total.saturating_sub(spendable);
 
         let network = crate::data::Network::from(cfg.network);
-        println!("{}", format_zec(total_zat as i64, network).trim_start());
+        println!("{}", format_zec(spendable as i64, network).trim_start());
+        if confirming > 0 {
+            ui::hint(format!(
+                "(+ {} confirming)",
+                format_zec(confirming as i64, network).trim_start()
+            ));
+        }
         if watch_only {
             ui::hint("(watch-only, cannot send)");
         }

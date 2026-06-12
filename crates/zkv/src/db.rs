@@ -626,7 +626,15 @@ impl Database {
         Ok(keys.receiver_hex)
     }
 
-    /// The wallet's total balance in zatoshi.
+    /// The wallet's **spendable** balance in zatoshi: shielded funds that can
+    /// be spent right now.
+    ///
+    /// Funds still confirming (incoming notes pending spendability, change
+    /// pending confirmation, and unshielded transparent value) are **not**
+    /// included; [`Database::balance_confirming`] reports those separately,
+    /// and the two together are the wallet's total. Kept disjoint — usable on
+    /// one side, about-to-be-usable on the other — so a wallet that just sent
+    /// or received doesn't display in-flight value as if it were spendable.
     ///
     /// Returns [`ZkvError::WatchOnly`] for watch-only databases (they
     /// hold no spending key and therefore no balance). Does not sync
@@ -638,25 +646,25 @@ impl Database {
         let (_, db_data_path) = crate::data::get_db_paths(&self.name).map_err(ZkvError::Other)?;
         let db_data = crate::data::open_wallet_db(db_data_path, self.cfg.network)
             .map_err(|e| ZkvError::Other(anyhow::anyhow!("open wallet db: {e}")))?;
-        let total = db_data
+        let spendable = db_data
             .get_wallet_summary(ConfirmationsPolicy::default())
             .map_err(|e| ZkvError::Other(anyhow::anyhow!("wallet summary: {e}")))?
             .map(|s| {
                 s.account_balances()
                     .values()
-                    .map(|b| u64::from(b.total()))
+                    .map(|b| u64::from(b.spendable_value()))
                     .sum()
             })
             .unwrap_or(0);
-        Ok(total)
+        Ok(spendable)
     }
 
     /// Funds still confirming, in zatoshi: incoming notes pending
     /// spendability, change pending confirmation, and unshielded
-    /// transparent balance. These are already counted in
-    /// [`Database::balance`] (which returns `total()`) but are not yet
-    /// spendable. Returns [`ZkvError::WatchOnly`] for watch-only databases.
-    /// Does not sync first.
+    /// transparent balance. Disjoint from [`Database::balance`] (which
+    /// returns only spendable value); `balance + balance_confirming` is the
+    /// wallet's total. Returns [`ZkvError::WatchOnly`] for watch-only
+    /// databases. Does not sync first.
     pub fn balance_confirming(&self) -> Result<u64> {
         use zcash_client_backend::data_api::{wallet::ConfirmationsPolicy, WalletRead};
 

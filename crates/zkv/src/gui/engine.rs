@@ -207,8 +207,11 @@ pub struct DbDetail {
     pub init: String,
     pub init_done: u32,
     pub init_required: u32,
+    /// Spendable balance (zatoshi): funds usable right now. `None` for
+    /// watch-only. Confirming funds are NOT included; see `confirming`.
     pub balance: Option<u64>,
-    /// Funds still confirming (subset of `balance`). `None` for watch-only.
+    /// Funds still confirming (zatoshi), disjoint from `balance` (the two
+    /// sum to the wallet total). `None` for watch-only.
     pub confirming: Option<u64>,
     pub synced: Option<u32>,
     /// Note-count scan progress toward the chain tip, `[scanned, total]`

@@ -83,10 +83,12 @@ impl Command {
     }
 }
 
-/// Last-known wallet balance for a database, formatted as e.g. `1.23 TAZ`,
-/// or `None` for watch-only / unreadable databases (which hold no spending
-/// key and thus no balance). Reads the local wallet DB only; no sync, so the
-/// figure reflects the last completed scan.
+/// Last-known **spendable** wallet balance for a database, formatted as e.g.
+/// `1.23 TAZ`, or `None` for watch-only / unreadable databases (which hold no
+/// spending key and thus no balance). Spendable (not total) to match `zkv
+/// balance` and the GUI: funds still confirming aren't usable yet. Reads the
+/// local wallet DB only; no sync, so the figure reflects the last completed
+/// scan.
 fn last_known_balance(name: &str) -> Option<String> {
     let cfg = WalletConfig::read(name).ok()?;
     if cfg.role != Role::Admin {
@@ -97,14 +99,14 @@ fn last_known_balance(name: &str) -> Option<String> {
     let summary = db_data
         .get_wallet_summary(ConfirmationsPolicy::default())
         .ok()??;
-    let total_zat: u64 = summary
+    let spendable_zat: u64 = summary
         .account_balances()
         .values()
-        .map(|b| u64::from(b.total()))
+        .map(|b| u64::from(b.spendable_value()))
         .sum();
     let network = data::Network::from(cfg.network);
     Some(
-        format_zec(total_zat as i64, network)
+        format_zec(spendable_zat as i64, network)
             .trim_start()
             .to_owned(),
     )

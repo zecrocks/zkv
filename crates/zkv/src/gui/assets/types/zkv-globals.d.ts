@@ -121,6 +121,8 @@ declare global {
     init: string;
     init_done: number;
     init_required: number;
+    // Spendable balance, zatoshi (usable right now). Confirming funds are
+    // NOT included; `confirming` is disjoint and the two sum to the total.
     balance: number | null;
     confirming: number | null;
     synced: number | null;

@@ -308,7 +308,7 @@ const StatusBar = ({ db, synced, isSynced, latency, syncing, networkBlock, netwo
           <span>{formatZats(db.balance, db.network)}</span>
           {db.confirming! > 0 && (
             <span style={{ color: 'var(--amber-300)', opacity: 0.85 }}
-                  title="Funds still confirming, included in the balance but not yet spendable">
+                  title="Funds still confirming, about to become spendable; not included in the balance on the left">
               (confirming: {formatZats(db.confirming, db.network)})
             </span>
           )}
