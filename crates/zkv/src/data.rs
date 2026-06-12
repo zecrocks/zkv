@@ -434,10 +434,10 @@ pub fn init_dbs<P: Parameters + 'static>(
     ensure_db_dir(name)?;
     let (db_cache, db_data) = get_db_paths(name)?;
     let mut db_cache = FsBlockDb::for_path(db_cache).map_err(error::Error::from)?;
-    let mut db_data = WalletDb::for_path(db_data, params, SystemClock, OsRng)?;
     init_blockmeta_db(&mut db_cache)?;
-    init_wallet_db(&mut db_data, None)?;
-    Ok(db_data)
+    // Route through `open_wallet_db` so a brand-new wallet is born in WAL
+    // mode (and migrated), instead of converting on its first reopen.
+    open_wallet_db(db_data, params)
 }
 
 /// Open an existing wallet `data.sqlite`, applying any pending schema
@@ -457,18 +457,93 @@ pub fn init_dbs<P: Parameters + 'static>(
 /// route through here instead of calling `WalletDb::for_path` directly. The
 /// migrations needed to upgrade an existing, functioning database are
 /// schema-only, so a `None` seed (matching [`init_dbs`]) is sufficient.
+///
+/// The connection is opened in **WAL** journal mode with a busy timeout.
+/// A catch-up sync commits each scan batch in one long write transaction;
+/// in SQLite's default rollback-journal mode that writer escalates to the
+/// file's exclusive lock as soon as its page cache spills, so for most of
+/// every batch *all* concurrent opens/reads of `data.sqlite` fail with
+/// `SQLITE_BUSY` — surfaced by the GUI as "An error occurred while
+/// interacting with the adapter" when opening a database mid-sync. Under
+/// WAL, readers never take the writer's locks (they read the last committed
+/// snapshot), so reads alongside a sync always succeed; the busy timeout
+/// covers the rare writer-vs-writer overlap (a schema migration racing a
+/// sync right after an upgrade), which WAL's fast commits keep brief.
+/// `journal_mode` is persistent in the file: asserting it on every open is
+/// a cheap no-op once set, and converts pre-WAL databases on first touch.
 pub fn open_wallet_db<P: Parameters + 'static>(
     path: impl AsRef<Path>,
     params: P,
 ) -> anyhow::Result<WalletDb<rusqlite::Connection, P, SystemClock, OsRng>> {
-    let mut db_data = WalletDb::for_path(path, params, SystemClock, OsRng)?;
+    let conn = rusqlite::Connection::open(path.as_ref())?;
+    // What `WalletDb::for_path` would have done; required by the generated
+    // queries' use of the carray extension.
+    rusqlite::vtab::array::load_module(&conn)?;
+    conn.busy_timeout(WALLET_DB_BUSY_TIMEOUT)?;
+    // Best-effort: converting a legacy rollback-journal file needs a moment
+    // with no other live transactions, which an in-flight sync can deny
+    // beyond the busy timeout. Reads still work in rollback mode (between
+    // the writer's lock windows), so don't fail the open; the very next
+    // uncontended open performs the one-time conversion.
+    if let Err(e) = conn.query_row("PRAGMA journal_mode=WAL", [], |_| Ok(())) {
+        tracing::debug!("journal_mode=WAL not applied yet (will retry on next open): {e}");
+    }
+    let mut db_data = WalletDb::from_connection(conn, params, SystemClock, OsRng);
     init_wallet_db(&mut db_data, None)?;
     Ok(db_data)
 }
 
+/// How long a wallet-db connection waits on a competing writer before
+/// surfacing `SQLITE_BUSY`. Only writer-vs-writer waits hit this under WAL
+/// (reads proceed regardless), and those are short append-commits, so this
+/// is generous.
+const WALLET_DB_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The GUI regression behind "An error occurred while interacting with the
+    // adapter": a catch-up sync commits each scan batch in one long write
+    // transaction, which in SQLite's default rollback-journal mode escalates
+    // to the file's exclusive lock, making every concurrent open/read of
+    // data.sqlite fail with SQLITE_BUSY. `open_wallet_db` now puts the file
+    // in WAL mode, where readers never take the writer's locks — so opening
+    // (which runs the migrator's read-only pass) and reading must both
+    // succeed while a writer sits mid-transaction.
+    #[test]
+    fn open_wallet_db_reads_succeed_alongside_an_exclusive_writer() {
+        use zcash_client_backend::data_api::{wallet::ConfirmationsPolicy, WalletRead};
+        use zcash_protocol::consensus::Network;
+
+        let dir = std::env::temp_dir().join(format!("zkv-wal-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("data.sqlite");
+        let _ = std::fs::remove_file(&path);
+
+        // First open creates + migrates the wallet db and flips it to WAL.
+        drop(open_wallet_db(&path, Network::TestNetwork).unwrap());
+        let mode: String = rusqlite::Connection::open(&path)
+            .unwrap()
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode, "wal");
+
+        // Stand-in for the sync's batch-commit transaction. EXCLUSIVE is the
+        // strongest start; under WAL it takes only the writer lock.
+        let writer = rusqlite::Connection::open(&path).unwrap();
+        writer
+            .execute_batch("BEGIN EXCLUSIVE; CREATE TABLE _zkv_busy_probe (x INTEGER);")
+            .unwrap();
+        let reader = open_wallet_db(&path, Network::TestNetwork).unwrap();
+        reader
+            .get_wallet_summary(ConfirmationsPolicy::default())
+            .unwrap();
+        writer.execute_batch("ROLLBACK").unwrap();
+
+        drop(reader);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn ok(name: &str) {
         validate_db_name(name).unwrap_or_else(|e| panic!("expected {name:?} to be accepted: {e}"));
