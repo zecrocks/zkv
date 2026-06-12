@@ -13,8 +13,10 @@
 //!   there even when the row happens to report one. A transaction that nets to
 //!   a bare fee (a zkv write or an
 //!   internal shield) therefore comes out as `0`. A non-zkv shuffle netting to
-//!   `0` is dropped *unless* it carries a deliberate self-send leg (a non-change
-//!   output back to one of our own accounts), in which case it surfaces as a
+//!   `0` is dropped *unless* it carries a deliberate self-send leg (an output
+//!   back to one of our own accounts at an *external-scope* address — see
+//!   [`OutputsAgg::self_value`] for why key scope, not the view's `is_change`
+//!   flag, is the discriminator), in which case it surfaces as a
 //!   [`FundingDirection::SelfTransfer`] whose `amount` is the net effect (the
 //!   fee, as librustzcash reports it) with the gross self-sent value kept on
 //!   the side in [`FundingTx::self_sent`]. An *outbound zkv write* netting to a
@@ -58,6 +60,11 @@ const TRUSTED_CONFIRMATIONS: u32 = 3;
 /// deposit reads as "confirming" in the wallet balance until it is 10 blocks
 /// deep; the Funding tab now agrees.
 const UNTRUSTED_CONFIRMATIONS: u32 = 10;
+
+/// `v_tx_outputs.recipient_key_scope` encoding for the ZIP-32 *external* scope
+/// (1 = internal/change, 2 = ephemeral ZIP-320 legs). An output received by
+/// our own account at an external-scope address is a deliberate self-send.
+const KEY_SCOPE_EXTERNAL: i64 = 0;
 
 /// Direction of a funding transaction relative to this wallet.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -143,9 +150,20 @@ struct OutputsAgg {
     memo: Option<String>,
     /// External recipient addresses (sends only).
     recipients: Vec<String>,
-    /// Total value (zatoshi) of non-change outputs addressed back to one of our
-    /// own accounts: a deliberate self-send leg. Lets a fee-only-netting tx be
-    /// surfaced as a self-transfer instead of dropped like a zkv write.
+    /// Total value (zatoshi) of outputs addressed back to one of our own
+    /// accounts at an **external-scope** address: a deliberate self-send leg.
+    /// Lets a fee-only-netting tx be surfaced as a self-transfer instead of
+    /// dropped like a zkv write.
+    ///
+    /// Keyed on `recipient_key_scope` (0 = external), **not** on the view's
+    /// `is_change` flag: librustzcash's scanner marks *every* note an account
+    /// receives in a transaction that account also spent in as change —
+    /// explicitly including "notes sent from one account to itself"
+    /// (`zcash_client_backend::scanning`) — so once a self-send is scanned its
+    /// returning output reads `is_change = 1` and an `is_change`-based test
+    /// drops the whole transaction from the ledger. Real change lands at
+    /// internal-scope (1) addresses and ephemeral ZIP-320 legs at scope 2, so
+    /// external scope alone cleanly identifies the deliberate leg.
     self_value: u64,
 }
 
@@ -168,18 +186,44 @@ pub fn load_funding(
     };
 
     let conn = Connection::open(&db_data_path)?;
+    let entries = funding_entries(&conn, &account_uuid_bytes, tip)?;
 
+    let total = entries.len() as u64;
+    let off = offset as usize;
+    let paged: Vec<FundingTx> = match limit {
+        None => entries.into_iter().skip(off).collect(),
+        Some(lim) => entries.into_iter().skip(off).take(lim as usize).collect(),
+    };
+
+    Ok(FundingResult {
+        entries: paged,
+        total,
+        offset,
+        limit,
+    })
+}
+
+/// The query + classification core of [`load_funding`], over an already-open
+/// wallet-db connection. Split out so the classification can be exercised
+/// against a stub `v_transactions`/`v_tx_outputs` schema in tests. Returns
+/// every matching transaction, newest-first with mempool pinned on top.
+fn funding_entries(
+    conn: &Connection,
+    account_uuid_bytes: &[u8],
+    tip: u32,
+) -> anyhow::Result<Vec<FundingTx>> {
     // ---- Per-tx outputs: zkv detection + display memo + send recipients ----
     let mut agg: HashMap<Vec<u8>, OutputsAgg> = HashMap::new();
     {
         let mut stmt = conn.prepare(
-            "SELECT v.txid, v.memo, v.to_address, v.to_account_uuid, v.is_change, v.value
+            "SELECT v.txid, v.memo, v.to_address, v.to_account_uuid, v.is_change, v.value,
+                    v.recipient_key_scope
              FROM v_tx_outputs v
              WHERE v.to_account_uuid = :account_uuid
                 OR v.from_account_uuid = :account_uuid",
         )?;
         let rows = stmt.query_map(
-            named_params! { ":account_uuid": account_uuid_bytes.as_slice() },
+            named_params! { ":account_uuid": account_uuid_bytes },
             |row| {
                 let txid: Option<Vec<u8>> = row.get(0)?;
                 let memo: Option<Vec<u8>> = row.get(1)?;
@@ -187,11 +231,20 @@ pub fn load_funding(
                 let to_account_uuid: Option<Vec<u8>> = row.get(3)?;
                 let is_change: Option<i64> = row.get(4)?;
                 let value: Option<i64> = row.get(5)?;
-                Ok((txid, memo, to_address, to_account_uuid, is_change, value))
+                let key_scope: Option<i64> = row.get(6)?;
+                Ok((
+                    txid,
+                    memo,
+                    to_address,
+                    to_account_uuid,
+                    is_change,
+                    value,
+                    key_scope,
+                ))
             },
         )?;
         for r in rows {
-            let (txid, memo, to_address, to_account_uuid, is_change, value) = r?;
+            let (txid, memo, to_address, to_account_uuid, is_change, value, key_scope) = r?;
             let Some(txid) = txid.filter(|t| !t.is_empty()) else {
                 continue;
             };
@@ -213,10 +266,19 @@ pub fn load_funding(
                         entry.recipients.push(addr);
                     }
                 }
-            } else if to_account_uuid.is_some() && !is_change {
-                // A self-send leg: a deliberate, non-change output back to one
-                // of our own accounts. Receives land here too, but those net
-                // positive and never reach the self-transfer branch below.
+            } else if to_account_uuid.as_deref() == Some(account_uuid_bytes)
+                && key_scope == Some(KEY_SCOPE_EXTERNAL)
+            {
+                // A self-send leg: an output back to one of our own accounts at
+                // an external-scope address (the deposit UA / a taddr), i.e. a
+                // destination someone deliberately addressed. NOT gated on the
+                // view's `is_change`: the scanner marks every note we receive
+                // in a tx we also spent in as change — self-sends included —
+                // so an `is_change` test would drop exactly the rows this
+                // exists to surface (see `OutputsAgg::self_value`). Change
+                // proper lands at internal scope (1) and never matches.
+                // External receives land here too, but those net positive and
+                // never reach the self-transfer branch below.
                 entry.self_value = entry
                     .self_value
                     .saturating_add(value.unwrap_or(0).max(0) as u64);
@@ -238,7 +300,7 @@ pub fn load_funding(
         )?;
         let rows = stmt.query_map(
             named_params! {
-                ":account_uuid": account_uuid_bytes.as_slice(),
+                ":account_uuid": account_uuid_bytes,
                 ":tip": tip,
             },
             |row| {
@@ -365,19 +427,7 @@ pub fn load_funding(
             .then(b.txid.cmp(&a.txid))
     });
 
-    let total = entries.len() as u64;
-    let off = offset as usize;
-    let paged: Vec<FundingTx> = match limit {
-        None => entries.into_iter().skip(off).collect(),
-        Some(lim) => entries.into_iter().skip(off).take(lim as usize).collect(),
-    };
-
-    Ok(FundingResult {
-        entries: paged,
-        total,
-        offset,
-        limit,
-    })
+    Ok(entries)
 }
 
 /// Decode raw memo bytes to text, returning `Some` only for `Memo::Text`
@@ -387,5 +437,204 @@ fn decode_text_memo(bytes: &[u8]) -> Option<String> {
     match Memo::try_from(mb).ok()? {
         Memo::Text(t) => Some(t.to_string()),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ACCOUNT: [u8; 16] = [7u8; 16];
+    const OTHER_ACCOUNT: [u8; 16] = [9u8; 16];
+    const TIP: u32 = 1000;
+    const FEE: i64 = 10_000;
+
+    /// Minimal stand-ins for the wallet's `v_transactions` / `v_tx_outputs`
+    /// views: only the columns `funding_entries` reads (the pattern of
+    /// `internal::sync`'s stub). Lets us exercise the funding classification
+    /// without the full zcash_client_sqlite schema.
+    fn stub_conn() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE v_transactions (
+                 txid BLOB, account_uuid BLOB, mined_height INTEGER,
+                 block_time INTEGER, account_balance_delta INTEGER,
+                 fee_paid INTEGER, expiry_height INTEGER
+             );
+             CREATE TABLE v_tx_outputs (
+                 txid BLOB, memo BLOB, to_address TEXT, to_account_uuid BLOB,
+                 from_account_uuid BLOB, is_change INTEGER, value INTEGER,
+                 recipient_key_scope INTEGER
+             );",
+        )
+        .unwrap();
+        conn
+    }
+
+    fn insert_tx(conn: &Connection, txid: u8, delta: i64, fee: Option<i64>) {
+        conn.execute(
+            "INSERT INTO v_transactions
+                 (txid, account_uuid, mined_height, block_time,
+                  account_balance_delta, fee_paid, expiry_height)
+             VALUES (?1, ?2, 900, 1700000000, ?3, ?4, NULL)",
+            rusqlite::params![vec![txid; 32], ACCOUNT.as_slice(), delta, fee],
+        )
+        .unwrap();
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn insert_output(
+        conn: &Connection,
+        txid: u8,
+        to_address: Option<&str>,
+        to_account: Option<&[u8]>,
+        is_change: bool,
+        value: i64,
+        key_scope: Option<i64>,
+        memo: Option<&[u8]>,
+    ) {
+        conn.execute(
+            "INSERT INTO v_tx_outputs
+                 (txid, memo, to_address, to_account_uuid, from_account_uuid,
+                  is_change, value, recipient_key_scope)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                vec![txid; 32],
+                memo,
+                to_address,
+                to_account,
+                ACCOUNT.as_slice(),
+                is_change,
+                value,
+                key_scope,
+            ],
+        )
+        .unwrap();
+    }
+
+    // The user-reported regression: a 10 ZEC send from the wallet back to its
+    // own deposit UA. Once the block is scanned, librustzcash marks the
+    // returning note as change (`is_change = 1`; the scanner flags every note
+    // an account receives in a tx it also spent in, self-sends explicitly
+    // included), so an `is_change`-based self-send test made the whole
+    // transaction vanish from the Funding ledger — fee and all. The returning
+    // leg sits at an external-scope address, which change never does, so the
+    // scope-keyed classification surfaces it as a SelfTransfer.
+    #[test]
+    fn scanned_self_send_marked_change_still_surfaces_as_self_transfer() {
+        let conn = stub_conn();
+        let gross = 1_000_000_000i64; // 10 ZEC back to our own deposit UA
+        insert_tx(&conn, 1, -FEE, Some(FEE)); // delta nets to the bare fee
+        insert_output(
+            &conn,
+            1,
+            Some("u1selfdeposit"),
+            Some(&ACCOUNT),
+            true, // the scanner's post-scan marking that used to hide it
+            gross,
+            Some(KEY_SCOPE_EXTERNAL),
+            None,
+        );
+        // The change split, internal scope as real change always is.
+        insert_output(&conn, 1, None, Some(&ACCOUNT), true, 172_455_000, Some(1), None);
+
+        let entries = funding_entries(&conn, &ACCOUNT, TIP).unwrap();
+        assert_eq!(entries.len(), 1, "the self-send must not be dropped");
+        let tx = &entries[0];
+        assert_eq!(tx.direction, FundingDirection::SelfTransfer);
+        assert_eq!(tx.amount, FEE as u64, "net effect is the fee");
+        assert_eq!(tx.self_sent, Some(gross as u64), "gross value kept aside");
+        assert_eq!(tx.fee, Some(FEE as u64));
+        assert!(tx.recipients.is_empty(), "own address is not a recipient");
+    }
+
+    // Real change must keep not surfacing: a fee-only tx whose returning
+    // outputs are all internal-scope (an internal shuffle / note split) is
+    // wallet plumbing, not funding activity.
+    #[test]
+    fn internal_shuffle_is_still_dropped() {
+        let conn = stub_conn();
+        insert_tx(&conn, 2, -FEE, Some(FEE));
+        insert_output(&conn, 2, None, Some(&ACCOUNT), true, 50_000_000, Some(1), None);
+
+        let entries = funding_entries(&conn, &ACCOUNT, TIP).unwrap();
+        assert!(entries.is_empty(), "internal shuffles stay out of the ledger");
+    }
+
+    // A bare-fee zkv write still shows as a ZkvOperation, not a SelfTransfer:
+    // its memo output goes to the database's own external receiver, but the
+    // zkv classification takes its own branch only when no deliberate
+    // self-send leg exists... and the write's memo marks the whole tx as zkv
+    // traffic. Guards the INIT row the user *did* see.
+    #[test]
+    fn bare_fee_zkv_write_is_a_zkv_operation() {
+        let conn = stub_conn();
+        insert_tx(&conn, 3, -FEE, Some(FEE));
+        // The ZKV0 memo rides an output to our own external receiver, but a
+        // zkv write addresses the *protocol* receiver with a dust/zero note,
+        // recorded as change of the write; only internal change comes back.
+        let memo = b"ZKV0 SET k v".as_slice();
+        insert_output(&conn, 3, None, Some(&ACCOUNT), true, 0, Some(1), Some(memo));
+
+        let entries = funding_entries(&conn, &ACCOUNT, TIP).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].direction, FundingDirection::ZkvOperation);
+        assert_eq!(entries[0].amount, FEE as u64);
+        assert!(entries[0].is_zkv);
+    }
+
+    // Plain deposits and payments are untouched by the scope-keyed change.
+    #[test]
+    fn receives_and_sends_classify_as_before() {
+        let conn = stub_conn();
+        // Inbound 1 ZEC deposit (no fee of ours).
+        insert_tx(&conn, 4, 100_000_000, None);
+        insert_output(
+            &conn,
+            4,
+            Some("u1ourreceiver"),
+            Some(&ACCOUNT),
+            false,
+            100_000_000,
+            Some(KEY_SCOPE_EXTERNAL),
+            None,
+        );
+        // Outbound 0.5 ZEC payment to an external recipient, plus change.
+        insert_tx(&conn, 5, -(50_000_000 + FEE), Some(FEE));
+        insert_output(&conn, 5, Some("u1recipient"), None, false, 50_000_000, None, None);
+        insert_output(&conn, 5, None, Some(&ACCOUNT), true, 25_000_000, Some(1), None);
+
+        let entries = funding_entries(&conn, &ACCOUNT, TIP).unwrap();
+        assert_eq!(entries.len(), 2);
+        let recv = entries.iter().find(|t| t.txid.starts_with("04")).unwrap();
+        assert_eq!(recv.direction, FundingDirection::Received);
+        assert_eq!(recv.amount, 100_000_000);
+        let sent = entries.iter().find(|t| t.txid.starts_with("05")).unwrap();
+        assert_eq!(sent.direction, FundingDirection::Sent);
+        assert_eq!(sent.amount, 50_000_000, "fee excluded from the amount");
+        assert_eq!(sent.recipients, vec!["u1recipient".to_owned()]);
+    }
+
+    // Outputs of other accounts' (or unknown) ownership never count toward a
+    // self-send leg, even at external scope.
+    #[test]
+    fn external_scope_output_to_another_account_is_not_a_self_send() {
+        let conn = stub_conn();
+        insert_tx(&conn, 6, -FEE, Some(FEE));
+        insert_output(
+            &conn,
+            6,
+            Some("u1other"),
+            Some(&OTHER_ACCOUNT),
+            false,
+            10_000_000,
+            Some(KEY_SCOPE_EXTERNAL),
+            None,
+        );
+
+        let entries = funding_entries(&conn, &ACCOUNT, TIP).unwrap();
+        // The other account's leg still produces a SelfTransfer ONLY if the
+        // uuid matches ours; here it doesn't, and nothing else qualifies.
+        assert!(entries.is_empty());
     }
 }
