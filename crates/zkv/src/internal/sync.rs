@@ -919,13 +919,11 @@ fn perform_rewind<P: Parameters>(
                     );
                     Ok(h)
                 }
-                Err(SqliteClientError::RequestedRewindInvalid { .. }) => {
-                    Err(UnrecoverableRewind {
-                        at_height,
-                        requested,
-                    }
-                    .into())
+                Err(SqliteClientError::RequestedRewindInvalid { .. }) => Err(UnrecoverableRewind {
+                    at_height,
+                    requested,
                 }
+                .into()),
                 Err(e) => Err(anyhow!("{:?}", e)),
             }
         }
