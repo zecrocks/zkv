@@ -54,7 +54,8 @@ impl Command {
         // The birthday is carried by the address, so pin it verbatim (no
         // buffer). Refuses a stale/unreachable tip before building the db.
         let mut client = connection.connect(network).await?;
-        let birthday = crate::internal::sync::pinned_birthday(&mut client, parsed.birthday).await?;
+        let birthday =
+            crate::internal::sync::pinned_birthday(&mut client, network, parsed.birthday).await?;
 
         WalletConfig::init_watch(
             &name,

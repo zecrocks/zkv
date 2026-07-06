@@ -12,8 +12,8 @@ use tracing::info;
 use zcash_client_backend::proto::service::{
     self, compact_tx_streamer_client::CompactTxStreamerClient,
 };
-use zcash_protocol::consensus::Network;
 
+use crate::network::Network;
 use crate::socks::SocksConnector;
 
 /// Bound the TCP+TLS handshake. A fresh connect right after a laptop wakes
@@ -76,12 +76,16 @@ pub enum ServerOperator {
 impl ServerOperator {
     fn servers(&self, network: Network) -> &[Server<'_>] {
         match (self, network) {
-            (ServerOperator::Ecc, Network::MainNetwork) => &[],
-            (ServerOperator::Ecc, Network::TestNetwork) => ECC_TESTNET,
-            (ServerOperator::YWallet, Network::MainNetwork) => YWALLET_MAINNET,
-            (ServerOperator::YWallet, Network::TestNetwork) => &[],
-            (ServerOperator::ZecRocks, Network::MainNetwork) => ZEC_ROCKS_MAINNET,
-            (ServerOperator::ZecRocks, Network::TestNetwork) => ZEC_ROCKS_TESTNET,
+            (ServerOperator::Ecc, Network::Main) => &[],
+            (ServerOperator::Ecc, Network::Test) => ECC_TESTNET,
+            (ServerOperator::YWallet, Network::Main) => YWALLET_MAINNET,
+            (ServerOperator::YWallet, Network::Test) => &[],
+            (ServerOperator::ZecRocks, Network::Main) => ZEC_ROCKS_MAINNET,
+            (ServerOperator::ZecRocks, Network::Test) => ZEC_ROCKS_TESTNET,
+            // No operator hosts a public regtest chain; a regtest database
+            // needs an explicit `--server host:port` pointing at the local
+            // lightwalletd (see `Servers::pick`'s error).
+            (_, Network::Regtest) => &[],
         }
     }
 }
@@ -118,10 +122,18 @@ impl Servers {
 
     pub fn pick(&self, network: Network) -> anyhow::Result<&Server<'_>> {
         match self {
-            Servers::Hosted(server_operator) => server_operator
-                .servers(network)
-                .first()
-                .ok_or(anyhow!("{:?} doesn't serve {:?}", server_operator, network)),
+            Servers::Hosted(server_operator) => {
+                server_operator.servers(network).first().ok_or_else(|| {
+                    if network == Network::Regtest {
+                        anyhow!(
+                            "no hosted lightwalletd serves regtest; pass \
+                             `--server <host>:<port>` pointing at your local one"
+                        )
+                    } else {
+                        anyhow!("{:?} doesn't serve {:?}", server_operator, network)
+                    }
+                })
+            }
             Servers::Custom(servers) => Ok(servers.first().expect("not empty")),
         }
     }
@@ -279,8 +291,11 @@ impl ConnectionArgs {
     /// was given, otherwise the default `server`.
     fn servers_for(&self, network: Network) -> &Servers {
         match network {
-            Network::MainNetwork => self.mainnet_server.as_ref().unwrap_or(&self.server),
-            Network::TestNetwork => self.testnet_server.as_ref().unwrap_or(&self.server),
+            Network::Main => self.mainnet_server.as_ref().unwrap_or(&self.server),
+            Network::Test => self.testnet_server.as_ref().unwrap_or(&self.server),
+            // Regtest has no per-network override flag; the explicit
+            // `--server host:port` is the only sensible configuration.
+            Network::Regtest => &self.server,
         }
     }
 
@@ -367,17 +382,16 @@ fn backend_label(subversion: &str, vendor: &str) -> String {
 
 /// Human label for a network, for error messages.
 fn network_label(n: Network) -> &'static str {
-    match n {
-        Network::MainNetwork => "mainnet",
-        Network::TestNetwork => "testnet",
-    }
+    n.name()
 }
 
-/// Map a lightwalletd `chain_name` (`"main"` / `"test"`) to a [`Network`].
+/// Map a lightwalletd `chain_name` (`"main"` / `"test"` / `"regtest"`) to a
+/// [`Network`].
 fn network_from_chain_name(chain_name: &str) -> Option<Network> {
     match chain_name {
-        "main" => Some(Network::MainNetwork),
-        "test" => Some(Network::TestNetwork),
+        "main" => Some(Network::Main),
+        "test" => Some(Network::Test),
+        "regtest" => Some(Network::Regtest),
         _ => None,
     }
 }
@@ -402,6 +416,13 @@ async fn verify_server_network(
         .into_inner();
     match network_from_chain_name(&info.chain_name) {
         Some(actual) if actual == expected => Ok(()),
+        // zebra implements regtest as a configured testnet, so its
+        // getblockchaininfo (and hence lightwalletd's chain_name) reports
+        // "test" for a regtest chain. A regtest database therefore accepts a
+        // "test" server; the mainnet refusal (the guard that protects real
+        // funds) still holds, and pointing a regtest database at the public
+        // testnet is harmless (different receiver domain, no memos decrypt).
+        Some(Network::Test) if expected == Network::Regtest => Ok(()),
         Some(actual) => bail!(
             "lightwalletd is serving {} but this database is {}, refusing to \
              scan the wrong chain (server chain_name={:?})",

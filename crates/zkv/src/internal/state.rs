@@ -217,7 +217,7 @@ pub fn wallet_tip(db_name: &str) -> anyhow::Result<u32> {
 /// defaults to 0 before the first wallet summary exists (nothing scanned yet).
 fn tip_and_fully_scanned(
     db_data_path: &std::path::Path,
-    network: zcash_protocol::consensus::Network,
+    network: crate::network::Network,
 ) -> anyhow::Result<(u32, u32)> {
     use zcash_client_backend::data_api::wallet::ConfirmationsPolicy;
     let db_data = open_wallet_db(db_data_path, network)?;

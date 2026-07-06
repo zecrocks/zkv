@@ -26,7 +26,7 @@ use zcash_client_sqlite::{
     wallet::init::init_wallet_db,
     FsBlockDb, WalletDb,
 };
-use zcash_protocol::consensus::{self, Parameters};
+use zcash_protocol::consensus::Parameters;
 
 use crate::error;
 
@@ -42,58 +42,10 @@ const CURRENT_MARKER: &str = "current";
 /// of [`list_dbs`] (which skips dotfiles and non-directories).
 const ONBOARDED_MARKER: &str = ".onboarded";
 
-#[derive(Clone, Copy, Debug, Default)]
-pub enum Network {
-    #[default]
-    Main,
-    Test,
-}
-
-impl Network {
-    pub fn parse(name: &str) -> Result<Network, String> {
-        match name {
-            // Canonical names: "mainnet" / "testnet". Short forms accepted
-            // for legacy/CLI brevity.
-            "mainnet" | "main" => Ok(Network::Main),
-            "testnet" | "test" => Ok(Network::Test),
-            other => Err(format!(
-                "Unsupported network: {other:?} (use \"mainnet\" or \"testnet\")",
-            )),
-        }
-    }
-
-    pub fn name(&self) -> &str {
-        match self {
-            Network::Test => "testnet",
-            Network::Main => "mainnet",
-        }
-    }
-
-    pub fn ticker(&self) -> &'static str {
-        match self {
-            Network::Main => "ZEC",
-            Network::Test => "TAZ",
-        }
-    }
-}
-
-impl From<Network> for consensus::Network {
-    fn from(value: Network) -> Self {
-        match value {
-            Network::Test => consensus::Network::TestNetwork,
-            Network::Main => consensus::Network::MainNetwork,
-        }
-    }
-}
-
-impl From<consensus::Network> for Network {
-    fn from(value: consensus::Network) -> Self {
-        match value {
-            consensus::Network::TestNetwork => Network::Test,
-            consensus::Network::MainNetwork => Network::Main,
-        }
-    }
-}
+// The network enum lives in `crate::network` (it implements `Parameters`, so
+// regtest fits the whole generic wallet stack); re-exported here, its
+// historical home, so `data::Network` paths keep working.
+pub use crate::network::Network;
 
 /// Process-wide override for the data directory, set once at startup by `main` from
 /// the global `--data-dir` flag. Higher precedence than `$ZKV_DATA`.

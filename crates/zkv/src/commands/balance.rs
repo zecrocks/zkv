@@ -45,7 +45,7 @@ impl Command {
             .map(|b| u64::from(b.total()))
             .sum();
 
-        let network = crate::data::Network::from(cfg.network);
+        let network = cfg.network;
         println!("{}", format_zec(total_zat as i64, network).trim_start());
         if watch_only {
             ui::hint("(watch-only, cannot send)");

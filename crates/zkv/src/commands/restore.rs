@@ -3,7 +3,6 @@ use bip0039::{English, Mnemonic};
 use clap::Args;
 use secrecy::{SecretVec, Zeroize};
 use zcash_client_backend::data_api::WalletWrite;
-use zcash_protocol::consensus;
 use zcash_protocol::ShieldedProtocol;
 
 use crate::{
@@ -75,14 +74,14 @@ impl Command {
             None => None,
         };
         let network: Network = match &parsed_addr {
-            Some(p) => network_from_type(p.network)?.into(),
+            Some(p) => network_from_type(p.network)?,
             None => self.network,
         };
         let pool = match &parsed_addr {
             Some(p) => p.pool,
             None => self.pool,
         };
-        let params: consensus::Network = network.into();
+        let params = network;
 
         let dir = db_dir(&name)?;
         if dir.join("keys.toml").exists() {
@@ -149,7 +148,8 @@ impl Command {
             .or_else(|| parsed_addr.as_ref().map(|p| p.birthday))
             .expect("address or birthday is required (checked above)");
         let mut client = connection.connect(params).await?;
-        let birthday = crate::internal::sync::pinned_birthday(&mut client, birthday_height).await?;
+        let birthday =
+            crate::internal::sync::pinned_birthday(&mut client, params, birthday_height).await?;
 
         WalletConfig::init_admin(&name, &mnemonic, birthday.height(), params, pool)?;
 

@@ -147,7 +147,8 @@ async fn import_account(conn: &ConnectionArgs) -> anyhow::Result<()> {
     // Birthday is carried by the demo address, so pin it verbatim (no buffer).
     // Refuses a stale/unreachable tip before importing the account.
     let mut client = conn.connect(network).await?;
-    let birthday = crate::internal::sync::pinned_birthday(&mut client, parsed.birthday).await?;
+    let birthday =
+        crate::internal::sync::pinned_birthday(&mut client, network, parsed.birthday).await?;
 
     let mut db = data::open_wallet_db(&data_path, network)?;
     db.import_account_ufvk(
@@ -206,13 +207,13 @@ mod tests {
 
     #[test]
     fn demo_address_parses_as_testnet() {
-        use zcash_protocol::consensus::Network;
+        use crate::network::Network;
 
         let parsed = parse_zkv_addr(DEMO_ZKV_ADDRESS).expect("demo address must parse");
         let network =
             network_from_type(parsed.network).expect("demo address network must be known");
         assert!(
-            matches!(network, Network::TestNetwork),
+            matches!(network, Network::Test),
             "demo address should be testnet"
         );
     }

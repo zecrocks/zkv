@@ -36,7 +36,7 @@ use serde_json::{json, Value};
 
 use zkv::{
     config::Role,
-    data::{set_data_dir_override, Network},
+    data::set_data_dir_override,
     db::{Database, ZkvError},
     protocol::{network_from_type, parse_zkv_addr},
     remote::{ConnectionArgs, ConnectionMode, Servers},
@@ -512,7 +512,7 @@ async fn restore_from_address(cfg: &Config, conn: ConnectionArgs) -> anyhow::Res
     })?;
 
     let parsed = parse_zkv_addr(addr).context("parsing ZKV_ADDRESS")?;
-    let network = Network::from(network_from_type(parsed.network).context("ZKV_ADDRESS network")?);
+    let network = network_from_type(parsed.network).context("ZKV_ADDRESS network")?;
     // The birthday lives inside the address; a ZKV_BIRTHDAY override is honoured
     // for unusual cases (e.g. forcing an earlier rescan).
     let birthday = cfg.birthday.or(Some(parsed.birthday));

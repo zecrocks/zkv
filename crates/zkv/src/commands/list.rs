@@ -37,7 +37,7 @@ impl Command {
             let (role, network, pool, creator) = match WalletConfig::read(&name) {
                 Ok(cfg) => (
                     format!("{:?}", cfg.role).to_lowercase(),
-                    data::Network::from(cfg.network).name().to_owned(),
+                    cfg.network.name().to_owned(),
                     pool_label(cfg.pool).to_owned(),
                     // Admin = we hold the seed whose UFVK roots this address,
                     // i.e. we hold the root signing key that bootstraps the db
@@ -102,7 +102,7 @@ fn last_known_balance(name: &str) -> Option<String> {
         .values()
         .map(|b| u64::from(b.total()))
         .sum();
-    let network = data::Network::from(cfg.network);
+    let network = cfg.network;
     Some(
         format_zec(total_zat as i64, network)
             .trim_start()

@@ -30,7 +30,7 @@ use bip0039::{English, Mnemonic};
 use secrecy::{ExposeSecret, SecretVec, Zeroize};
 use serde::{Deserialize, Serialize};
 
-use zcash_protocol::consensus::{self, BlockHeight, Parameters};
+use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
 use zcash_protocol::ShieldedProtocol;
 
 use crate::{
@@ -59,7 +59,7 @@ pub enum Role {
 }
 
 pub struct WalletConfig {
-    pub network: consensus::Network,
+    pub network: Network,
     pub role: Role,
     pub birthday: BlockHeight,
     /// For Watch databases, the original zkv address used at `zkv watch`
@@ -115,7 +115,7 @@ impl WalletConfig {
         db_name: &str,
         mnemonic: &Mnemonic,
         birthday: BlockHeight,
-        network: consensus::Network,
+        network: Network,
         pool: ShieldedProtocol,
     ) -> anyhow::Result<()> {
         let dir = ensure_db_dir(db_name)?;
@@ -135,7 +135,7 @@ impl WalletConfig {
             &dir,
             ConfigEncoding {
                 mnemonic: Some(ciphertext),
-                network: Some(Network::from(network).name().to_string()),
+                network: Some(network.name().to_string()),
                 birthday: Some(u32::from(birthday)),
                 role: Some("admin".to_owned()),
                 zkv_address: None,
@@ -149,7 +149,7 @@ impl WalletConfig {
     pub fn init_watch(
         db_name: &str,
         birthday: BlockHeight,
-        network: consensus::Network,
+        network: Network,
         zkv_address: &str,
         pool: ShieldedProtocol,
     ) -> anyhow::Result<()> {
@@ -158,7 +158,7 @@ impl WalletConfig {
             &dir,
             ConfigEncoding {
                 mnemonic: None,
-                network: Some(Network::from(network).name().to_string()),
+                network: Some(network.name().to_string()),
                 birthday: Some(u32::from(birthday)),
                 role: Some("watch".to_owned()),
                 zkv_address: Some(zkv_address.to_owned()),
@@ -182,17 +182,13 @@ impl WalletConfig {
         let cfg: ConfigEncoding = toml::from_str(&buf)?;
 
         let network = cfg.network.map_or_else(
-            || Ok(consensus::Network::MainNetwork),
-            |n| {
-                Network::parse(n.trim())
-                    .map(consensus::Network::from)
-                    .map_err(|_| error::Error::InvalidKeysFile)
-            },
+            || Ok(Network::Main),
+            |n| Network::parse(n.trim()).map_err(|_| error::Error::InvalidKeysFile),
         )?;
 
         let birthday = cfg.birthday.map(BlockHeight::from).unwrap_or_else(|| {
             network
-                .activation_height(consensus::NetworkUpgrade::Sapling)
+                .activation_height(NetworkUpgrade::Sapling)
                 .expect("Sapling activation height known")
         });
 

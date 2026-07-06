@@ -81,6 +81,15 @@ pub mod config;
 /// **Unstable.** See the crate-level docs for the stability contract.
 pub mod data;
 
+// NOTE: no outer `///` doc here on purpose, same as `shallow` above: the
+// module's inner `//!` docs use bare intra-doc links (`Network`) that must
+// resolve in the module's own scope, and an outer doc comment would force the
+// concatenated block to resolve at the crate root instead. Summary: the
+// consensus network a database lives on (mainnet / testnet / regtest), the
+// single `Parameters` value the wallet stack is threaded with; also
+// re-exported as `data::Network`. Unstable tier.
+pub mod network;
+
 /// Chain-scan / write / send / pending-tx plumbing the CLI sits on top of.
 ///
 /// **Unstable.** See the crate-level docs for the stability contract.

@@ -10,7 +10,7 @@ use std::rc::Rc;
 use transparent::keys::NonHardenedChildIndex;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_primitives::transaction::TxId;
-use zcash_protocol::consensus::{self, NetworkType};
+use zcash_protocol::consensus::NetworkType;
 use zcash_protocol::ShieldedProtocol;
 
 use super::{ChainSource, ShallowError};
@@ -22,7 +22,7 @@ use crate::protocol::{
 /// A test database identity: the receiver domain, the root `zkvid1…`, and
 /// the root signing key (the same derivation `internal::account` uses).
 pub(crate) fn fixture() -> (String, String, secp256k1::SecretKey) {
-    let net = consensus::Network::TestNetwork;
+    let net = crate::network::Network::Test;
     let usk = UnifiedSpendingKey::from_seed(&net, &[0x42; 32], zip32::AccountId::ZERO)
         .expect("derive USK");
     let ufvk = usk.to_unified_full_viewing_key();

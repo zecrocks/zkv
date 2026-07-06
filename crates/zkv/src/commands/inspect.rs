@@ -73,7 +73,6 @@ fn describe(zkv_addr: &str) -> anyhow::Result<Inspect> {
 /// The funding address: a shielded-only unified address (the database's single
 /// pool, no transparent receiver) you send ZEC to so the wallet can pay write
 /// fees. Derived straight from the viewing key, so no synced wallet is needed.
-/// Only the networks the wallet stack supports get one (not regtest).
 fn funding_address(parsed: &ParsedZkvAddr) -> Option<String> {
     let net = network_from_type(parsed.network).ok()?;
     parsed
@@ -146,7 +145,11 @@ mod tests {
 
     use crate::internal::protocol::encode_zkv_addr;
 
-    fn sample_addr(net: consensus::Network, pool: ShieldedProtocol, birthday: u32) -> String {
+    fn sample_addr<P: consensus::Parameters>(
+        net: P,
+        pool: ShieldedProtocol,
+        birthday: u32,
+    ) -> String {
         let ufvk = UnifiedSpendingKey::from_seed(&net, &[0x42; 32], zip32::AccountId::ZERO)
             .expect("derive USK")
             .to_unified_full_viewing_key();
@@ -191,6 +194,31 @@ mod tests {
         assert_eq!(info.pool, "sapling");
         assert!(info.view_key.starts_with("uview1"), "{}", info.view_key);
         assert!(info.receiver.starts_with("main:"), "{}", info.receiver);
+    }
+
+    #[test]
+    fn describes_a_regtest_address() {
+        // The regtest HRP family (`zkvregtest1...`) round-trips offline just
+        // like the public networks; the regtest e2e harness relies on this.
+        let addr = sample_addr(crate::data::Network::Regtest, ShieldedProtocol::Orchard, 42);
+        assert!(addr.starts_with("zkvregtest1"), "{addr}");
+        let info = describe(&addr).expect("describe");
+        assert_eq!(info.network, "regtest");
+        assert_eq!(info.pool, "orchard");
+        assert_eq!(info.birthday, 42);
+        assert!(
+            info.signing_key.starts_with("zkvid1"),
+            "{}",
+            info.signing_key
+        );
+        assert!(
+            info.view_key.starts_with("uviewregtest1"),
+            "{}",
+            info.view_key
+        );
+        assert!(info.receiver.starts_with("regtest:"), "{}", info.receiver);
+        let funding = info.funding_address.expect("funding address");
+        assert!(funding.starts_with("uregtest1"), "{funding}");
     }
 
     #[test]

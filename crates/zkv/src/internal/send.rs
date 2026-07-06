@@ -23,7 +23,7 @@ use zcash_client_backend::{
 use zcash_keys::{address::Address, keys::UnifiedSpendingKey};
 use zcash_proofs::prover::LocalTxProver;
 use zcash_protocol::{
-    consensus::{self, NetworkType, Parameters},
+    consensus::{NetworkType, Parameters},
     memo::{Memo, MemoBytes},
     value::Zatoshis,
 };
@@ -116,7 +116,10 @@ pub fn parse_zec(input: &str) -> Result<Zatoshis, String> {
 /// Surfaces a friendly reason on failure (unparseable, wrong network, or an
 /// unsupported kind). Pure: no I/O. Accepts every address type librustzcash
 /// recognizes.
-pub fn validate_recipient(recipient: &str, network: consensus::Network) -> Result<String, String> {
+pub fn validate_recipient(
+    recipient: &str,
+    network: crate::network::Network,
+) -> Result<String, String> {
     describe_recipient(recipient, network).map(|info| info.kind)
 }
 
@@ -136,7 +139,7 @@ pub struct RecipientInfo {
 /// failure as [`validate_recipient`]. Pure: no I/O.
 pub fn describe_recipient(
     recipient: &str,
-    network: consensus::Network,
+    network: crate::network::Network,
 ) -> Result<RecipientInfo, String> {
     let recipient = recipient.trim();
     if recipient.is_empty() {
@@ -379,7 +382,7 @@ mod tests {
 
     #[test]
     fn validate_recipient_rejects_empty_and_garbage() {
-        let net = consensus::Network::MainNetwork;
+        let net = crate::network::Network::Main;
         assert!(validate_recipient("", net).is_err());
         assert!(validate_recipient("not-an-address", net).is_err());
     }
@@ -392,23 +395,23 @@ mod tests {
         // branches without fabricating a checksum.
         let zs = "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8jl04tak0d3mm47vdtahatqrlkngh9slya";
         assert_eq!(
-            validate_recipient(zs, consensus::Network::MainNetwork).as_deref(),
+            validate_recipient(zs, crate::network::Network::Main).as_deref(),
             Ok("sapling"),
         );
-        assert!(validate_recipient(zs, consensus::Network::TestNetwork).is_err());
+        assert!(validate_recipient(zs, crate::network::Network::Test).is_err());
     }
 
     #[test]
     fn describe_recipient_classifies_kind_and_pool() {
         // The same verified mainnet Sapling vector as the test above.
         let zs = "zs1z7rejlpsa98s2rrrfkwmaxu53e4ue0ulcrw0h4x5g8jl04tak0d3mm47vdtahatqrlkngh9slya";
-        let info = describe_recipient(zs, consensus::Network::MainNetwork).expect("valid sapling");
+        let info = describe_recipient(zs, crate::network::Network::Main).expect("valid sapling");
         assert_eq!(info.kind, "sapling");
         assert_eq!(info.pool.as_deref(), Some("sapling"));
         // Wrong network is a clear error, not a misclassification.
-        assert!(describe_recipient(zs, consensus::Network::TestNetwork).is_err());
+        assert!(describe_recipient(zs, crate::network::Network::Test).is_err());
         // Empty and garbage are rejected before any network check.
-        assert!(describe_recipient("", consensus::Network::MainNetwork).is_err());
-        assert!(describe_recipient("not-an-address", consensus::Network::MainNetwork).is_err());
+        assert!(describe_recipient("", crate::network::Network::Main).is_err());
+        assert!(describe_recipient("not-an-address", crate::network::Network::Main).is_err());
     }
 }

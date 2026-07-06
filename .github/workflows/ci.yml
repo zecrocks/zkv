@@ -31,10 +31,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # Formatting is host-independent; run it once, on Linux.
+      # Formatting is host-independent; run it once, on Linux. The regtest
+      # harness is a separate workspace (see regtest-harness/README.md), so it
+      # gets its own fmt pass; its compile/clippy/test runs live in the
+      # Regtest E2E workflow, which triggers on the paths that affect it.
       - name: cargo fmt
         if: runner.os == 'Linux'
-        run: cargo fmt --all --check
+        run: |
+          cargo fmt --all --check
+          cargo fmt --all --check --manifest-path regtest-harness/Cargo.toml
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings

@@ -6,7 +6,6 @@ use bip0039::{Count, English, Mnemonic};
 use clap::Args;
 use secrecy::{SecretVec, Zeroize};
 use zcash_client_backend::data_api::{wallet::ConfirmationsPolicy, WalletRead, WalletWrite};
-use zcash_protocol::consensus;
 use zcash_protocol::ShieldedProtocol;
 
 use crate::{
@@ -44,7 +43,7 @@ pub(crate) struct Command {
     /// Database name. Defaults to "default".
     pub(crate) name: Option<String>,
 
-    /// Network: "mainnet" (default) or "testnet".
+    /// Network: "mainnet" (default), "testnet", or "regtest".
     #[arg(long, default_value = "mainnet", value_parser = Network::parse)]
     pub(crate) network: Network,
 
@@ -101,7 +100,7 @@ impl Command {
                 .or(crate::data::current_db()?)
                 .unwrap_or_else(|| DEFAULT_DB.to_owned()),
         };
-        let params: consensus::Network = self.network.into();
+        let params = self.network;
 
         let dir = db_dir(&name)?;
         if dir.join("keys.toml").exists() {
@@ -125,7 +124,7 @@ impl Command {
         // no history before now. Refuses a stale/unreachable tip so the birthday
         // is never anchored to a stale view of the chain.
         let mut client = connection.connect(params).await?;
-        let birthday = crate::internal::sync::near_tip_birthday(&mut client).await?;
+        let birthday = crate::internal::sync::near_tip_birthday(&mut client, params).await?;
 
         WalletConfig::init_admin(&name, &mnemonic, birthday.height(), params, self.pool)?;
 
@@ -223,7 +222,7 @@ impl Command {
                  so it cannot broadcast INIT"
             );
         }
-        let network = Network::from(cfg.network);
+        let network = cfg.network;
         let connection = self.connection.into_inner();
 
         eprintln!("Database {name:?} already exists; checking whether it needs initialization…");

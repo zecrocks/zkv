@@ -94,7 +94,6 @@ pub use crate::protocol::{
 };
 
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_protocol::consensus;
 use zcash_protocol::ShieldedProtocol;
 
 use crate::{
@@ -547,7 +546,8 @@ impl Database {
         // against a stale/unreachable server's view of the chain. The birthday
         // is carried by the address, so it is pinned verbatim (no buffer).
         let mut client = conn.connect(network).await.map_err(ZkvError::Other)?;
-        let birthday = crate::internal::sync::pinned_birthday(&mut client, parsed.birthday).await?;
+        let birthday =
+            crate::internal::sync::pinned_birthday(&mut client, network, parsed.birthday).await?;
 
         WalletConfig::init_watch(name, birthday.height(), network, zkv_address, parsed.pool)
             .map_err(ZkvError::Other)?;
@@ -579,7 +579,7 @@ impl Database {
 
     /// Mainnet or testnet.
     pub fn network(&self) -> Network {
-        Network::from(self.cfg.network)
+        self.cfg.network
     }
 
     /// The canonical `zkv1…` address for this database (the viewing key under a
@@ -1425,7 +1425,7 @@ fn map_write_error(e: anyhow::Error) -> ZkvError {
 fn database_identity(
     ufvk: &UnifiedFullViewingKey,
     pool: ShieldedProtocol,
-    network: consensus::Network,
+    network: Network,
 ) -> Result<String> {
     use zcash_protocol::consensus::Parameters as _;
     receiver_domain(ufvk, pool, network.network_type()).map_err(ZkvError::Other)
@@ -1438,7 +1438,7 @@ fn database_identity(
 fn find_duplicate_by_ufvk(
     ufvk: &UnifiedFullViewingKey,
     pool: ShieldedProtocol,
-    network: consensus::Network,
+    network: Network,
 ) -> Result<Option<String>> {
     let identity = database_identity(ufvk, pool, network)?;
     for name in crate::data::list_dbs().map_err(ZkvError::Other)? {
@@ -1484,14 +1484,13 @@ pub fn find_duplicate_database(
         .map_err(|e| ZkvError::Other(anyhow::anyhow!("invalid recovery phrase: {e}")))?;
     // The normalized phrase is a seed equivalent; wipe the owned copy.
     normalized.zeroize();
-    let params: consensus::Network = network.into();
     let mut seed = mnemonic.to_seed("");
-    let usk = UnifiedSpendingKey::from_seed(&params, &seed, AccountId::ZERO);
+    let usk = UnifiedSpendingKey::from_seed(&network, &seed, AccountId::ZERO);
     seed.zeroize();
     let ufvk = usk
         .map_err(|e| ZkvError::Other(anyhow::anyhow!("derive key from phrase: {e}")))?
         .to_unified_full_viewing_key();
-    find_duplicate_by_ufvk(&ufvk, pool, params)
+    find_duplicate_by_ufvk(&ufvk, pool, network)
 }
 
 /// Look for an already-imported local database that shares the identity of the
@@ -1516,9 +1515,8 @@ async fn create_admin(
 ) -> Result<Database> {
     use secrecy::{SecretVec, Zeroize};
     use zcash_client_backend::data_api::WalletWrite;
-    use zcash_protocol::consensus;
 
-    let params: consensus::Network = network.into();
+    let params = network;
     let dir = db_dir(name).map_err(ZkvError::Other)?;
     if dir.join("keys.toml").exists() {
         return Err(ZkvError::Other(anyhow::anyhow!(
@@ -1550,8 +1548,8 @@ async fn create_admin(
     // explicit `birthday` verbatim; otherwise default to tip − safety buffer.
     let mut client = conn.connect(params).await.map_err(ZkvError::Other)?;
     let birthday_acct = match birthday {
-        Some(height) => crate::internal::sync::pinned_birthday(&mut client, height).await?,
-        None => crate::internal::sync::near_tip_birthday(&mut client).await?,
+        Some(height) => crate::internal::sync::pinned_birthday(&mut client, params, height).await?,
+        None => crate::internal::sync::near_tip_birthday(&mut client, params).await?,
     };
 
     WalletConfig::init_admin(name, mnemonic, birthday_acct.height(), params, pool)
@@ -1716,7 +1714,7 @@ mod tests {
         }
     }
 
-    fn ufvk_for(seed: &[u8], network: consensus::Network) -> UnifiedFullViewingKey {
+    fn ufvk_for(seed: &[u8], network: Network) -> UnifiedFullViewingKey {
         use zcash_keys::keys::UnifiedSpendingKey;
         UnifiedSpendingKey::from_seed(&network, seed, zip32::AccountId::ZERO)
             .unwrap()
@@ -1729,8 +1727,8 @@ mod tests {
         // be stable for the same (seed, pool, network) and differ when any of
         // them changes, so two genuinely-different databases never collide and
         // a re-import of the same one always does.
-        let main = consensus::Network::MainNetwork;
-        let test = consensus::Network::TestNetwork;
+        let main = Network::Main;
+        let test = Network::Test;
         let seed_a = [0x11u8; 32];
         let seed_b = [0x22u8; 32];
 

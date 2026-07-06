@@ -6,7 +6,7 @@ use serde::Serialize;
 use crate::{
     commands::connection_args::ConnectionCliArgs,
     config::{pool_label, WalletConfig},
-    data::{self, resolve_db},
+    data::resolve_db,
     internal::{
         pending,
         protocol::{InitState, KeyState, PendingOp},
@@ -63,7 +63,7 @@ impl Command {
             eprintln!(
                 "# Database: {name} ({}, {}, {})",
                 format!("{:?}", cfg.role).to_lowercase(),
-                data::Network::from(cfg.network).name(),
+                cfg.network.name(),
                 pool_label(cfg.pool),
             );
         }

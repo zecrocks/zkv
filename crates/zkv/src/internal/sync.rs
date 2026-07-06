@@ -191,8 +191,18 @@ async fn chain_tip_height(client: &mut CompactTxStreamerClient<Channel>) -> Resu
 /// the server's view of the chain current?" guard the database-creation/import
 /// paths share; it does **not** require the local wallet to have caught up to
 /// the tip (that is a full sync, a separate thing).
-async fn fresh_chain_tip(client: &mut CompactTxStreamerClient<Channel>) -> Result<u32, TipError> {
+async fn fresh_chain_tip(
+    client: &mut CompactTxStreamerClient<Channel>,
+    network: crate::network::Network,
+) -> Result<u32, TipError> {
     let height = chain_tip_height(client).await?;
+    // Regtest block timestamps are synthetic (zebra's regtest genesis is
+    // dated 2011 and `generate`d blocks advance one second per block), so the
+    // wall-clock freshness gate can never pass and means nothing there: the
+    // harness controls mining, so the tip is current by construction.
+    if network == crate::network::Network::Regtest {
+        return Ok(height);
+    }
     let treestate = client
         .get_tree_state(BlockId {
             height: u64::from(height),
@@ -231,11 +241,13 @@ async fn account_birthday_at(
 /// the chain tip minus [`BIRTHDAY_SAFETY_BUFFER`] blocks. Used when *generating*
 /// a brand-new zkv address (`zkv init`), and as the fallback for `zkv restore` /
 /// the facade admin-create when no birthday is supplied. Requires a fresh tip
-/// ([`TipError::StaleTip`] otherwise).
+/// ([`TipError::StaleTip`] otherwise; regtest tips are always accepted, see
+/// `fresh_chain_tip`).
 pub async fn near_tip_birthday(
     client: &mut CompactTxStreamerClient<Channel>,
+    network: crate::network::Network,
 ) -> Result<AccountBirthday, TipError> {
-    let chain_tip = fresh_chain_tip(client).await?;
+    let chain_tip = fresh_chain_tip(client, network).await?;
     let birthday_height = chain_tip.saturating_sub(BIRTHDAY_SAFETY_BUFFER);
     account_birthday_at(client, birthday_height, chain_tip).await
 }
@@ -243,12 +255,14 @@ pub async fn near_tip_birthday(
 /// Pin a birthday at an **already-known** height: importing or watching a zkv
 /// address (birthday carried in the address), or a `zkv restore` with an
 /// explicit `--birthday`. The height is honored **verbatim** (no safety
-/// buffer). Still requires a fresh tip ([`TipError::StaleTip`] otherwise).
+/// buffer). Still requires a fresh tip ([`TipError::StaleTip`] otherwise;
+/// regtest tips are always accepted, see `fresh_chain_tip`).
 pub async fn pinned_birthday(
     client: &mut CompactTxStreamerClient<Channel>,
+    network: crate::network::Network,
     birthday_height: u32,
 ) -> Result<AccountBirthday, TipError> {
-    let chain_tip = fresh_chain_tip(client).await?;
+    let chain_tip = fresh_chain_tip(client, network).await?;
     account_birthday_at(client, birthday_height, chain_tip).await
 }
 
@@ -280,7 +294,7 @@ pub async fn pinned_birthday_unchecked(
 pub async fn wallet_synced_to_tip(
     db_name: &str,
     conn: &ConnectionArgs,
-    network: zcash_protocol::consensus::Network,
+    network: crate::network::Network,
 ) -> anyhow::Result<bool> {
     let (_, db_data_path) = get_db_paths(db_name)?;
     let db_data = open_wallet_db(&db_data_path, network)?;
@@ -594,6 +608,7 @@ async fn run_sync_inner(
             fsblockdb_root,
             &mut db_cache,
             &mut db_data,
+            &db_data_path,
             progress,
         )
         .await?
@@ -628,6 +643,7 @@ async fn sync_pass<P: Parameters + Send + 'static>(
     fsblockdb_root: &Path,
     db_cache: &mut FsBlockDb,
     db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
+    db_data_path: &Path,
     progress: Option<&SyncProgress>,
 ) -> anyhow::Result<bool> {
     let chain_tip = update_chain_tip(client, db_data).await?;
@@ -658,6 +674,7 @@ async fn sync_pass<P: Parameters + Send + 'static>(
                     fsblockdb_root,
                     db_cache,
                     db_data,
+                    db_data_path,
                     &chain_state,
                     scan_range,
                 )?;
@@ -700,6 +717,7 @@ async fn sync_pass<P: Parameters + Send + 'static>(
             fsblockdb_root,
             db_cache,
             db_data,
+            db_data_path,
             &chain_state,
             &scan_range,
         )?;
@@ -876,56 +894,66 @@ impl std::fmt::Display for UnrecoverableRewind {
 
 impl std::error::Error for UnrecoverableRewind {}
 
-/// Rewind the wallet to `requested` (chosen below the continuity break at `at_height`),
-/// retrying at the shallow bound `at_height - 2` when no valid truncation target exists
-/// at or below `requested`. Returns the height actually rewound to.
-///
-/// The retry leans on the documented `WalletWrite::truncate_to_height` contract:
-/// implementations rewind to the nearest valid target *at or below* the requested height
-/// and return it (`zcash_client_sqlite` picks the highest scanned block carrying both
-/// sapling and orchard note-commitment-tree checkpoints), so one shallower call is the
-/// entire "find a recoverable height" search — this handles young wallets whose lowest
-/// shared checkpoint (the birthday anchor) has no `blocks` row. The stored block at
-/// `at_height - 1` contradicts the new chain, so any useful rewind must remove it —
-/// hence the strict `at_height - 2` bound, which guarantees each pass strictly shrinks
-/// the scanned chain instead of re-truncating to the same stale block forever.
-///
-/// The error's `safe_rewind_height` is deliberately ignored: upstream computes it as the
-/// minimum checkpoint height *without* requiring a scanned block there, so it may name
-/// the blocks-row-less birthday anchor (itself an invalid target), and any height below
-/// the already-failed `requested` fails a fortiori.
-///
-/// Lineage: mirrored in zecd's `sync/engine.rs` — port fixes both ways.
-///
-/// TODO(upstream): the one remaining storage-backend coupling here is matching the
-/// concrete `SqliteClientError::RequestedRewindInvalid` — `zcash_client_backend`'s
-/// `WalletWrite` has no trait-level "rewind invalid" error contract, so reorg recovery is
-/// structurally tied to the sqlite backend. With non-SQLite `WalletDb` backends planned
-/// (PostgreSQL), propose upstream a trait-level error (or a `truncate_to_height` variant
-/// that reports "no valid target at or below" portably) and switch this match to it.
+/// Find the highest height that is in the `blocks` table AND has shared
+/// sapling+orchard checkpoints, bounded by `max_height`. Used as a shallow-rewind
+/// fallback when the requested deep rewind has no valid target below it.
+fn find_shallow_rewind_target(
+    db_data_path: &Path,
+    max_height: BlockHeight,
+) -> anyhow::Result<Option<BlockHeight>> {
+    use rusqlite::OptionalExtension;
+    let conn = rusqlite::Connection::open_with_flags(
+        db_data_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    let h: Option<u32> = conn
+        .query_row(
+            "SELECT MAX(blocks.height) FROM blocks
+             JOIN sapling_tree_checkpoints sc ON sc.checkpoint_id = blocks.height
+             JOIN orchard_tree_checkpoints oc ON oc.checkpoint_id = blocks.height
+             WHERE blocks.height <= ?1",
+            [u32::from(max_height)],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(h.map(BlockHeight::from))
+}
+
 fn perform_rewind<P: Parameters>(
     db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
+    db_data_path: &Path,
     at_height: BlockHeight,
     requested: BlockHeight,
 ) -> anyhow::Result<BlockHeight> {
     match db_data.truncate_to_height(requested) {
         Ok(h) => Ok(h),
-        Err(SqliteClientError::RequestedRewindInvalid { .. }) => {
-            let bound = BlockHeight::from(u32::from(at_height).saturating_sub(2));
-            match db_data.truncate_to_height(bound) {
-                Ok(h) => {
-                    info!(
-                        "Shallow rewind to {h} (no valid target at-or-below requested {requested})"
-                    );
-                    Ok(h)
+        Err(SqliteClientError::RequestedRewindInvalid {
+            safe_rewind_height, ..
+        }) => {
+            // First try the safe (deeper) rewind reported by the wallet, if any.
+            if let Some(safe) = safe_rewind_height.filter(|&s| s < requested) {
+                info!("No checkpoint at {requested}; trying safe rewind to {safe}");
+                if let Ok(h) = db_data.truncate_to_height(safe) {
+                    return Ok(h);
                 }
-                Err(SqliteClientError::RequestedRewindInvalid { .. }) => Err(UnrecoverableRewind {
-                    at_height,
-                    requested,
-                }
-                .into()),
-                Err(e) => Err(anyhow!("{:?}", e)),
             }
+            // Fall back: find the highest valid (blocks ∩ shared checkpoints) at or below
+            // the actual conflict height. This handles young wallets whose lowest
+            // shared checkpoint (the birthday anchor) has no `blocks` row.
+            if let Some(target) = find_shallow_rewind_target(db_data_path, at_height)? {
+                info!(
+                    "Shallow rewind to {target} (no valid target at-or-below requested {requested})"
+                );
+                return db_data
+                    .truncate_to_height(target)
+                    .map_err(|e| anyhow!("{:?}", e));
+            }
+            Err(UnrecoverableRewind {
+                at_height,
+                requested,
+            }
+            .into())
         }
         Err(e) => Err(anyhow!("{:?}", e)),
     }
@@ -936,6 +964,7 @@ fn scan_blocks<P: Parameters + Send + 'static>(
     fsblockdb_root: &Path,
     db_cache: &mut FsBlockDb,
     db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
+    db_data_path: &Path,
     initial_chain_state: &ChainState,
     scan_range: &ScanRange,
 ) -> anyhow::Result<bool> {
@@ -957,7 +986,7 @@ fn scan_blocks<P: Parameters + Send + 'static>(
                 err.at_height(),
                 requested
             );
-            let rewind_height = perform_rewind(db_data, err.at_height(), requested)?;
+            let rewind_height = perform_rewind(db_data, db_data_path, err.at_height(), requested)?;
             db_cache
                 .with_blocks(Some(rewind_height + 1), None, |block| {
                     let meta = BlockMeta {

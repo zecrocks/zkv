@@ -64,7 +64,7 @@ impl Command {
             Role::Admin => "admin",
             Role::Watch => "watch",
         };
-        let network_label = crate::data::Network::from(cfg.network);
+        let network_label = cfg.network;
         let net_str = network_label.name();
         let pool_str = match cfg.pool {
             zcash_protocol::ShieldedProtocol::Sapling => "sapling",

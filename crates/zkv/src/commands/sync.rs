@@ -33,7 +33,7 @@ impl Command {
         // Report where we synced from: network, the server we picked, and the
         // transport. `pick` can't fail here (the sync above already connected
         // through it), but fall back to a bare line if it somehow does.
-        let network = crate::data::Network::from(cfg.network).name().to_owned();
+        let network = cfg.network.name().to_owned();
         match connection.server.pick(cfg.network) {
             Ok(server) => {
                 let via = match &connection.connection {

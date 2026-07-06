@@ -66,7 +66,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use zcash_primitives::transaction::TxId;
-use zcash_protocol::{consensus, ShieldedProtocol};
+use zcash_protocol::ShieldedProtocol;
 
 use crate::{
     config::WalletConfig,
@@ -217,7 +217,7 @@ pub enum ShallowError {
 /// [`GrpcSource`]) so the drivers are testable against an in-memory chain;
 /// the public constructors always build the gRPC form.
 pub struct ShallowClient<C: ChainSource = GrpcSource> {
-    network: consensus::Network,
+    network: crate::network::Network,
     pool: ShieldedProtocol,
     birthday: u32,
     /// The signing-domain receiver every `ZKV0` signature binds to.
@@ -298,7 +298,7 @@ impl<C: ChainSource> ShallowClient<C> {
         cache_dir: Option<PathBuf>,
     ) -> Self {
         Self {
-            network: consensus::Network::TestNetwork,
+            network: crate::network::Network::Test,
             pool: ShieldedProtocol::Orchard,
             birthday,
             receiver,
@@ -315,7 +315,7 @@ impl<C: ChainSource> ShallowClient<C> {
         &self.zkv_addr
     }
 
-    pub fn network(&self) -> consensus::Network {
+    pub fn network(&self) -> crate::network::Network {
         self.network
     }
 

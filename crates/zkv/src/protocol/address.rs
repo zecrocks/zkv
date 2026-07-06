@@ -272,13 +272,14 @@ pub fn parse_zkv_addr(s: &str) -> anyhow::Result<ParsedZkvAddr> {
     })
 }
 
-/// Convert a parsed zkv address's `NetworkType` to a `consensus::Network`.
-pub fn network_from_type(network: NetworkType) -> anyhow::Result<consensus::Network> {
-    match network {
-        NetworkType::Main => Ok(consensus::Network::MainNetwork),
-        NetworkType::Test => Ok(consensus::Network::TestNetwork),
-        NetworkType::Regtest => Err(anyhow!("regtest is not supported")),
-    }
+/// Convert a parsed zkv address's `NetworkType` to a [`crate::network::Network`].
+pub fn network_from_type(network: NetworkType) -> anyhow::Result<crate::network::Network> {
+    use crate::network::Network;
+    Ok(match network {
+        NetworkType::Main => Network::Main,
+        NetworkType::Test => Network::Test,
+        NetworkType::Regtest => Network::Regtest,
+    })
 }
 
 /// Derive the zkv signing pubkey from a UFVK at the fixed scope+index.

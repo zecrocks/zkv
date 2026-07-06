@@ -1,0 +1,26 @@
+[package]
+name = "zkv-regtest-harness"
+version = "0.0.0"
+edition = "2021"
+publish = false
+description = "End-to-end regtest integration harness for zkv (zebra + lightwalletd, Zcash-Foundation-standard)"
+
+# Standalone workspace on purpose (mirroring zecd's regtest harness): keeps the
+# harness's e2e-only dependency tree (reqwest etc.) fully isolated from zkv's
+# hard-pinned librustzcash lockfile; `cargo build` in the parent never sees
+# these deps. A committed Cargo.lock pins the tree; build with --locked.
+#
+# There is NO zebra crate dependency: blocks are mined via zebrad's
+# Regtest-only `generate` RPC (zebra >= 2.0.0), so the harness is a pure
+# black-box driver and works against any zebrad release. zkv itself is driven
+# as a subprocess (the real CLI binary), so the harness exercises the real
+# sync/write/broadcast pipeline, not library shortcuts.
+[workspace]
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "time", "fs", "io-util", "net"] }
+# Plaintext HTTP only (zebrad's JSON-RPC is local http://) - no TLS stack pulled in.
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+serde_json = "1"
+anyhow = "1"
+tempfile = "3"

@@ -69,7 +69,7 @@ impl Command {
         } else {
             println!("{addr}");
             // Hint goes to stderr so it never pollutes the piped address value.
-            let ticker = crate::data::Network::from(cfg.network).ticker();
+            let ticker = cfg.network.ticker();
             ui::hint(format!(
                 "Tip: run `zkv address --funding` for the address to send {ticker} to."
             ));

@@ -31,6 +31,12 @@ strip = true
 [workspace]
 resolver = "2"
 members = ["crates/zkv", "crates/zkv-oracle", "crates/zkv-version-oracle"]
+# Directories that may exist inside the repo checkout but are NOT members:
+# the regtest harness is deliberately its own workspace (own lockfile; see
+# regtest-harness/README.md), and the Regtest E2E CI workflow checks out
+# zcash-devtool (the funding wallet) into the repo root, where cargo's
+# directory traversal would otherwise try to claim it for this workspace.
+exclude = ["regtest-harness", "zcash-devtool"]
 
 [workspace.dependencies]
 # Internal crate (path resolved relative to the workspace root, so the faucet

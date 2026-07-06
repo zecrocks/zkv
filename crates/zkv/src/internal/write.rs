@@ -798,7 +798,7 @@ pub(crate) fn augment_insufficient_funds(err: anyhow::Error, db_name: &str) -> a
         return err;
     };
     let network = WalletConfig::read(db_name)
-        .map(|c| crate::data::Network::from(c.network))
+        .map(|c| c.network)
         .unwrap_or_default();
     WriteError::InsufficientFunds {
         available: u64::from(*available),

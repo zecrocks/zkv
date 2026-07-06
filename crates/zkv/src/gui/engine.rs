@@ -30,7 +30,6 @@ use tokio::runtime::Handle;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 
-use zcash_protocol::consensus;
 use zcash_protocol::ShieldedProtocol;
 
 use crate::{
@@ -609,7 +608,7 @@ impl Engine {
         // that console should carry only `tracing` log events. See
         // `ui::set_quiet`.
         crate::ui::set_quiet();
-        let server_label = server_endpoint(&conn, consensus::Network::MainNetwork);
+        let server_label = server_endpoint(&conn, Network::Main);
         Arc::new(Engine {
             conn,
             server_label,
@@ -648,9 +647,9 @@ impl Engine {
             let db = run_blocking(move |_| Database::open(&n, conn)).await;
             if let Ok(db) = db {
                 let net = db.network();
-                is_mainnet = matches!(net.into(), consensus::Network::MainNetwork);
+                is_mainnet = matches!(net, Network::Main);
                 network = Some(net.name().to_owned());
-                server = server_endpoint(&self.conn, net.into());
+                server = server_endpoint(&self.conn, net);
                 synced = db.synced_height().ok().flatten();
                 let started = std::time::Instant::now();
                 if let Ok(tip) = db.chain_tip().await {
@@ -672,7 +671,7 @@ impl Engine {
                     chain_tip
                 } else {
                     self.conn
-                        .server_info(consensus::Network::MainNetwork)
+                        .server_info(Network::Main)
                         .await
                         .ok()
                         .map(|i| i.block_height as u32)
@@ -713,7 +712,7 @@ impl Engine {
     /// one network being unreachable (or the operator not serving it) only
     /// marks that row offline. The two probes run concurrently.
     pub async fn servers(&self) -> ServersResp {
-        let probe = |network: consensus::Network| {
+        let probe = |network: Network| {
             let conn = self.conn.clone();
             async move {
                 let server = server_endpoint(&conn, network);
@@ -733,10 +732,7 @@ impl Engine {
                 }
             }
         };
-        let (mainnet, testnet) = tokio::join!(
-            probe(consensus::Network::MainNetwork),
-            probe(consensus::Network::TestNetwork),
-        );
+        let (mainnet, testnet) = tokio::join!(probe(Network::Main), probe(Network::Test),);
         // Display-formatted (e.g. `~/.zkv` on Unix, the full path on Windows);
         // best-effort, blank if it can't be resolved.
         let data_dir = data::data_dir_display().unwrap_or_default();
@@ -794,9 +790,9 @@ impl Engine {
                 out.push(DbSummary {
                     name,
                     role: role_str(cfg.role).to_owned(),
-                    network: Network::from(cfg.network).name().to_owned(),
+                    network: cfg.network.name().to_owned(),
                     pool: crate::config::pool_label(cfg.pool).to_owned(),
-                    server: server_endpoint(&conn, Network::from(cfg.network).into()),
+                    server: server_endpoint(&conn, cfg.network),
                     birthday: u32::from(cfg.birthday),
                     keys,
                     unsynced,
@@ -817,7 +813,7 @@ impl Engine {
         run_blocking(move |h| {
             let cfg = WalletConfig::read(&name).map_err(|e| classify_unknown(e, &name))?;
             let db = Database::open(&name, conn.clone())?;
-            let server = server_endpoint(&conn, db.network().into());
+            let server = server_endpoint(&conn, db.network());
             let result = db.read(Confirmations::Default)?;
             let (init, init_done, init_required) = init_parts(&result.init);
             // Only the uninitialized verdict is provisional (an INIT could still
@@ -1388,9 +1384,8 @@ impl Engine {
         run_blocking(move |_| {
             let parsed =
                 crate::protocol::parse_zkv_addr(address.trim()).map_err(ZkvError::Other)?;
-            let network: Network = crate::protocol::network_from_type(parsed.network)
-                .map_err(ZkvError::Other)?
-                .into();
+            let network: Network =
+                crate::protocol::network_from_type(parsed.network).map_err(ZkvError::Other)?;
             Ok::<_, ZkvError>(ZkvAddrInfoResp {
                 network: network.name().to_owned(),
                 pool: crate::config::pool_label(parsed.pool).to_owned(),
@@ -2082,7 +2077,7 @@ fn derive_watch_name(addr: &str) -> String {
 
 /// Human-facing lightwalletd endpoint, e.g. `zec.rocks:443`. Falls back
 /// to the operator name when the operator doesn't serve that network.
-fn server_endpoint(conn: &ConnectionArgs, network: consensus::Network) -> String {
+fn server_endpoint(conn: &ConnectionArgs, network: Network) -> String {
     match conn.server.pick(network) {
         Ok(s) => s.to_string(),
         Err(_) => match &conn.server {
