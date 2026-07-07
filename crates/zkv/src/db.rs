@@ -108,7 +108,7 @@ use crate::{
             cached_version, load_audit, load_history_page, load_state_with_height, wallet_tip,
             HistoryOrder,
         },
-        sync::run_sync_read,
+        sync::{run_sync_read, run_sync_read_cancellable, CancelFlag},
         write::{
             broadcast_init, manage_and_broadcast, prepare, prepare_init, prepare_management,
             write_and_broadcast, write_many_and_broadcast, BatchItem, PreparedWrite, WriteError,
@@ -775,6 +775,23 @@ impl Database {
         run_sync_read(&self.name, &self.conn, /* fetch_mempool_too = */ false)
             .await
             .map_err(ZkvError::Other)
+    }
+
+    /// Like [`Database::sync`], but cooperatively cancellable: when `cancel`
+    /// flips to `true` the in-flight scan stops at the next block-batch boundary
+    /// and returns the height reached so far (a partial sync is safe and resumes
+    /// on the next call). The GUI's background auto-sync loop uses this so
+    /// pausing halts scanning promptly instead of only at the next cycle;
+    /// passing `None` is identical to [`Database::sync`].
+    pub async fn sync_cancellable(&self, cancel: Option<CancelFlag>) -> Result<u32> {
+        if let Some(tip) = self.skip_sync_if_blocked()? {
+            return Ok(tip);
+        }
+        run_sync_read_cancellable(
+            &self.name, &self.conn, /* fetch_mempool_too = */ false, cancel,
+        )
+        .await
+        .map_err(ZkvError::Other)
     }
 
     /// Sync plus pull the current lightwalletd mempool into the local

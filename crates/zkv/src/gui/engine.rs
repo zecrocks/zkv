@@ -592,6 +592,12 @@ pub struct Engine {
     sync_workers: AtomicUsize,
     /// Global pause: when set, the background loop halts entirely.
     paused_all: AtomicBool,
+    /// Cooperative cancel for the *current* auto-sync cycle's in-flight scans.
+    /// Set when a pause is toggled so scans already running abort promptly (the
+    /// per-db `paused` set and `paused_all` only gate which databases a cycle
+    /// *starts*); reset at the top of each cycle. Handed to `db.sync_cancellable`
+    /// as an [`Arc<AtomicBool>`] the blocking scan polls between block batches.
+    sync_cancel: Arc<AtomicBool>,
     /// Cached build-freshness verdict. The mainnet height probe runs once (on
     /// the first [`Engine::status`] call) and the answer is reused for the
     /// process lifetime: we don't care about the long-running edge case where a
@@ -616,6 +622,7 @@ impl Engine {
             paused: std::sync::Mutex::new(HashSet::new()),
             sync_workers: AtomicUsize::new(DEFAULT_SYNC_WORKERS),
             paused_all: AtomicBool::new(false),
+            sync_cancel: Arc::new(AtomicBool::new(false)),
             out_of_date: tokio::sync::OnceCell::new(),
         })
     }
@@ -1551,11 +1558,20 @@ impl Engine {
     /// Pause or resume continuous auto-sync for a single database. In-memory
     /// only (resets on restart); no wallet IO.
     pub fn set_pause(&self, name: String, paused: bool) -> PauseResp {
-        let mut set = self.paused.lock().unwrap();
+        {
+            let mut set = self.paused.lock().unwrap();
+            if paused {
+                set.insert(name);
+            } else {
+                set.remove(&name);
+            }
+        }
+        // Abort the current cycle's in-flight scans so a running scan of the
+        // just-paused database stops promptly rather than finishing its whole
+        // range. Cancellation is cheap and safe for the other databases too:
+        // they resume on the next cycle. Only worth signalling on pause.
         if paused {
-            set.insert(name);
-        } else {
-            set.remove(&name);
+            self.sync_cancel.store(true, Ordering::Relaxed);
         }
         PauseResp { paused }
     }
@@ -1564,6 +1580,12 @@ impl Engine {
     /// [`Engine::run_auto_sync`] halts entirely. In-memory only.
     pub fn set_pause_all(&self, paused: bool) -> PauseResp {
         self.paused_all.store(paused, Ordering::Relaxed);
+        // Stop the current cycle's in-flight scans immediately instead of
+        // waiting for it to drain (a single slow database could otherwise keep
+        // the CPU pegged for the rest of the cycle after the user hit pause).
+        if paused {
+            self.sync_cancel.store(true, Ordering::Relaxed);
+        }
         PauseResp { paused }
     }
 
@@ -1627,6 +1649,12 @@ impl Engine {
                 names.into_iter().filter(|n| !paused.contains(n)).collect()
             };
 
+            // Fresh cancel token for this cycle. A pause toggled mid-cycle flips
+            // it (see `set_pause`/`set_pause_all`) so in-flight scans abort; a
+            // new cycle only runs once syncing is unpaused, so clearing it here
+            // is safe.
+            self.sync_cancel.store(false, Ordering::Relaxed);
+
             let workers = self.sync_workers.load(Ordering::Relaxed).max(1);
             let sem = Arc::new(Semaphore::new(workers));
             let mut set = JoinSet::new();
@@ -1636,14 +1664,25 @@ impl Engine {
                 set.spawn(async move {
                     // Cap concurrency to `workers`.
                     let _permit = sem.acquire_owned().await.expect("semaphore not closed");
+                    // A pause toggled while this database waited for a worker
+                    // slot means we should not start its scan at all. Re-checking
+                    // here (not just at cycle start) is what keeps the CPU from
+                    // staying pegged for a full cycle after the user hits pause.
+                    if engine.paused_all.load(Ordering::Relaxed)
+                        || engine.sync_cancel.load(Ordering::Relaxed)
+                        || engine.paused.lock().unwrap().contains(&name)
+                    {
+                        return;
+                    }
                     // Serialize against same-db work (interactive writes, creates).
                     let lock = engine.db_lock(&name);
                     let _guard = lock.lock().await;
                     let conn = engine.conn.clone();
+                    let cancel = engine.sync_cancel.clone();
                     let label = name.clone();
                     if let Err(e) = run_blocking(move |h| {
                         let db = Database::open(&name, conn)?;
-                        h.block_on(db.sync())
+                        h.block_on(db.sync_cancellable(Some(cancel)))
                     })
                     .await
                     {

@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 
 use anyhow::anyhow;
@@ -360,6 +360,20 @@ impl SyncProgress {
 /// an instant cached sync just blinks rather than lingering).
 const SPINNER_GRACE: std::time::Duration = std::time::Duration::ZERO;
 
+/// A cooperative cancellation flag for a sync in progress. When it flips to
+/// `true`, the scan loop stops at the next block-batch boundary and returns the
+/// height reached so far. A partial sync is always safe: scanning is resumable
+/// (the wallet DB commits per batch) and the snapshot/tail read model tolerates
+/// a wallet that trails the tip. Used by the GUI auto-sync loop so pausing
+/// halts in-flight scans promptly instead of only at the next cycle. `None`
+/// means never cancel (every CLI/manual sync path passes `None`).
+pub type CancelFlag = Arc<AtomicBool>;
+
+/// Whether a cooperative cancellation has been requested.
+fn cancelled(cancel: &Option<CancelFlag>) -> bool {
+    cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
+}
+
 /// Back-compat alias for [`run_sync`]. The animated status spinner now lives in
 /// `run_sync` itself, so every sync path (the CLI commands, the `db::Database`
 /// facade, and the write path's pre-broadcast sync) shows it uniformly.
@@ -387,7 +401,7 @@ pub async fn run_sync(
     conn: &ConnectionArgs,
     fetch_mempool_too: bool,
 ) -> anyhow::Result<u32> {
-    run_sync_tol(db_name, conn, fetch_mempool_too, 0).await
+    run_sync_tol(db_name, conn, fetch_mempool_too, 0, None).await
 }
 
 /// Read-oriented sync: identical to [`run_sync`], but tolerates being up to
@@ -401,7 +415,21 @@ pub async fn run_sync_read(
     conn: &ConnectionArgs,
     fetch_mempool_too: bool,
 ) -> anyhow::Result<u32> {
-    run_sync_tol(db_name, conn, fetch_mempool_too, NEAR_TIP_TOLERANCE).await
+    run_sync_tol(db_name, conn, fetch_mempool_too, NEAR_TIP_TOLERANCE, None).await
+}
+
+/// Read sync that a caller can cancel cooperatively (see [`CancelFlag`]). Used
+/// by the GUI's background auto-sync loop so pausing a database (or pausing all
+/// syncing) aborts an in-flight scan promptly instead of letting it run to the
+/// end of the cycle. Behaves exactly like [`run_sync_read`] when `cancel` is
+/// never set.
+pub async fn run_sync_read_cancellable(
+    db_name: &str,
+    conn: &ConnectionArgs,
+    fetch_mempool_too: bool,
+    cancel: Option<CancelFlag>,
+) -> anyhow::Result<u32> {
+    run_sync_tol(db_name, conn, fetch_mempool_too, NEAR_TIP_TOLERANCE, cancel).await
 }
 
 /// Read sync whose fast-path skip tolerance comes from the request's
@@ -422,6 +450,7 @@ pub async fn run_sync_read_confs(
         conn,
         fetch_mempool_too,
         read_tip_tolerance(min_confs),
+        None,
     )
     .await
 }
@@ -434,6 +463,7 @@ async fn run_sync_tol(
     conn: &ConnectionArgs,
     fetch_mempool_too: bool,
     tip_tolerance: u32,
+    cancel: Option<CancelFlag>,
 ) -> anyhow::Result<u32> {
     // Serialize against any other zkv process touching this database: a chain
     // scan mutates the wallet DB and the block cache, and two concurrent scans
@@ -457,6 +487,7 @@ async fn run_sync_tol(
             fetch_mempool_too,
             tip_tolerance,
             Some(&progress),
+            &cancel,
         )
         .await;
         spinner.stop().await;
@@ -533,6 +564,7 @@ async fn run_sync_inner(
     fetch_mempool_too: bool,
     tip_tolerance: u32,
     progress: Option<&SyncProgress>,
+    cancel: &Option<CancelFlag>,
 ) -> anyhow::Result<u32> {
     let config = WalletConfig::read(db_name)?;
     let params = config.network;
@@ -602,6 +634,13 @@ async fn run_sync_inner(
     update_subtree_roots(&mut client, &mut db_data).await?;
 
     loop {
+        // Cooperative cancellation: a paused GUI aborts the scan between passes
+        // (and `sync_pass` checks again per block-batch). Partial progress is
+        // safe and resumes on the next sync.
+        if cancelled(cancel) {
+            info!("sync cancelled; stopping scan early");
+            return Ok(db_data.chain_height()?.map(u32::from).unwrap_or(0));
+        }
         if !sync_pass(
             &mut client,
             &params,
@@ -610,11 +649,19 @@ async fn run_sync_inner(
             &mut db_data,
             &db_data_path,
             progress,
+            cancel,
         )
         .await?
         {
             break;
         }
+    }
+
+    // If cancellation landed during the last pass, skip the (potentially heavy)
+    // enhance + mempool work and return what we have.
+    if cancelled(cancel) {
+        info!("sync cancelled; skipping enhance");
+        return Ok(db_data.chain_height()?.map(u32::from).unwrap_or(0));
     }
 
     // Enhance: fetch full transactions so memos are decrypted into the wallet DB.
@@ -637,6 +684,10 @@ async fn run_sync_inner(
 
 /// One pass: download blocks, scan, repeat as suggested. Returns `true` if a
 /// retriggering condition (chain tip moved or reorg) suggests we should loop again.
+// One more argument than clippy's default cap: this is the download/scan
+// pass's full working set (clients, params, both DB handles, progress, cancel),
+// threaded rather than bundled to keep the call site self-documenting.
+#[allow(clippy::too_many_arguments)]
 async fn sync_pass<P: Parameters + Send + 'static>(
     client: &mut CompactTxStreamerClient<Channel>,
     params: &P,
@@ -645,6 +696,7 @@ async fn sync_pass<P: Parameters + Send + 'static>(
     db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
     db_data_path: &Path,
     progress: Option<&SyncProgress>,
+    cancel: &Option<CancelFlag>,
 ) -> anyhow::Result<bool> {
     let chain_tip = update_chain_tip(client, db_data).await?;
     if let Some(p) = progress {
@@ -710,6 +762,15 @@ async fn sync_pass<P: Parameters + Send + 'static>(
             }
         })
     }) {
+        // Stop before starting the next batch if a cancellation is pending, so a
+        // paused GUI stops burning CPU within one batch instead of at the end of
+        // the full range. Flush the deferred block-cache deletions first.
+        if cancelled(cancel) {
+            for deletion in block_deletions {
+                deletion.await?;
+            }
+            return Ok(false);
+        }
         let block_meta = download_blocks(client, fsblockdb_root, db_cache, &scan_range).await?;
         let chain_state = download_chain_state(client, scan_range.block_range().start - 1).await?;
         let updated = scan_blocks(

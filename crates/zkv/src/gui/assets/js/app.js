@@ -368,20 +368,30 @@ function App() {
   const doTogglePause = React.useCallback(async () => {
     if (!activeName) return;
     const next = !(detail && detail.paused);
+    const setPausedLocally = (name, value) => {
+      setDetail((d) => d && d.name === name ? { ...d, paused: value } : d);
+      setDatabases(
+        (dbs) => dbs.map((db) => db.name === name ? { ...db, paused: value } : db)
+      );
+    };
+    setPausedLocally(activeName, next);
     try {
       await api.setPause(activeName, next);
-      await loadDetail(activeName);
+      loadDetail(activeName);
       refreshDatabases();
     } catch (e) {
+      setPausedLocally(activeName, !next);
       flash("Couldn't change sync: " + e.message, "error");
     }
   }, [activeName, detail, loadDetail, refreshDatabases, flash]);
   const doTogglePauseAll = React.useCallback(async () => {
     const next = !(status && status.paused_all);
+    setStatus((s) => s ? { ...s, paused_all: next } : s);
     try {
       await api.pauseAll(next);
-      await refreshStatus();
+      refreshStatus();
     } catch (e) {
+      setStatus((s) => s ? { ...s, paused_all: !next } : s);
       flash("Couldn't change sync: " + e.message, "error");
     }
   }, [status, refreshStatus, flash]);
