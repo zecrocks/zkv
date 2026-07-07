@@ -160,6 +160,23 @@ pub struct DbSummary {
     pub synced: Option<u32>,
 }
 
+/// Memoized inputs for one database's [`DbSummary`], keyed implicitly by the
+/// database name in [`Engine::summary_cache`]. Reused across sidebar polls when
+/// the wallet's fully-scanned height and the `pending.toml` fingerprint both
+/// match, sparing a full `load_state` replay. Not the `synced` field itself
+/// (that is read fresh each poll and *is* the cache key).
+struct CachedSummary {
+    /// Fully-scanned height at the time the counts were computed; a change here
+    /// means new blocks were scanned, so the confirmed state may have moved.
+    synced: Option<u32>,
+    /// Fingerprint of `pending.toml`; a change means a local write / prune
+    /// altered the in-flight set the read path merges in.
+    pending_fp: u64,
+    keys: usize,
+    unsynced: usize,
+    updated_at: Option<u32>,
+}
+
 #[derive(Serialize)]
 pub struct KeyStatus {
     pub kind: String, // confirmed | confirming | pending | deleting
@@ -598,6 +615,15 @@ pub struct Engine {
     /// *starts*); reset at the top of each cycle. Handed to `db.sync_cancellable`
     /// as an [`Arc<AtomicBool>`] the blocking scan polls between block batches.
     sync_cancel: Arc<AtomicBool>,
+    /// Memoized sidebar-summary inputs per database. `list_databases` is polled
+    /// on a timer (every ~10s), and the counts it derives come from a full
+    /// `load_state` replay per database, which dominates the poll's cost and
+    /// runs even while syncing is paused (pausing halts the sync loop, not the
+    /// frontend poll). The confirmed KV state changes only when the wallet scans
+    /// new blocks (fully-scanned height advances) or a local write mutates
+    /// `pending.toml`, so cache the derived counts keyed by both and reuse them
+    /// when neither moved. See [`Engine::list_databases`] / [`CachedSummary`].
+    summary_cache: Arc<std::sync::Mutex<HashMap<String, CachedSummary>>>,
     /// Cached build-freshness verdict. The mainnet height probe runs once (on
     /// the first [`Engine::status`] call) and the answer is reused for the
     /// process lifetime: we don't care about the long-running edge case where a
@@ -623,6 +649,7 @@ impl Engine {
             sync_workers: AtomicUsize::new(DEFAULT_SYNC_WORKERS),
             paused_all: AtomicBool::new(false),
             sync_cancel: Arc::new(AtomicBool::new(false)),
+            summary_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
             out_of_date: tokio::sync::OnceCell::new(),
         })
     }
@@ -766,6 +793,7 @@ impl Engine {
         // Snapshot the per-db paused set (drives the sidebar icon; never the
         // global pause-all). Cloned out so the closure stays `Send + 'static`.
         let paused = self.paused.lock().unwrap().clone();
+        let cache = self.summary_cache.clone();
         run_blocking(move |_| {
             let names = data::list_dbs().map_err(ZkvError::Other)?;
             let mut out = Vec::with_capacity(names.len());
@@ -774,21 +802,53 @@ impl Engine {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                // Local-only state read for the sidebar counts + scanned
-                // height. No network. The synced height lets the status bar
-                // reflect the clicked db immediately, before its detail loads.
+                // Local-only state for the sidebar counts + scanned height. No
+                // network. `synced` (the wallet's fully-scanned height) also
+                // lets the status bar reflect the clicked db immediately, before
+                // its detail loads.
+                //
+                // The counts come from a full `load_state` replay, which is the
+                // expensive part of this per-poll loop. But that state only
+                // moves when the wallet scans new blocks (`synced` advances) or a
+                // local write changes `pending.toml`, so key a cache on both and
+                // skip the replay when neither changed (the steady/paused case).
                 let (keys, unsynced, updated_at, synced) = match Database::open(&name, conn.clone())
                 {
                     Ok(db) => {
                         let synced = db.synced_height().ok().flatten();
-                        match db.read(Confirmations::Default) {
-                            Ok(result) => {
-                                let (k, u) = count_keys(&result.state);
-                                let updated =
-                                    result.state.values().filter_map(|ks| ks.updated_at).max();
-                                (k, u, updated, synced)
-                            }
-                            Err(_) => (0, 0, None, synced),
+                        let pending_fp = pending_fingerprint(&name);
+                        let cached = {
+                            let map = cache.lock().unwrap();
+                            map.get(&name).and_then(|c| {
+                                (c.synced == synced && c.pending_fp == pending_fp).then_some((
+                                    c.keys,
+                                    c.unsynced,
+                                    c.updated_at,
+                                ))
+                            })
+                        };
+                        match cached {
+                            Some((k, u, updated)) => (k, u, updated, synced),
+                            None => match db.read(Confirmations::Default) {
+                                Ok(result) => {
+                                    let (k, u) = count_keys(&result.state);
+                                    let updated =
+                                        result.state.values().filter_map(|ks| ks.updated_at).max();
+                                    cache.lock().unwrap().insert(
+                                        name.clone(),
+                                        CachedSummary {
+                                            synced,
+                                            pending_fp,
+                                            keys: k,
+                                            unsynced: u,
+                                            updated_at: updated,
+                                        },
+                                    );
+                                    (k, u, updated, synced)
+                                }
+                                // Don't cache a failed read: retry next poll.
+                                Err(_) => (0, 0, None, synced),
+                            },
                         }
                     }
                     Err(_) => (0, 0, None, None),
@@ -1526,8 +1586,10 @@ impl Engine {
             }
         }
 
-        // Drop the in-memory per-db pause flag; nothing references it now.
+        // Drop the in-memory per-db pause flag and cached summary; nothing
+        // references them now, and a same-named db later must not inherit them.
         self.paused.lock().unwrap().remove(&name);
+        self.summary_cache.lock().unwrap().remove(&name);
 
         Ok(OkResp { ok: true })
     }
@@ -1808,6 +1870,29 @@ fn init_parts(init: &InitState) -> (String, u32, u32) {
         InitState::Initializing { done, required } => ("initializing".to_owned(), *done, *required),
         InitState::Initialized => ("initialized".to_owned(), 0, 0),
     }
+}
+
+/// Cheap content fingerprint of a database's `pending.toml`: the in-flight
+/// writes the read path merges in. Two calls hash equal iff the entry set (and
+/// each entry's op/key/value) is unchanged, so it flags any append / prune /
+/// stale-expiry that would move the sidebar counts. An unreadable file hashes
+/// to a distinct sentinel so a broken pending state never serves a stale cache.
+fn pending_fingerprint(name: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    match pending::load(name) {
+        Ok(entries) => {
+            entries.len().hash(&mut h);
+            for e in &entries {
+                e.txid.hash(&mut h);
+                e.op.hash(&mut h);
+                e.key.hash(&mut h);
+                e.value.hash(&mut h);
+            }
+        }
+        Err(_) => u64::MAX.hash(&mut h),
+    }
+    h.finish()
 }
 
 /// (keys, unsynced) where `keys` is confirmed-or-incoming keys and
