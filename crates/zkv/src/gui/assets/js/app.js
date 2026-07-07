@@ -74,6 +74,21 @@ function App() {
       return [];
     }
   }, [flash]);
+  const refreshDatabasesBasic = React.useCallback(async () => {
+    try {
+      const basic = await api.listDatabasesBasic();
+      setDatabases((prev) => {
+        const byName = new Map(prev.map((d) => [d.name, d]));
+        return basic.map((b) => {
+          const old = byName.get(b.name);
+          return old && old.detailed ? { ...old, paused: b.paused } : b;
+        });
+      });
+      return basic;
+    } catch (_) {
+      return [];
+    }
+  }, []);
   const refreshStatus = React.useCallback(async () => {
     try {
       const s = await api.status();
@@ -176,8 +191,9 @@ function App() {
   );
   React.useEffect(() => {
     (async () => {
-      const dbs = await refreshDatabases();
+      const dbs = await refreshDatabasesBasic();
       const st = await refreshStatus();
+      refreshDatabases();
       const userDbs = dbs.filter((d) => d.name !== DEMO_DB_NAME);
       if (userDbs.length === 0 && !(st && st.onboarded)) setShowOnboarding(true);
       setBooted(true);

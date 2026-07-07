@@ -177,6 +177,14 @@ fn router(state: Arc<AppState>) -> Router {
 // ===================================================================
 
 #[derive(Deserialize)]
+struct ListQuery {
+    /// When set, return the fast wallet-free summary (names + config only, no
+    /// key counts) for an instant sidebar paint on launch.
+    #[serde(default)]
+    basic: bool,
+}
+
+#[derive(Deserialize)]
 struct HistoryQuery {
     /// Case-insensitive substring filter on the key.
     #[serde(default)]
@@ -360,8 +368,16 @@ async fn handle_licenses(State(state): State<Arc<AppState>>) -> Json<LicensesRes
     Json(state.engine.licenses())
 }
 
-async fn handle_list(State(state): State<Arc<AppState>>) -> Result<Json<Vec<DbSummary>>, ApiError> {
-    Ok(Json(state.engine.list_databases().await?))
+async fn handle_list(
+    State(state): State<Arc<AppState>>,
+    Query(q): Query<ListQuery>,
+) -> Result<Json<Vec<DbSummary>>, ApiError> {
+    let dbs = if q.basic {
+        state.engine.list_databases_basic().await?
+    } else {
+        state.engine.list_databases().await?
+    };
+    Ok(Json(dbs))
 }
 
 async fn handle_detail(
@@ -1039,6 +1055,27 @@ mod tests {
         let res = app
             .oneshot(api_req(
                 "/api/databases",
+                "localhost:8088",
+                Some("secrettoken"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(body_string(res).await, "[]");
+    }
+
+    #[tokio::test]
+    async fn api_lists_databases_basic_via_query_param() {
+        // The `?basic=1` variant (fast launch list) shares the route and the
+        // `ListQuery` extractor; on an empty data dir it returns the same `[]`.
+        let dir = std::env::temp_dir().join(format!("zkv-gui-basic-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("ZKV_DATA", &dir);
+
+        let app = router(test_state("secrettoken"));
+        let res = app
+            .oneshot(api_req(
+                "/api/databases?basic=true",
                 "localhost:8088",
                 Some("secrettoken"),
             ))

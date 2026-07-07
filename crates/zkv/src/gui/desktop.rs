@@ -198,6 +198,13 @@ mod ipc {
         Ok(engine.list_databases().await?)
     }
 
+    /// Fast wallet-free sidebar list (names + config only) for an instant paint
+    /// on launch; see [`super::super::engine::Engine::list_databases_basic`].
+    #[tauri::command(rename_all = "snake_case")]
+    pub async fn list_databases_basic(engine: E<'_>) -> Result<Vec<DbSummary>, CmdError> {
+        Ok(engine.list_databases_basic().await?)
+    }
+
     #[tauri::command(rename_all = "snake_case")]
     pub async fn detail(engine: E<'_>, name: String) -> Result<DbDetail, CmdError> {
         Ok(engine.detail(name).await?)
@@ -478,6 +485,7 @@ pub fn run(runtime: tokio::runtime::Runtime, conn: ConnectionArgs) -> anyhow::Re
             ipc::save_licenses,
             ipc::open_url,
             ipc::list_databases,
+            ipc::list_databases_basic,
             ipc::detail,
             ipc::history,
             ipc::rejections,

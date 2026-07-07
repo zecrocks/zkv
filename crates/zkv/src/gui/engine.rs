@@ -158,6 +158,13 @@ pub struct DbSummary {
     /// the ~100ms before the full detail loads. `None` only if the wallet DB
     /// can't be opened.
     pub synced: Option<u32>,
+    /// Whether `keys`/`unsynced`/`updated_at`/`synced` reflect a real state
+    /// read. The sidebar's first paint comes from [`Engine::list_databases_basic`]
+    /// (names + config only, no wallet read) so it appears instantly on launch;
+    /// those rows carry `detailed: false` and zeroed counts, and the frontend
+    /// renders the count as a placeholder until the full
+    /// [`Engine::list_databases`] fills it in. Always `true` from the full list.
+    pub detailed: bool,
 }
 
 /// Memoized inputs for one database's [`DbSummary`], keyed implicitly by the
@@ -787,7 +794,15 @@ impl Engine {
         }
     }
 
-    /// One summary row per local database (sidebar list).
+    /// One summary row per local database (sidebar list), with the full key
+    /// counts / synced height (memoized via `summary_cache`). Databases are
+    /// summarized concurrently so a many-database workspace doesn't pay the
+    /// per-db read cost strictly serially (a cold launch would otherwise block
+    /// the whole sidebar on the sum of every database's replay); output order
+    /// (the `list_dbs` order) is preserved.
+    ///
+    /// The frontend calls [`Engine::list_databases_basic`] first for an instant
+    /// sidebar and swaps this fuller result in when it lands.
     pub async fn list_databases(&self) -> Result<Vec<DbSummary>, ZkvError> {
         let conn = self.conn.clone();
         // Snapshot the per-db paused set (drives the sidebar icon; never the
@@ -796,62 +811,42 @@ impl Engine {
         let cache = self.summary_cache.clone();
         run_blocking(move |_| {
             let names = data::list_dbs().map_err(ZkvError::Other)?;
+            // Each database is an independent set of files; summarize them on
+            // scoped threads and collect in `names` order.
+            let out: Vec<DbSummary> = std::thread::scope(|scope| {
+                let handles: Vec<_> = names
+                    .iter()
+                    .map(|name| scope.spawn(|| summarize_db_full(name, &conn, &paused, &cache)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .filter_map(|h| h.join().unwrap())
+                    .collect()
+            });
+            Ok::<_, ZkvError>(out)
+        })
+        .await
+    }
+
+    /// Fast, wallet-free sidebar list: names plus static config
+    /// (role/network/pool/server/birthday/paused) only, with zeroed counts and
+    /// `detailed: false`. Costs one `keys.toml` read per database, no sqlite
+    /// open and no `load_state` replay, so it returns near-instantly however
+    /// many databases exist. The frontend paints this on launch so the sidebar
+    /// appears immediately, then replaces it with the full [`list_databases`]
+    /// result once the per-db reads finish.
+    ///
+    /// [`list_databases`]: Engine::list_databases
+    pub async fn list_databases_basic(&self) -> Result<Vec<DbSummary>, ZkvError> {
+        let conn = self.conn.clone();
+        let paused = self.paused.lock().unwrap().clone();
+        run_blocking(move |_| {
+            let names = data::list_dbs().map_err(ZkvError::Other)?;
             let mut out = Vec::with_capacity(names.len());
             for name in names {
                 let cfg = match WalletConfig::read(&name) {
                     Ok(c) => c,
                     Err(_) => continue,
-                };
-                // Local-only state for the sidebar counts + scanned height. No
-                // network. `synced` (the wallet's fully-scanned height) also
-                // lets the status bar reflect the clicked db immediately, before
-                // its detail loads.
-                //
-                // The counts come from a full `load_state` replay, which is the
-                // expensive part of this per-poll loop. But that state only
-                // moves when the wallet scans new blocks (`synced` advances) or a
-                // local write changes `pending.toml`, so key a cache on both and
-                // skip the replay when neither changed (the steady/paused case).
-                let (keys, unsynced, updated_at, synced) = match Database::open(&name, conn.clone())
-                {
-                    Ok(db) => {
-                        let synced = db.synced_height().ok().flatten();
-                        let pending_fp = pending_fingerprint(&name);
-                        let cached = {
-                            let map = cache.lock().unwrap();
-                            map.get(&name).and_then(|c| {
-                                (c.synced == synced && c.pending_fp == pending_fp).then_some((
-                                    c.keys,
-                                    c.unsynced,
-                                    c.updated_at,
-                                ))
-                            })
-                        };
-                        match cached {
-                            Some((k, u, updated)) => (k, u, updated, synced),
-                            None => match db.read(Confirmations::Default) {
-                                Ok(result) => {
-                                    let (k, u) = count_keys(&result.state);
-                                    let updated =
-                                        result.state.values().filter_map(|ks| ks.updated_at).max();
-                                    cache.lock().unwrap().insert(
-                                        name.clone(),
-                                        CachedSummary {
-                                            synced,
-                                            pending_fp,
-                                            keys: k,
-                                            unsynced: u,
-                                            updated_at: updated,
-                                        },
-                                    );
-                                    (k, u, updated, synced)
-                                }
-                                // Don't cache a failed read: retry next poll.
-                                Err(_) => (0, 0, None, synced),
-                            },
-                        }
-                    }
-                    Err(_) => (0, 0, None, None),
                 };
                 let is_paused = paused.contains(&name);
                 out.push(DbSummary {
@@ -861,11 +856,12 @@ impl Engine {
                     pool: crate::config::pool_label(cfg.pool).to_owned(),
                     server: server_endpoint(&conn, cfg.network),
                     birthday: u32::from(cfg.birthday),
-                    keys,
-                    unsynced,
+                    keys: 0,
+                    unsynced: 0,
                     paused: is_paused,
-                    updated_at,
-                    synced,
+                    updated_at: None,
+                    synced: None,
+                    detailed: false,
                 });
             }
             Ok::<_, ZkvError>(out)
@@ -1870,6 +1866,82 @@ fn init_parts(init: &InitState) -> (String, u32, u32) {
         InitState::Initializing { done, required } => ("initializing".to_owned(), *done, *required),
         InitState::Initialized => ("initialized".to_owned(), 0, 0),
     }
+}
+
+/// Compute the full sidebar summary for one database: static config plus the
+/// key counts / synced height, memoized via `cache` (see [`CachedSummary`]).
+/// `None` if the config can't be read (the database is dropped from the list,
+/// matching the pre-parallel loop's `continue`). Safe to run concurrently for
+/// different databases: each opens its own sqlite files and the shared cache is
+/// mutex-guarded.
+fn summarize_db_full(
+    name: &str,
+    conn: &ConnectionArgs,
+    paused: &HashSet<String>,
+    cache: &std::sync::Mutex<HashMap<String, CachedSummary>>,
+) -> Option<DbSummary> {
+    let cfg = WalletConfig::read(name).ok()?;
+    // Local-only state for the sidebar counts + scanned height. No network.
+    // `synced` (the wallet's fully-scanned height) also lets the status bar
+    // reflect the clicked db immediately, before its detail loads.
+    //
+    // The counts come from a full `load_state` replay, the expensive part. But
+    // that state only moves when the wallet scans new blocks (`synced` advances)
+    // or a local write changes `pending.toml`, so key a cache on both and skip
+    // the replay when neither changed (the steady/paused case).
+    let (keys, unsynced, updated_at, synced) = match Database::open(name, conn.clone()) {
+        Ok(db) => {
+            let synced = db.synced_height().ok().flatten();
+            let pending_fp = pending_fingerprint(name);
+            let cached = {
+                let map = cache.lock().unwrap();
+                map.get(name).and_then(|c| {
+                    (c.synced == synced && c.pending_fp == pending_fp).then_some((
+                        c.keys,
+                        c.unsynced,
+                        c.updated_at,
+                    ))
+                })
+            };
+            match cached {
+                Some((k, u, updated)) => (k, u, updated, synced),
+                None => match db.read(Confirmations::Default) {
+                    Ok(result) => {
+                        let (k, u) = count_keys(&result.state);
+                        let updated = result.state.values().filter_map(|ks| ks.updated_at).max();
+                        cache.lock().unwrap().insert(
+                            name.to_owned(),
+                            CachedSummary {
+                                synced,
+                                pending_fp,
+                                keys: k,
+                                unsynced: u,
+                                updated_at: updated,
+                            },
+                        );
+                        (k, u, updated, synced)
+                    }
+                    // Don't cache a failed read: retry next poll.
+                    Err(_) => (0, 0, None, synced),
+                },
+            }
+        }
+        Err(_) => (0, 0, None, None),
+    };
+    Some(DbSummary {
+        name: name.to_owned(),
+        role: role_str(cfg.role).to_owned(),
+        network: cfg.network.name().to_owned(),
+        pool: crate::config::pool_label(cfg.pool).to_owned(),
+        server: server_endpoint(conn, cfg.network),
+        birthday: u32::from(cfg.birthday),
+        keys,
+        unsynced,
+        paused: paused.contains(name),
+        updated_at,
+        synced,
+        detailed: true,
+    })
 }
 
 /// Cheap content fingerprint of a database's `pending.toml`: the in-flight

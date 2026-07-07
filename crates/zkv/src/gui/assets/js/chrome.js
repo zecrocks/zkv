@@ -104,10 +104,10 @@ const Sidebar = ({ view, onSelectView, databases, sidebarDbs, truncated, totalCo
       }
     ),
     /* @__PURE__ */ React.createElement("span", null, d.name),
-    d.unsynced > 0 && /* @__PURE__ */ React.createElement("span", { className: "unread-dot", title: `${d.unsynced} pending` }),
+    d.detailed && d.unsynced > 0 && /* @__PURE__ */ React.createElement("span", { className: "unread-dot", title: `${d.unsynced} pending` }),
     d.network === "testnet" && /* @__PURE__ */ React.createElement("span", { className: "net-tag", title: "Testnet database" }, "T"),
     d.paused && /* @__PURE__ */ React.createElement(PauseGlyph, { size: 11, style: { color: "var(--fg-3)" }, title: "Auto-sync paused" }),
-    /* @__PURE__ */ React.createElement("span", { className: "meta" }, d.keys)
+    /* @__PURE__ */ React.createElement("span", { className: "meta" }, d.detailed ? d.keys : /* @__PURE__ */ React.createElement("span", { style: { color: "var(--fg-3)" } }, "\xB7"))
   );
   return /* @__PURE__ */ React.createElement("aside", { className: "sidebar" }, /* @__PURE__ */ React.createElement("div", { className: "sidebar-actions" }, /* @__PURE__ */ React.createElement("button", { className: "btn secondary sm", onClick: onCreate }, /* @__PURE__ */ React.createElement(Icon, { name: "plus", className: "icon" }), " Create"), /* @__PURE__ */ React.createElement("button", { className: "btn secondary sm", onClick: onImport }, /* @__PURE__ */ React.createElement(Icon, { name: "download", className: "icon" }), " Import")), /* @__PURE__ */ React.createElement("div", { className: "sidebar-section" }, /* @__PURE__ */ React.createElement("div", { className: "sidebar-heading" }, /* @__PURE__ */ React.createElement("span", null, "Workspace")), /* @__PURE__ */ React.createElement(
     "div",

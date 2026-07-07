@@ -35,6 +35,7 @@
     saveLicenses: () => call("save_licenses"),
     openUrl: (url) => call("open_url", { url }),
     listDatabases: () => call("list_databases"),
+    listDatabasesBasic: () => call("list_databases_basic"),
     detail: (name) => call("detail", { name }),
     history: (name, opts) => {
       const o = opts || {};
@@ -155,6 +156,7 @@
       return Promise.resolve();
     },
     listDatabases: () => req("GET", "/api/databases"),
+    listDatabasesBasic: () => req("GET", "/api/databases?basic=true"),
     detail: (name) => req("GET", "/api/databases/" + enc(name)),
     history: (name, opts) => {
       const o = opts || {};

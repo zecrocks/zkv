@@ -124,6 +124,28 @@ function App() {
     }
   }, [flash]);
 
+  // Fast, wallet-free sidebar list (names + config only) for the first paint on
+  // launch, so the sidebar appears immediately instead of blocking on a full
+  // per-database state read. The full `refreshDatabases` fills in the key counts
+  // a moment later. Merge rather than overwrite so we never downgrade an
+  // already-detailed row's real counts back to a placeholder (only the paused
+  // flag, which is authoritative here, is refreshed on such rows).
+  const refreshDatabasesBasic = React.useCallback(async () => {
+    try {
+      const basic = await api.listDatabasesBasic();
+      setDatabases((prev) => {
+        const byName = new Map(prev.map((d) => [d.name, d]));
+        return basic.map((b) => {
+          const old = byName.get(b.name);
+          return old && old.detailed ? { ...old, paused: b.paused } : b;
+        });
+      });
+      return basic;
+    } catch (_) {
+      return [];
+    }
+  }, []);
+
   const refreshStatus = React.useCallback(async () => {
     try {
       const s = await api.status();
@@ -241,8 +263,12 @@ function App() {
   // ---- boot ----
   React.useEffect(() => {
     (async () => {
-      const dbs = await refreshDatabases();
+      // Paint the sidebar from the fast wallet-free list first, so names appear
+      // immediately, then fill in counts/synced from the full list in the
+      // background (it summarizes databases concurrently server-side).
+      const dbs = await refreshDatabasesBasic();
       const st = await refreshStatus();
+      refreshDatabases();
       // Onboarding state lives in the data dir (`.zkv`), not the browser. An
       // earlier version persisted a "dismissed" flag in localStorage, but that
       // is per-origin (every zkv install shares http://127.0.0.1:<port>), so a

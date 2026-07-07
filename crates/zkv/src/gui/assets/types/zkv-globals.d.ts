@@ -90,6 +90,10 @@ declare global {
     paused: boolean;
     updated_at: number | null;
     synced: number | null;
+    /// False for rows from the fast launch list (`listDatabasesBasic`): their
+    /// counts are placeholders until the full list fills them in. Always true
+    /// from `listDatabases`.
+    detailed: boolean;
   }
 
   interface KeyStatus {
@@ -357,6 +361,7 @@ declare global {
     saveLicenses(): Promise<SaveResp>;
     openUrl(url: string): Promise<void>;
     listDatabases(): Promise<DbSummary[]>;
+    listDatabasesBasic(): Promise<DbSummary[]>;
     detail(name: string): Promise<DbDetail>;
     history(name: string, opts?: HistoryOpts): Promise<HistoryResp>;
     rejections(name: string): Promise<RejectionsResp>;

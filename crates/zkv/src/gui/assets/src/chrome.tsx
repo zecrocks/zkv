@@ -190,10 +190,12 @@ const Sidebar = ({ view, onSelectView, databases, sidebarDbs, truncated, totalCo
       <Icon name={d.role === 'admin' ? 'database' : 'eye'} size={14}
             color={d.role === 'admin' ? undefined : 'var(--fg-3)'} />
       <span>{d.name}</span>
-      {d.unsynced > 0 && <span className="unread-dot" title={`${d.unsynced} pending`}></span>}
+      {d.detailed && d.unsynced > 0 && <span className="unread-dot" title={`${d.unsynced} pending`}></span>}
       {d.network === 'testnet' && <span className="net-tag" title="Testnet database">T</span>}
       {d.paused && <PauseGlyph size={11} style={{color:'var(--fg-3)'}} title="Auto-sync paused" />}
-      <span className="meta">{d.keys}</span>
+      {/* Until the full list fills counts in, show a muted placeholder instead
+          of a misleading "0" for a database whose keys haven't loaded yet. */}
+      <span className="meta">{d.detailed ? d.keys : <span style={{color:'var(--fg-3)'}}>·</span>}</span>
     </div>
   );
   return (
