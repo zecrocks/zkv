@@ -67,8 +67,9 @@ impl Command {
         let network_label = cfg.network;
         let net_str = network_label.name();
         let pool_str = match cfg.pool {
-            zcash_protocol::ShieldedProtocol::Sapling => "sapling",
-            zcash_protocol::ShieldedProtocol::Orchard => "orchard",
+            zcash_protocol::ShieldedPool::Sapling => "sapling",
+            zcash_protocol::ShieldedPool::Orchard => "orchard",
+            zcash_protocol::ShieldedPool::Ironwood => "ironwood",
         };
 
         // The funding address: a shielded-only unified address (the database's

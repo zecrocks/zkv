@@ -129,6 +129,10 @@ pub struct PromoteRow {
 pub fn open(path: &Path) -> Result<Connection> {
     let mut conn = Connection::open(path)
         .map_err(|e| anyhow!("open zkv_state.sqlite at {}: {e}", path.display()))?;
+    // Same concurrency pragmas as the wallet DB: the read path promotes into the
+    // snapshot while the GUI may read it, so tolerate brief reader/writer overlap
+    // instead of failing with "database is locked".
+    crate::data::configure_sqlite(&conn)?;
     let version: u32 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
     match version {
         0 => init_schema(&mut conn)?,

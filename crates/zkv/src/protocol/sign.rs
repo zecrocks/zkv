@@ -41,19 +41,21 @@ pub fn signed_payload(domain: &str, op: Op, key: &str, value: Option<&str>) -> V
 /// single-pool UA a writer pays), so it cannot disagree with the read key.
 pub fn receiver_domain(
     ufvk: &UnifiedFullViewingKey,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     net: NetworkType,
 ) -> anyhow::Result<String> {
     let (ua, _) = ufvk
         .default_address(ua_request_for_pool(pool))
         .map_err(|e| anyhow!("derive {pool:?} receiver: {e}"))?;
     let raw: Vec<u8> = match pool {
-        ShieldedProtocol::Orchard => ua
+        // Ironwood shares the Orchard receiver, so both bind the Orchard receiver
+        // bytes: a signature made under one verifies under the other.
+        ShieldedPool::Orchard | ShieldedPool::Ironwood => ua
             .orchard()
             .ok_or_else(|| anyhow!("single-pool UA missing its Orchard receiver"))?
             .to_raw_address_bytes()
             .to_vec(),
-        ShieldedProtocol::Sapling => ua
+        ShieldedPool::Sapling => ua
             .sapling()
             .ok_or_else(|| anyhow!("single-pool UA missing its Sapling receiver"))?
             .to_bytes()

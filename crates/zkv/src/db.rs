@@ -94,7 +94,7 @@ pub use crate::protocol::{
 };
 
 use zcash_keys::keys::UnifiedFullViewingKey;
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
 
 use crate::{
     config::{Role, WalletConfig},
@@ -447,20 +447,25 @@ impl Database {
         network: Network,
         conn: ConnectionArgs,
     ) -> Result<(Self, String)> {
-        Self::init_admin_with_pool(name, network, ShieldedProtocol::Orchard, conn).await
+        let pool = crate::config::default_pool_for_network(network);
+        Self::init_admin_with_pool(name, network, pool, conn).await
     }
 
     /// Like [`Database::init_admin`], but lets the caller pick the shielded
-    /// pool (Sapling or Orchard) the database lives in. Every memo is read
-    /// from and written to this pool; it is fixed at creation.
+    /// pool (Ironwood, Orchard, or Sapling) the database lives in. Every memo is
+    /// read from and written to this pool; it is fixed at creation. `init_admin`
+    /// defaults to the network's pool (Ironwood on testnet, Orchard on mainnet).
+    /// Ironwood shares the Orchard receiver and is rejected on mainnet until
+    /// NU6.3 activates there ([`ZkvError::Other`]).
     pub async fn init_admin_with_pool(
         name: &str,
         network: Network,
-        pool: ShieldedProtocol,
+        pool: ShieldedPool,
         conn: ConnectionArgs,
     ) -> Result<(Self, String)> {
         use bip0039::{Count, Mnemonic};
 
+        ensure_pool_available(pool, network)?;
         let mnemonic = Mnemonic::generate(Count::Words24);
         let phrase = mnemonic.phrase().to_owned();
         let db = create_admin(name, network, &mnemonic, None, pool, conn).await?;
@@ -479,15 +484,8 @@ impl Database {
         birthday: Option<u32>,
         conn: ConnectionArgs,
     ) -> Result<Self> {
-        Self::restore_admin_with_pool(
-            name,
-            network,
-            recovery_phrase,
-            birthday,
-            ShieldedProtocol::Orchard,
-            conn,
-        )
-        .await
+        let pool = crate::config::default_pool_for_network(network);
+        Self::restore_admin_with_pool(name, network, recovery_phrase, birthday, pool, conn).await
     }
 
     /// Like [`Database::restore_admin`], but lets the caller pick the shielded
@@ -499,12 +497,13 @@ impl Database {
         network: Network,
         recovery_phrase: &str,
         birthday: Option<u32>,
-        pool: ShieldedProtocol,
+        pool: ShieldedPool,
         conn: ConnectionArgs,
     ) -> Result<Self> {
         use bip0039::{English, Mnemonic};
         use secrecy::Zeroize as _;
 
+        ensure_pool_available(pool, network)?;
         let mut normalized = recovery_phrase
             .to_lowercase()
             .split_whitespace()
@@ -1441,7 +1440,7 @@ fn map_write_error(e: anyhow::Error) -> ZkvError {
 /// part of the identity).
 fn database_identity(
     ufvk: &UnifiedFullViewingKey,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     network: Network,
 ) -> Result<String> {
     use zcash_protocol::consensus::Parameters as _;
@@ -1454,7 +1453,7 @@ fn database_identity(
 /// `None` if there is no collision.
 fn find_duplicate_by_ufvk(
     ufvk: &UnifiedFullViewingKey,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     network: Network,
 ) -> Result<Option<String>> {
     let identity = database_identity(ufvk, pool, network)?;
@@ -1484,7 +1483,7 @@ fn find_duplicate_by_ufvk(
 /// under a different name.
 pub fn find_duplicate_database(
     recovery_phrase: &str,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     network: Network,
 ) -> Result<Option<String>> {
     use bip0039::{English, Mnemonic};
@@ -1522,12 +1521,26 @@ pub fn find_duplicate_watch_database(zkv_address: &str) -> Result<Option<String>
     find_duplicate_by_ufvk(&parsed.ufvk, parsed.pool, network)
 }
 
+/// Reject a pool that isn't available on the target network. Ironwood (NU6.3)
+/// is live on testnet but not yet on mainnet; a mainnet database uses plain
+/// Orchard instead (the two share the Orchard receiver). Shared by the admin
+/// creation paths so the CLI, GUI, and library all enforce the same policy.
+fn ensure_pool_available(pool: ShieldedPool, network: Network) -> Result<()> {
+    if pool == ShieldedPool::Ironwood && !crate::config::ironwood_available(network) {
+        return Err(ZkvError::Other(anyhow::anyhow!(
+            "the Ironwood pool is not yet available on mainnet (NU6.3 has not activated \
+             there); create the database with the Orchard pool, or use testnet"
+        )));
+    }
+    Ok(())
+}
+
 async fn create_admin(
     name: &str,
     network: Network,
     mnemonic: &bip0039::Mnemonic,
     birthday: Option<u32>,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     conn: ConnectionArgs,
 ) -> Result<Database> {
     use secrecy::{SecretVec, Zeroize};
@@ -1754,23 +1767,23 @@ mod tests {
 
         // Same seed, pool, network: identical identity (the re-import case).
         assert_eq!(
-            id(&ufvk_a, ShieldedProtocol::Orchard, main),
-            id(&ufvk_for(&seed_a, main), ShieldedProtocol::Orchard, main),
+            id(&ufvk_a, ShieldedPool::Orchard, main),
+            id(&ufvk_for(&seed_a, main), ShieldedPool::Orchard, main),
         );
         // Different seed: different identity.
         assert_ne!(
-            id(&ufvk_a, ShieldedProtocol::Orchard, main),
-            id(&ufvk_for(&seed_b, main), ShieldedProtocol::Orchard, main),
+            id(&ufvk_a, ShieldedPool::Orchard, main),
+            id(&ufvk_for(&seed_b, main), ShieldedPool::Orchard, main),
         );
         // Same seed, different pool: different identity.
         assert_ne!(
-            id(&ufvk_a, ShieldedProtocol::Orchard, main),
-            id(&ufvk_a, ShieldedProtocol::Sapling, main),
+            id(&ufvk_a, ShieldedPool::Orchard, main),
+            id(&ufvk_a, ShieldedPool::Sapling, main),
         );
         // Same seed, different network: different identity.
         assert_ne!(
-            id(&ufvk_for(&seed_a, main), ShieldedProtocol::Orchard, main),
-            id(&ufvk_for(&seed_a, test), ShieldedProtocol::Orchard, test),
+            id(&ufvk_for(&seed_a, main), ShieldedPool::Orchard, main),
+            id(&ufvk_for(&seed_a, test), ShieldedPool::Orchard, test),
         );
     }
 

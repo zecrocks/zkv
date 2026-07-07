@@ -168,6 +168,7 @@ pub fn load_funding(
     };
 
     let conn = Connection::open(&db_data_path)?;
+    crate::data::configure_sqlite(&conn)?;
 
     // ---- Per-tx outputs: zkv detection + display memo + send recipients ----
     let mut agg: HashMap<Vec<u8>, OutputsAgg> = HashMap::new();

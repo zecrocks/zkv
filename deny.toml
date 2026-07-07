@@ -51,4 +51,14 @@ wildcards = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-allow-git = []
+# Ironwood (NU6.3) support pins the librustzcash crate set to the zecrocks fork's
+# ironwood-scan-model branch via [patch.crates-io] in the workspace Cargo.toml
+# (the crates.io releases of the wallet crates depend on the `-pre` lower crates
+# and so can't be used directly), and that branch in turn needs an unreleased
+# shardtree/incrementalmerkletree. Allow those two git sources until the NU6.3
+# crates are published to crates.io, at which point the patches and these entries
+# come back out. See the workspace Cargo.toml comment.
+allow-git = [
+    "https://github.com/zecrocks/librustzcash",
+    "https://github.com/zcash/incrementalmerkletree",
+]

@@ -11,8 +11,9 @@ use zcash_address::{ConversionError, ZcashAddress};
 use zcash_client_backend::{
     data_api::{
         wallet::{
-            create_proposed_transactions, input_selection::GreedyInputSelector, propose_transfer,
-            ConfirmationsPolicy, SpendingKeys,
+            create_proposed_transactions,
+            input_selection::{GreedyInputSelector, TransparentSpendPolicy},
+            propose_transfer, ConfirmationsPolicy, SpendingKeys,
         },
         Account, WalletRead,
     },
@@ -26,6 +27,7 @@ use zcash_protocol::{
     consensus::{NetworkType, Parameters},
     memo::{Memo, MemoBytes},
     value::Zatoshis,
+    ShieldedPool,
 };
 use zip321::{Payment, TransactionRequest};
 
@@ -277,10 +279,22 @@ pub async fn pay(
 
     tracing::debug!(db = db_name, "creating transaction");
     let prover = LocalTxProver::bundled();
+    // The change strategy's `fallback_change_pool` is where change lands when
+    // the transaction has no shielded inputs. It must be a pool the fee/change
+    // accounting models directly (`OutputManifest` has only Sapling and Orchard
+    // slots): passing `Ironwood` trips a `total_shielded() == target_change_count`
+    // assertion in `zcash_client_backend`. Ironwood shares the Orchard pool
+    // on-chain, and the builder routes Orchard-pool change into the V6 Ironwood
+    // bundle when NU6.3 is active, so fold Ironwood to Orchard here (matching
+    // zcash-devtool, which always passes Orchard).
+    let fallback_change_pool = match config.pool {
+        ShieldedPool::Ironwood => ShieldedPool::Orchard,
+        other => other,
+    };
     let change_strategy = MultiOutputChangeStrategy::new(
         StandardFeeRule::Zip317,
         None,
-        config.pool,
+        fallback_change_pool,
         DustOutputPolicy::default(),
         SplitPolicy::with_min_output_value(
             NonZeroUsize::new(TARGET_NOTE_COUNT).expect("nonzero const"),
@@ -299,6 +313,14 @@ pub async fn pay(
         &change_strategy,
         request,
         ConfirmationsPolicy::default(),
+        // spend_policy (added in the Ironwood RC, transparent-inputs feature):
+        // ShieldedOnly (the library default). zkv's funding UA is shielded-only
+        // (ua_request_for_pool omits the transparent receiver), so writes are
+        // funded by and spent from shielded notes; there are no transparent
+        // inputs to select.
+        &TransparentSpendPolicy::default(),
+        // proposed_version (unstable feature): let the wallet pick the tx version
+        // for the target height (Ironwood/V6 past NU6.3).
         None,
     )
     .map_err(error::Error::from)?;

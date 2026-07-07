@@ -552,6 +552,8 @@ const CreateFlow = ({ onCancel, onCreate, onGeneratePhrase, onInit, pollDb, minI
   const [step, setStep] = React.useState(0);
   const [name, setName] = React.useState("");
   const [network, setNetwork] = React.useState("mainnet");
+  // Default pool tracks the network (mainnet → orchard, testnet → ironwood);
+  // initial network is mainnet, so the initial pool is orchard.
   const [pool, setPool] = React.useState("orchard");
   // Until the user picks a pool explicitly, it tracks the network's default
   // (see `defaultPoolFor`).
@@ -585,22 +587,25 @@ const CreateFlow = ({ onCancel, onCreate, onGeneratePhrase, onInit, pollDb, minI
     confirmWords[11] === words[11] &&
     confirmWords[19] === words[19];
 
-  // Orchard is live on both mainnet and testnet (NU6.2 has activated on
-  // testnet), so it is the default pool everywhere.
-  const defaultPoolFor = (_net: string) => "orchard";
+  // Ironwood (the NU6.3 Orchard pool) is testnet-only for now: it is the
+  // default on testnet, while mainnet defaults to plain Orchard (NU6.3 is not
+  // yet active there). Ironwood and Orchard share the Orchard receiver, so an
+  // old Orchard wallet auto-upgrades to Ironwood once NU6.3 reaches mainnet.
+  const ironwoodAvailable = (net: string) => net !== "mainnet";
+  const defaultPoolFor = (net: string) => (ironwoodAvailable(net) ? "ironwood" : "orchard");
   const selectNetwork = (net: string) => {
     setNetwork(net);
-    if (!poolTouched) setPool(defaultPoolFor(net));
+    if (!poolTouched) {
+      setPool(defaultPoolFor(net));
+    } else if (!ironwoodAvailable(net) && pool === "ironwood") {
+      // Ironwood is disabled on mainnet: fall back to its Orchard equivalent.
+      setPool("orchard");
+    }
   };
-  // Ironwood is an upcoming Zcash shielded pool. It is surfaced as a preview
-  // option only: it exists on testnet alone and cannot yet be used to create a
-  // database, so selecting it pins the network to testnet (shown greyed) and
-  // blocks the rest of the flow.
-  const ironwoodSelected = pool === "ironwood";
   const selectPool = (p: string) => {
+    if (p === "ironwood" && !ironwoodAvailable(network)) return;
     setPool(p);
     setPoolTouched(true);
-    if (p === "ironwood") setNetwork("testnet");
   };
 
   // Local db-name validation, mirrors the backend's data::validate_db_name:
@@ -829,10 +834,10 @@ const CreateFlow = ({ onCancel, onCreate, onGeneratePhrase, onInit, pollDb, minI
                 <div className="field-block">
                   <label>Network</label>
                   <div className="seg">
-                    <button className={network === "mainnet" ? "on" : ""} disabled={ironwoodSelected} onClick={() => selectNetwork("mainnet")}>
+                    <button className={network === "mainnet" ? "on" : ""} onClick={() => selectNetwork("mainnet")}>
                       <Icon name="globe" size={12} /> mainnet
                     </button>
-                    <button className={network === "testnet" ? "on" : ""} disabled={ironwoodSelected} onClick={() => selectNetwork("testnet")}>
+                    <button className={network === "testnet" ? "on" : ""} onClick={() => selectNetwork("testnet")}>
                       <Icon name="flask-conical" size={12} /> testnet
                     </button>
                   </div>
@@ -845,7 +850,12 @@ const CreateFlow = ({ onCancel, onCreate, onGeneratePhrase, onInit, pollDb, minI
                 <div className="field-block">
                   <label>Shielded pool</label>
                   <div className="seg">
-                    <button className={pool === "ironwood" ? "on" : ""} onClick={() => selectPool("ironwood")}>
+                    <button
+                      className={pool === "ironwood" ? "on" : ""}
+                      disabled={!ironwoodAvailable(network)}
+                      title={ironwoodAvailable(network) ? undefined : "Ironwood is not yet available on mainnet (NU6.3)"}
+                      onClick={() => selectPool("ironwood")}
+                    >
                       <Icon name="trees" size={12} /> ironwood
                     </button>
                     <button className={pool === "orchard" ? "on" : ""} onClick={() => selectPool("orchard")}>
@@ -855,19 +865,18 @@ const CreateFlow = ({ onCancel, onCreate, onGeneratePhrase, onInit, pollDb, minI
                       <Icon name="leaf" size={12} /> sapling
                     </button>
                   </div>
-                </div>
-                {ironwoodSelected && (
-                  <div className="callout-flow warn">
-                    <Icon name="alert-triangle" size={16} color="var(--amber-400)" />
-                    <div>Ironwood is an upcoming Zcash shielded pool.</div>
+                  <div className="hint" style={{ fontSize: 12.5, color: "var(--fg-3)", marginTop: 4 }}>
+                    {ironwoodAvailable(network)
+                      ? "Ironwood is the current Orchard pool (NU6.3). Old Orchard wallets import as Ironwood."
+                      : "Ironwood (NU6.3) is not yet available on mainnet; mainnet databases use Orchard."}
                   </div>
-                )}
+                </div>
               </div>
             </div>
             <div className="modal-foot">
               {counter}
               <div style={{ display: "flex", gap: 8 }}>
-                <button className="btn primary" disabled={!nameOk || busy || ironwoodSelected} onClick={doGenerate}>
+                <button className="btn primary" disabled={!nameOk || busy} onClick={doGenerate}>
                   {busy ? <><div className="spinner" /> Generating…</> : "Generate phrase →"}
                 </button>
               </div>
@@ -1197,12 +1206,14 @@ const ImportFlow = ({ onCancel, onWatch, onRestore, onComplete }: {
   const fromAddr = aohState === "addr" && !!addrInfo;
 
   // Effective restore parameters. The pasted address wins when resolved;
-  // otherwise the toggle drives the network and the pool defaults to Orchard
-  // (live on both networks post-NU6.2; paste a zkv address for a Sapling
-  // database). The birthday is the address's or the typed height: one is
+  // otherwise the toggle drives the network and the pool defaults per network
+  // (Ironwood on testnet, Orchard on mainnet, since NU6.3 is testnet-only for
+  // now). Ironwood and Orchard share the Orchard receiver, so an old Orchard
+  // wallet restores losslessly either way. Paste a zkv address for a Sapling
+  // database. The birthday is the address's or the typed height: one is
   // required, so there is no implicit default here.
   const effNetwork = fromAddr ? addrInfo!.network : network;
-  const effPool = fromAddr ? addrInfo!.pool : "orchard";
+  const effPool = fromAddr ? addrInfo!.pool : network === "mainnet" ? "orchard" : "ironwood";
   const effBirthday = fromAddr ? addrInfo!.birthday : aohState === "height" ? Number(aoh) : undefined;
 
   // When the optional field holds a shape-valid zkv address, resolve its
@@ -1506,7 +1517,10 @@ const ImportFlow = ({ onCancel, onWatch, onRestore, onComplete }: {
                   <span className="prev-ok" style={{ display: "inline-flex", alignItems: "center", gap: 6 }}>
                     <Icon name="check" size={12} />
                     <span className="net-badge" data-net={addrInfo.network}>{addrInfo.network}</span>
-                    <span className="db-pool">{addrInfo.pool}</span>
+                    {/* Orchard and Ironwood share the receiver, so an old
+                        Orchard address resolves to Ironwood; label it
+                        "ironwood/orchard" here so importers recognise it. */}
+                    <span className="db-pool">{addrInfo.pool === "ironwood" ? "ironwood/orchard" : addrInfo.pool}</span>
                     <span>· birthday {addrInfo.birthday}</span>
                   </span>
                 )}
@@ -1515,7 +1529,7 @@ const ImportFlow = ({ onCancel, onWatch, onRestore, onComplete }: {
             {/* Network: only when no address is pasted. A pasted address pins
                 the network and pool (shown in the badge above); in the height
                 case the toggle drives the network and the pool defaults to
-                Orchard. */}
+                Ironwood. */}
             {!fromAddr && (
               <div className="field-block">
                 <label>Network</label>

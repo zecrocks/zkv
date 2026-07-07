@@ -20,40 +20,54 @@ use zcash_primitives::transaction::{components::sapling::zip212_enforcement, Tra
 use zcash_protocol::{
     consensus::{BlockHeight, Parameters},
     memo::{Memo, MemoBytes},
-    ShieldedProtocol,
+    ShieldedPool,
 };
 
 /// The database's external incoming viewing key in its single pool, with the
 /// per-pool trial-decryption precomputation done once.
 pub(crate) enum PreparedIvk {
-    Sapling(sapling::note_encryption::PreparedIncomingViewingKey),
-    Orchard(orchard::keys::PreparedIncomingViewingKey),
+    // Both the External and Internal scopes: a zkv write to the database's own
+    // address is a same-account self-send, so the memo output lands under the
+    // wallet's *internal* (change) IVK, not the external one (the wallet scan
+    // tries both scopes; shallow must too, or it detects no candidates for the
+    // database's own writes, including INIT).
+    Sapling(Vec<sapling::note_encryption::PreparedIncomingViewingKey>),
+    Orchard(Vec<orchard::keys::PreparedIncomingViewingKey>),
 }
 
-/// Prepare the trial-decryption key for `pool` from the UFVK. Errors if the
+/// Prepare the trial-decryption keys for `pool` from the UFVK. Errors if the
 /// UFVK does not carry that pool's component (a parsed zkv address always
 /// does; its pool is inferred from which component is present).
 pub(crate) fn prepare_ivk(
     ufvk: &UnifiedFullViewingKey,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
 ) -> anyhow::Result<PreparedIvk> {
+    let scopes = [zip32::Scope::External, zip32::Scope::Internal];
     match pool {
-        ShieldedProtocol::Sapling => {
+        ShieldedPool::Sapling => {
             let dfvk = ufvk
                 .sapling()
                 .ok_or_else(|| anyhow!("UFVK has no Sapling component"))?;
-            let ivk = dfvk.to_ivk(zip32::Scope::External);
             Ok(PreparedIvk::Sapling(
-                sapling::note_encryption::PreparedIncomingViewingKey::new(&ivk),
+                scopes
+                    .iter()
+                    .map(|s| {
+                        sapling::note_encryption::PreparedIncomingViewingKey::new(&dfvk.to_ivk(*s))
+                    })
+                    .collect(),
             ))
         }
-        ShieldedProtocol::Orchard => {
+        // Ironwood shares the Orchard receiver, so it trial-decrypts with the
+        // Orchard IVK.
+        ShieldedPool::Orchard | ShieldedPool::Ironwood => {
             let fvk = ufvk
                 .orchard()
                 .ok_or_else(|| anyhow!("UFVK has no Orchard component"))?;
-            let ivk = fvk.to_ivk(zip32::Scope::External);
             Ok(PreparedIvk::Orchard(
-                orchard::keys::PreparedIncomingViewingKey::new(&ivk),
+                scopes
+                    .iter()
+                    .map(|s| orchard::keys::PreparedIncomingViewingKey::new(&fvk.to_ivk(*s)))
+                    .collect(),
             ))
         }
     }
@@ -75,27 +89,53 @@ pub(crate) fn scan_compact_block<P: Parameters>(
             continue;
         };
         let matched = match ivk {
-            PreparedIvk::Sapling(pivk) => {
+            PreparedIvk::Sapling(pivks) => {
                 let domain = sapling::note_encryption::SaplingDomain::new(zip212_enforcement(
                     params, height,
                 ));
                 vtx.outputs.iter().any(|out| {
-                    sapling::note_encryption::CompactOutputDescription::try_from(out)
-                        .ok()
-                        .and_then(|desc| try_compact_note_decryption(&domain, pivk, &desc))
-                        .is_some()
+                    let Ok(desc) =
+                        sapling::note_encryption::CompactOutputDescription::try_from(out)
+                    else {
+                        return false;
+                    };
+                    pivks
+                        .iter()
+                        .any(|pivk| try_compact_note_decryption(&domain, pivk, &desc).is_some())
                 })
             }
-            PreparedIvk::Orchard(pivk) => vtx.actions.iter().any(|act| {
-                orchard::note_encryption::CompactAction::try_from(act)
-                    .ok()
-                    .and_then(|action| {
-                        let domain =
-                            orchard::note_encryption::OrchardDomain::for_compact_action(&action);
-                        try_compact_note_decryption(&domain, pivk, &action)
-                    })
-                    .is_some()
-            }),
+            PreparedIvk::Orchard(pivks) => {
+                // Orchard (V5) and Ironwood (V6) actions live in *separate*
+                // compact fields: `CompactTx.actions` carries V5 Orchard actions
+                // (V2 note plaintexts, `OrchardDomain`), while `CompactTx
+                // .ironwood_actions` carries V6 Ironwood actions (V3 note
+                // plaintexts, `IronwoodDomain`). They share the Orchard receiver
+                // and IVK and the `CompactOrchardAction` shape, only the field
+                // and note-plaintext version differ. This build's own writes on
+                // an Ironwood chain land in `ironwood_actions`, so scanning only
+                // `actions` (the earlier bug) finds nothing.
+                let orchard_hit = vtx.actions.iter().any(|act| {
+                    let Ok(action) = orchard::note_encryption::CompactAction::try_from(act) else {
+                        return false;
+                    };
+                    let domain =
+                        orchard::note_encryption::OrchardDomain::for_compact_action(&action);
+                    pivks
+                        .iter()
+                        .any(|pivk| try_compact_note_decryption(&domain, pivk, &action).is_some())
+                });
+                let ironwood_hit = vtx.ironwood_actions.iter().any(|act| {
+                    let Ok(action) = orchard::note_encryption::CompactAction::try_from(act) else {
+                        return false;
+                    };
+                    let domain =
+                        orchard::note_encryption::IronwoodDomain::for_compact_action(&action);
+                    pivks
+                        .iter()
+                        .any(|pivk| try_compact_note_decryption(&domain, pivk, &action).is_some())
+                });
+                orchard_hit || ironwood_hit
+            }
         };
         if matched {
             hits.push(TxId::from_bytes(txid_bytes));
@@ -113,7 +153,7 @@ pub(crate) fn scan_compact_block<P: Parameters>(
 /// memos in one transaction; iterating all decrypted outputs handles that.
 pub(crate) fn extract_memos<P: Parameters>(
     params: &P,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     ufvk: &UnifiedFullViewingKey,
     tx: &Transaction,
     mined_height: Option<BlockHeight>,
@@ -123,15 +163,25 @@ pub(crate) fn extract_memos<P: Parameters>(
     let decrypted =
         decrypt_transaction::<_, u32>(params, mined_height, Some(chain_tip), tx, &ufvks);
     let outputs: Vec<(usize, &MemoBytes)> = match pool {
-        ShieldedProtocol::Sapling => decrypted
+        ShieldedPool::Sapling => decrypted
             .sapling_outputs()
             .iter()
             .map(|o: &DecryptedOutput<sapling::Note, u32>| (o.index(), o.memo()))
             .collect(),
-        ShieldedProtocol::Orchard => decrypted
+        // Ironwood shares the Orchard receiver but is a distinct value pool with
+        // its own decrypted-output accessor (`decrypt_transaction` splits V2
+        // Orchard from V3 Ironwood notes). A V6 write lands in `ironwood_outputs`,
+        // so both must be scanned or this build's own memos on an Ironwood chain
+        // vanish. The element type is identical, so they chain directly.
+        ShieldedPool::Orchard | ShieldedPool::Ironwood => decrypted
             .orchard_outputs()
             .iter()
-            .map(|o: &DecryptedOutput<orchard::Note, u32>| (o.index(), o.memo()))
+            .chain(decrypted.ironwood_outputs())
+            .map(
+                |o: &DecryptedOutput<(orchard::Note, orchard::ValuePool), u32>| {
+                    (o.index(), o.memo())
+                },
+            )
             .collect(),
     };
     outputs

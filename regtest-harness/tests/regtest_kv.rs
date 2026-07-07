@@ -131,7 +131,9 @@ async fn regtest_kv_lifecycle() {
     // the network, pool, and the creator's signing key from the string alone.
     let info = zkv.inspect_json(&zkv_addr).expect("inspect own address");
     assert_eq!(info["network"], "regtest");
-    assert_eq!(info["pool"], "orchard");
+    // Regtest is testnet-flavored, so the default pool is Ironwood (see
+    // `config::default_pool_for_network`); the db is created without `--pool`.
+    assert_eq!(info["pool"], "ironwood");
     let creator_key = info["signing_key"]
         .as_str()
         .expect("signing_key in inspect JSON")

@@ -79,7 +79,7 @@ mod ipc {
 
     use tauri::State;
 
-    use zcash_protocol::ShieldedProtocol;
+    use zcash_protocol::ShieldedPool;
 
     use crate::data::Network;
     use crate::gui::engine::{
@@ -117,10 +117,12 @@ mod ipc {
         })
     }
 
-    /// Parse the optional `pool` IPC argument. Absent means Orchard (default).
-    fn parse_pool(s: Option<String>) -> Result<ShieldedProtocol, CmdError> {
+    /// Parse the optional `pool` IPC argument. Absent means the network's
+    /// default pool (Ironwood on testnet, Orchard on mainnet); the facade also
+    /// rejects Ironwood on mainnet.
+    fn parse_pool(s: Option<String>, network: Network) -> Result<ShieldedPool, CmdError> {
         match s {
-            None => Ok(ShieldedProtocol::Orchard),
+            None => Ok(crate::config::default_pool_for_network(network)),
             Some(v) => crate::config::parse_pool(&v).map_err(|message| CmdError {
                 code: "bad_pool",
                 message,
@@ -346,8 +348,9 @@ mod ipc {
         pool: Option<String>,
         phrase: Option<String>,
     ) -> Result<CreateResp, CmdError> {
+        let net = parse_network(network)?;
         Ok(engine
-            .create(name, parse_network(network)?, parse_pool(pool)?, phrase)
+            .create(name, net, parse_pool(pool, net)?, phrase)
             .await?)
     }
 
@@ -406,14 +409,9 @@ mod ipc {
         pool: Option<String>,
         birthday: Option<u32>,
     ) -> Result<AddDbResp, CmdError> {
+        let net = parse_network(network)?;
         Ok(engine
-            .restore(
-                name,
-                phrase,
-                parse_network(network)?,
-                parse_pool(pool)?,
-                birthday,
-            )
+            .restore(name, phrase, net, parse_pool(pool, net)?, birthday)
             .await?)
     }
 

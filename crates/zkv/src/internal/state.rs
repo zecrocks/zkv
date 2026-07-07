@@ -16,7 +16,7 @@ use rusqlite::{named_params, Connection, OptionalExtension};
 use zcash_client_backend::data_api::WalletRead;
 use zcash_primitives::transaction::TxId;
 use zcash_protocol::memo::{Memo, MemoBytes};
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
 
 use crate::{
     config::WalletConfig,
@@ -47,14 +47,33 @@ struct DecodedRow {
     output_index: u32,
 }
 
-/// The `v_tx_outputs.output_pool` code for a shielded pool, matching
-/// `zcash_client_sqlite`'s `pool_code` (Sapling = 2, Orchard = 3; transparent
-/// is 0 and carries no memo).
-fn pool_output_code(pool: ShieldedProtocol) -> i64 {
+/// The `v_tx_outputs.output_pool` codes for a database's shielded pool,
+/// matching `zcash_client_sqlite`'s `pool_code` (Sapling = 2, Orchard = 3,
+/// Ironwood = 4; transparent is 0 and carries no memo).
+///
+/// The Orchard *value pool* spans two codes: `3` for V5 Orchard outputs and
+/// `4` for V6 Ironwood outputs. Ironwood shares the Orchard receiver and value
+/// pool, and a post-NU6.3 database's own writes are built as V6 (an Orchard
+/// wallet auto-upgrades on its first send), so a single Orchard/Ironwood
+/// database's memos can land under *either* code. Read paths must match both,
+/// or V6 memos (including this build's own writes on an Ironwood chain) are
+/// invisible. A Sapling database stays code 2 only.
+fn pool_output_codes(pool: ShieldedPool) -> &'static [i64] {
     match pool {
-        ShieldedProtocol::Sapling => 2,
-        ShieldedProtocol::Orchard => 3,
+        ShieldedPool::Sapling => &[2],
+        ShieldedPool::Orchard | ShieldedPool::Ironwood => &[3, 4],
     }
+}
+
+/// Render [`pool_output_codes`] as a SQL `IN`-list body (e.g. `"3, 4"`) for
+/// inlining into a query. The values are trusted integer constants, never user
+/// input, so string interpolation is safe here.
+fn pool_in_list(pool: ShieldedPool) -> String {
+    pool_output_codes(pool)
+        .iter()
+        .map(|c| c.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Query `data.sqlite` for this database's-pool text memos addressed to this
@@ -71,15 +90,35 @@ fn scan_memos_past_watermark(
     account_uuid_bytes: &[u8],
     tip: u32,
     watermark: &snapshot::Watermark,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
 ) -> anyhow::Result<Vec<DecodedRow>> {
-    let mut stmt = conn.prepare(
-        "SELECT v.memo, t.mined_height, t.block_time, v.from_account_uuid, v.txid, v.output_index
+    // Ironwood self-send memo recovery: the Orchard->Ironwood auto-upgrade
+    // records the wallet's own memo output in `sent_notes` under the Orchard
+    // receiver's pool code (3) while the on-chain note is scanned as Ironwood
+    // (pool 4). `v_tx_outputs` joins received notes to `sent_notes` on matching
+    // pool code, so the pool-4 received note is left with a NULL memo even
+    // though the memo sits in the pool-3 `sent_notes` row. Recover it
+    // via a scalar subquery matching `sent_notes` on `(txid, output_index)`
+    // *ignoring* the pool code: codes 3 and 4 alias the same Orchard value pool
+    // and receiver, so the same output position identifies the same memo. Only
+    // the wallet's own sends (`from_account_uuid`) can be NULL-and-recoverable,
+    // so the extra `OR from_account` term keeps foreign traffic untouched.
+    let mut stmt = conn.prepare(&format!(
+        "SELECT COALESCE(v.memo, (
+                    SELECT sn.memo FROM sent_notes sn
+                    JOIN transactions stx ON stx.id_tx = sn.transaction_id
+                    WHERE stx.txid = v.txid
+                      AND sn.output_index = v.output_index
+                      AND sn.output_pool IN ({pools})
+                      AND sn.memo IS NOT NULL
+                    LIMIT 1
+                )) AS memo,
+                t.mined_height, t.block_time, v.from_account_uuid, v.txid, v.output_index
          FROM v_tx_outputs v
          JOIN v_transactions t ON t.txid = v.txid AND t.account_uuid = v.to_account_uuid
          WHERE v.to_account_uuid = :account_uuid
-           AND v.output_pool = :output_pool
-           AND v.memo IS NOT NULL
+           AND v.output_pool IN ({pools})
+           AND (v.memo IS NOT NULL OR v.from_account_uuid = :account_uuid)
            AND (t.mined_height IS NOT NULL
                 OR t.expiry_height IS NULL
                 OR t.expiry_height = 0
@@ -91,13 +130,13 @@ fn scan_memos_past_watermark(
                          OR (v.txid = :wm_txid
                              AND v.output_index > :wm_output_index))))
          ORDER BY t.mined_height ASC NULLS LAST, v.txid ASC, v.output_index ASC",
-    )?;
+        pools = pool_in_list(pool),
+    ))?;
 
     let decoded: Vec<DecodedRow> = stmt
         .query_and_then(
             named_params! {
                 ":account_uuid": account_uuid_bytes,
-                ":output_pool": pool_output_code(pool),
                 ":tip": tip,
                 ":wm_height": watermark.height,
                 ":wm_txid": &watermark.txid,
@@ -316,6 +355,7 @@ pub fn load_state_with_height(
     // empty txid blob), every confirmed row qualifies; `txid > X''` holds for
     // all non-empty BLOBs.
     let conn = Connection::open(&db_data_path)?;
+    crate::data::configure_sqlite(&conn)?;
     let decoded = scan_memos_past_watermark(
         &conn,
         account_uuid_bytes.as_slice(),
@@ -521,6 +561,7 @@ pub fn load_history_page(
 
     // ---- LIVE: tail past the watermark + pending.toml (small) ----
     let conn = Connection::open(&db_data_path)?;
+    crate::data::configure_sqlite(&conn)?;
     let decoded = scan_memos_past_watermark(
         &conn,
         account_uuid_bytes.as_slice(),
@@ -873,6 +914,7 @@ pub fn load_audit(db_name: &str, min_confs: u32) -> anyhow::Result<AuditResult> 
 
     // Full scan: an empty (default) watermark means "every row".
     let conn = Connection::open(&db_data_path)?;
+    crate::data::configure_sqlite(&conn)?;
     let decoded = scan_memos_past_watermark(
         &conn,
         account_uuid_bytes.as_slice(),
@@ -936,15 +978,15 @@ pub fn load_audit(db_name: &str, min_confs: u32) -> anyhow::Result<AuditResult> 
 fn fill_tx_fee_and_output(
     conn: &Connection,
     entries: &mut [HistoryEntry],
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
 ) -> anyhow::Result<()> {
     let mut tx_stmt =
         conn.prepare("SELECT account_balance_delta, fee_paid FROM v_transactions WHERE txid = ?1")?;
-    let mut out_stmt = conn.prepare(
+    let mut out_stmt = conn.prepare(&format!(
         "SELECT value FROM v_tx_outputs
-         WHERE txid = ?1 AND output_index = ?2 AND output_pool = ?3",
-    )?;
-    let pool_code = pool_output_code(pool);
+         WHERE txid = ?1 AND output_index = ?2 AND output_pool IN ({pools})",
+        pools = pool_in_list(pool),
+    ))?;
     // A single tx can carry several writes; cache its fee lookup by txid.
     let mut fee_cache: HashMap<String, Option<u64>> = HashMap::new();
     for e in entries.iter_mut() {
@@ -973,9 +1015,7 @@ fn fill_tx_fee_and_output(
         e.fee = fee;
 
         let value: Option<i64> = out_stmt
-            .query_row(rusqlite::params![&blob, e.output_index, pool_code], |row| {
-                row.get(0)
-            })
+            .query_row(rusqlite::params![&blob, e.output_index], |row| row.get(0))
             .optional()?;
         e.output_value = value.filter(|v| *v > 0).map(|v| v as u64);
     }

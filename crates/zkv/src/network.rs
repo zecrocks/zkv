@@ -43,6 +43,15 @@ const REGTEST_GENESIS_UPGRADES: u32 = 1;
 /// first. Must match the harness zebrad config's activation heights.
 const REGTEST_NU6_2_HEIGHT: u32 = 4;
 
+/// Height at which NU6.3 (Ironwood) activates on the regtest chain. Kept a few
+/// blocks after NU6.2 (like NU6.2 trails NU6) and **must** agree across all
+/// three sides of the harness: this `LocalNetwork`, the zebrad config's
+/// `[network.testnet_parameters.activation_heights]` `"NU6.3"` key (emitted only
+/// for the Ironwood tier, since stock zebra rejects the unknown key), and the
+/// devtool funder's `--activation-heights`. Regtest is a testnet-flavored local
+/// chain, so Ironwood is available there (see `config::ironwood_available`).
+pub const REGTEST_NU6_3_HEIGHT: u32 = 8;
+
 /// The fixed regtest chain parameters, as a [`LocalNetwork`].
 // `zcash_unstable` is a librustzcash RUSTFLAGS cfg (nu7/zfuture). We don't set
 // it, but the gated fields keep this literal valid if someone builds with
@@ -51,6 +60,7 @@ const REGTEST_NU6_2_HEIGHT: u32 = 4;
 fn regtest_activation() -> LocalNetwork {
     let h = Some(BlockHeight::from_u32(REGTEST_GENESIS_UPGRADES));
     let nu62 = Some(BlockHeight::from_u32(REGTEST_NU6_2_HEIGHT));
+    let nu63 = Some(BlockHeight::from_u32(REGTEST_NU6_3_HEIGHT));
     LocalNetwork {
         overwinter: h,
         sapling: h,
@@ -61,10 +71,11 @@ fn regtest_activation() -> LocalNetwork {
         nu6: h,
         nu6_1: nu62,
         nu6_2: nu62,
+        nu6_3: nu63,
         #[cfg(zcash_unstable = "nu7")]
-        nu7: nu62,
+        nu7: nu63,
         #[cfg(zcash_unstable = "zfuture")]
-        z_future: nu62,
+        z_future: nu63,
     }
 }
 

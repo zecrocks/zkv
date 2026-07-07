@@ -6,7 +6,7 @@ use bip0039::{Count, English, Mnemonic};
 use clap::Args;
 use secrecy::{SecretVec, Zeroize};
 use zcash_client_backend::data_api::{wallet::ConfirmationsPolicy, WalletRead, WalletWrite};
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
 
 use crate::{
     commands::connection_args::ConnectionCliArgs,
@@ -47,10 +47,15 @@ pub(crate) struct Command {
     #[arg(long, default_value = "mainnet", value_parser = Network::parse)]
     pub(crate) network: Network,
 
-    /// Shielded pool for this database: "orchard" (default) or "sapling".
+    /// Shielded pool for this database: "ironwood", "orchard", or "sapling".
     /// Fixed at creation; every memo is read from and written to this pool.
-    #[arg(long, default_value = "orchard", value_parser = parse_pool)]
-    pub(crate) pool: ShieldedProtocol,
+    /// Defaults to the network's pool when omitted: Ironwood on testnet (the
+    /// NU6.3 Orchard pool), Orchard on mainnet (Ironwood is rejected on mainnet
+    /// until NU6.3 activates there). Ironwood and Orchard share the Orchard
+    /// receiver, so the choice only affects the label and the transaction
+    /// version a send builds.
+    #[arg(long, value_parser = parse_pool)]
+    pub(crate) pool: Option<ShieldedPool>,
 
     /// Skip the type-it-back confirmation prompt AND the funding/INIT poll
     /// loop. Prints the funding instructions (no QR), the exact INIT memo
@@ -112,6 +117,11 @@ impl Command {
             return self.resume(&name).await;
         }
 
+        // Resolve the pool now that the network is known: default per network
+        // (Ironwood on testnet, Orchard on mainnet) and reject Ironwood on
+        // mainnet, before minting a seed or touching the chain.
+        let pool = crate::config::resolve_pool_for_network(self.pool, params)?;
+
         // Mnemonic ceremony first; user sees their phrase even if the network is down.
         let mnemonic = Mnemonic::generate(Count::Words24);
         if !self.non_interactive {
@@ -126,7 +136,7 @@ impl Command {
         let mut client = connection.connect(params).await?;
         let birthday = crate::internal::sync::near_tip_birthday(&mut client, params).await?;
 
-        WalletConfig::init_admin(&name, &mnemonic, birthday.height(), params, self.pool)?;
+        WalletConfig::init_admin(&name, &mnemonic, birthday.height(), params, pool)?;
 
         let seed = {
             let mut s = mnemonic.to_seed("");
@@ -145,7 +155,7 @@ impl Command {
         let ufvk = zcash_client_backend::data_api::Account::ufvk(&account)
             .ok_or_else(|| anyhow!("no UFVK"))?;
         zkv_verifying_pubkey(ufvk)?;
-        let zkv_addr = encode_zkv_addr(ufvk, &params, self.pool, u32::from(birthday.height()))?;
+        let zkv_addr = encode_zkv_addr(ufvk, &params, pool, u32::from(birthday.height()))?;
         drop(db_data);
 
         // Build the signed INIT memo + recipient UA up-front so we can display

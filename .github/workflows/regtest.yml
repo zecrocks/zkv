@@ -65,6 +65,15 @@ concurrency:
 jobs:
   regtest:
     runs-on: ubuntu-latest
+    # The Ironwood feature branch activates NU6.3 on its regtest chain, which
+    # this tier's stock zebra doesn't know, so the two diverge past the NU6.3
+    # height and the e2e can't pass here. That branch's live tier runs in
+    # `regtest-ironwood.yml` (Ironwood zebra + dev lwd/devtool images) instead,
+    # so skip the stock tier on its PRs. Every other PR / push / schedule runs
+    # normally.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.head_ref != 'claude/zkv-ironwood-support-5s6bfn'
     # NB: new harness test files must be added to the matrix `tests` list here
     # (it enumerates --test targets; nothing runs them implicitly).
     #

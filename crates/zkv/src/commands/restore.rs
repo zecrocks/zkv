@@ -3,7 +3,7 @@ use bip0039::{English, Mnemonic};
 use clap::Args;
 use secrecy::{SecretVec, Zeroize};
 use zcash_client_backend::data_api::WalletWrite;
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
 
 use crate::{
     commands::connection_args::ConnectionCliArgs,
@@ -39,12 +39,16 @@ pub(crate) struct Command {
     #[arg(long)]
     pub(crate) birthday: Option<u32>,
 
-    /// Shielded pool of the database being restored: "orchard" (default) or
+    /// Shielded pool of the database being restored: "ironwood", "orchard", or
     /// "sapling". Must match the pool chosen at the original `zkv init`, or the
     /// reconstructed zkv address won't match and the database will look empty.
-    /// Ignored when `--address` is given (the address carries the pool).
-    #[arg(long, default_value = "orchard", value_parser = parse_pool)]
-    pub(crate) pool: ShieldedProtocol,
+    /// Defaults to the network's pool when omitted (Ironwood on testnet, Orchard
+    /// on mainnet). Ironwood and Orchard share the Orchard receiver, so an old
+    /// Orchard wallet restored as Ironwood on testnet derives the identical
+    /// address and reads the identical memos. Ignored when `--address` is given
+    /// (the address carries the pool).
+    #[arg(long, value_parser = parse_pool)]
+    pub(crate) pool: Option<ShieldedPool>,
 
     #[command(flatten)]
     pub(crate) connection: ConnectionCliArgs,
@@ -77,11 +81,14 @@ impl Command {
             Some(p) => network_from_type(p.network)?,
             None => self.network,
         };
+        let params = network;
+        // With an address, the pool is authoritative (and already network-aware
+        // from parsing). Without one, resolve the flag against the network:
+        // default per network, and reject Ironwood on mainnet.
         let pool = match &parsed_addr {
             Some(p) => p.pool,
-            None => self.pool,
+            None => crate::config::resolve_pool_for_network(self.pool, network)?,
         };
-        let params = network;
 
         let dir = db_dir(&name)?;
         if dir.join("keys.toml").exists() {

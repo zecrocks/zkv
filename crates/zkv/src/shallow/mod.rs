@@ -66,7 +66,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 use zcash_primitives::transaction::TxId;
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
 
 use crate::{
     config::WalletConfig,
@@ -218,7 +218,7 @@ pub enum ShallowError {
 /// the public constructors always build the gRPC form.
 pub struct ShallowClient<C: ChainSource = GrpcSource> {
     network: crate::network::Network,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     birthday: u32,
     /// The signing-domain receiver every `ZKV0` signature binds to.
     receiver: String,
@@ -299,7 +299,7 @@ impl<C: ChainSource> ShallowClient<C> {
     ) -> Self {
         Self {
             network: crate::network::Network::Test,
-            pool: ShieldedProtocol::Orchard,
+            pool: ShieldedPool::Orchard,
             birthday,
             receiver,
             root_hex,
@@ -319,7 +319,7 @@ impl<C: ChainSource> ShallowClient<C> {
         self.network
     }
 
-    pub fn pool(&self) -> ShieldedProtocol {
+    pub fn pool(&self) -> ShieldedPool {
         self.pool
     }
 

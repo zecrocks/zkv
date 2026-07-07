@@ -11,7 +11,7 @@ use transparent::keys::NonHardenedChildIndex;
 use zcash_keys::keys::UnifiedSpendingKey;
 use zcash_primitives::transaction::TxId;
 use zcash_protocol::consensus::NetworkType;
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
 
 use super::{ChainSource, ShallowError};
 use crate::protocol::{
@@ -26,8 +26,8 @@ pub(crate) fn fixture() -> (String, String, secp256k1::SecretKey) {
     let usk = UnifiedSpendingKey::from_seed(&net, &[0x42; 32], zip32::AccountId::ZERO)
         .expect("derive USK");
     let ufvk = usk.to_unified_full_viewing_key();
-    let receiver = receiver_domain(&ufvk, ShieldedProtocol::Orchard, NetworkType::Test)
-        .expect("receiver domain");
+    let receiver =
+        receiver_domain(&ufvk, ShieldedPool::Orchard, NetworkType::Test).expect("receiver domain");
     let root_hex = pubkey_bech32(&zkv_verifying_pubkey(&ufvk).expect("root pubkey"));
     let idx = NonHardenedChildIndex::from_index(ZKV_TRANSPARENT_INDEX).expect("index");
     let sk = usk

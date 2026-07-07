@@ -46,7 +46,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
 
 use crate::data::Network;
 use crate::db::ZkvError;
@@ -566,7 +566,7 @@ async fn handle_create(
     Json(body): Json<CreateReq>,
 ) -> Result<Json<CreateResp>, ApiError> {
     let network = parse_network(&body.network)?;
-    let pool = parse_pool(body.pool.as_deref())?;
+    let pool = parse_pool(body.pool.as_deref(), network)?;
     Ok(Json(
         state
             .engine
@@ -631,7 +631,7 @@ async fn handle_restore(
     Json(body): Json<RestoreReq>,
 ) -> Result<Json<AddDbResp>, ApiError> {
     let network = parse_network(&body.network)?;
-    let pool = parse_pool(body.pool.as_deref())?;
+    let pool = parse_pool(body.pool.as_deref(), network)?;
     Ok(Json(
         state
             .engine
@@ -676,11 +676,12 @@ fn parse_network(s: &str) -> Result<Network, ApiError> {
     })
 }
 
-/// Parse the optional `pool` field from a create request. Absent means
-/// Orchard (the default pool).
-fn parse_pool(s: Option<&str>) -> Result<ShieldedProtocol, ApiError> {
+/// Parse the optional `pool` field from a create request. Absent means the
+/// network's default pool (Ironwood on testnet, Orchard on mainnet). The facade
+/// additionally rejects Ironwood on mainnet.
+fn parse_pool(s: Option<&str>, network: Network) -> Result<ShieldedPool, ApiError> {
     match s {
-        None => Ok(ShieldedProtocol::Orchard),
+        None => Ok(crate::config::default_pool_for_network(network)),
         Some(v) => crate::config::parse_pool(v).map_err(|msg| {
             ApiError(
                 StatusCode::BAD_REQUEST,

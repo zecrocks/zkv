@@ -31,7 +31,7 @@ use secrecy::{ExposeSecret, SecretVec, Zeroize};
 use serde::{Deserialize, Serialize};
 
 use zcash_protocol::consensus::{BlockHeight, NetworkUpgrade, Parameters};
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
 
 use crate::{
     data::{db_dir, ensure_db_dir, Network},
@@ -71,38 +71,90 @@ pub struct WalletConfig {
     /// The single shielded pool this database lives in: every memo is read
     /// from, and written to, this pool. Chosen at creation and fixed
     /// thereafter. Absent in `keys.toml` (legacy databases) means Orchard.
-    pub pool: ShieldedProtocol,
+    pub pool: ShieldedPool,
     seed_ciphertext: Option<String>,
     db_dir: PathBuf,
 }
 
-/// Parse a `--pool` CLI value into a [`ShieldedProtocol`]. Strict: only
-/// `"sapling"` and `"orchard"` are accepted (the `String` error feeds clap).
-pub fn parse_pool(s: &str) -> Result<ShieldedProtocol, String> {
+/// Parse a `--pool` value into a [`ShieldedPool`]: `"ironwood"`, `"orchard"`,
+/// or `"sapling"`. Ironwood and Orchard share the Orchard receiver and are
+/// chain-identical; which one a new database uses is a per-network policy
+/// (see [`default_pool_for_network`] / [`ironwood_available`]): Ironwood is the
+/// testnet default, Orchard the mainnet one (NU6.3 is not yet active on
+/// mainnet). The `String` error feeds clap; network validation happens at the
+/// creation call site, not here.
+pub fn parse_pool(s: &str) -> Result<ShieldedPool, String> {
     match s.trim().to_ascii_lowercase().as_str() {
-        "sapling" => Ok(ShieldedProtocol::Sapling),
-        "orchard" => Ok(ShieldedProtocol::Orchard),
+        "sapling" => Ok(ShieldedPool::Sapling),
+        "orchard" => Ok(ShieldedPool::Orchard),
+        "ironwood" => Ok(ShieldedPool::Ironwood),
         other => Err(format!(
-            "unknown pool {other:?} (expected \"sapling\" or \"orchard\")"
+            "unknown pool {other:?} (expected \"ironwood\", \"orchard\", or \"sapling\")"
         )),
     }
 }
 
-/// Lowercase label for a pool (`"sapling"`/`"orchard"`), as written to
-/// `keys.toml` and surfaced to the GUI.
-pub fn pool_label(pool: ShieldedProtocol) -> &'static str {
-    match pool {
-        ShieldedProtocol::Sapling => "sapling",
-        ShieldedProtocol::Orchard => "orchard",
+/// Whether the Ironwood (NU6.3) pool can back a database on `network`. Ironwood
+/// is live on testnet and regtest but not yet on mainnet, so it is available on
+/// every network except mainnet; on mainnet the equivalent pool is plain
+/// Orchard (an Orchard wallet auto-upgrades to Ironwood once NU6.3 activates on
+/// mainnet, since they share the Orchard receiver).
+pub fn ironwood_available(network: Network) -> bool {
+    !matches!(network, Network::Main)
+}
+
+/// The default shielded pool for a new database on `network`: Ironwood on
+/// testnet/regtest (the current NU6.3 Orchard pool), Orchard on mainnet (until
+/// NU6.3 activates there).
+pub fn default_pool_for_network(network: Network) -> ShieldedPool {
+    if ironwood_available(network) {
+        ShieldedPool::Ironwood
+    } else {
+        ShieldedPool::Orchard
     }
 }
 
-/// Parse a `keys.toml` pool label. Unknown or absent labels fall back to
-/// Orchard (the original, pre-pool-field behavior) at the call site.
-fn pool_from_label(label: Option<&str>) -> ShieldedProtocol {
+/// Resolve the pool for a **new** database: fall back to the network default
+/// when unspecified, and reject Ironwood on a network where it isn't available
+/// yet (mainnet). Shared by `zkv init`/`restore` and the facade so the policy
+/// lives in one place.
+pub fn resolve_pool_for_network(
+    pool: Option<ShieldedPool>,
+    network: Network,
+) -> anyhow::Result<ShieldedPool> {
+    let pool = pool.unwrap_or_else(|| default_pool_for_network(network));
+    if pool == ShieldedPool::Ironwood && !ironwood_available(network) {
+        anyhow::bail!(
+            "the Ironwood pool is not yet available on mainnet (NU6.3 has not activated \
+             there); create the database with `--pool orchard`, or use testnet"
+        );
+    }
+    Ok(pool)
+}
+
+/// Lowercase label for a pool, as written to `keys.toml` and surfaced to the
+/// GUI. Ironwood and Orchard are distinct labels (Ironwood is new; legacy
+/// databases stay labelled `"orchard"`) even though they share the Orchard
+/// receiver and are handled identically on the chain.
+pub fn pool_label(pool: ShieldedPool) -> &'static str {
+    match pool {
+        ShieldedPool::Sapling => "sapling",
+        ShieldedPool::Orchard => "orchard",
+        ShieldedPool::Ironwood => "ironwood",
+    }
+}
+
+/// Parse a `keys.toml` pool label. `"ironwood"` is the pool for databases
+/// created since NU6.3; `"orchard"` and an absent label are the legacy Orchard
+/// form (kept as-is so existing databases open unchanged, and handled
+/// identically to Ironwood since they share the Orchard receiver).
+fn pool_from_label(label: Option<&str>) -> ShieldedPool {
     match label {
-        Some("sapling") => ShieldedProtocol::Sapling,
-        _ => ShieldedProtocol::Orchard,
+        Some("sapling") => ShieldedPool::Sapling,
+        Some("ironwood") => ShieldedPool::Ironwood,
+        // `Some("orchard")` and `None` (pre-pool-field databases) are legacy
+        // Orchard, behaviourally identical to Ironwood.
+        _ => ShieldedPool::Orchard,
     }
 }
 
@@ -116,7 +168,7 @@ impl WalletConfig {
         mnemonic: &Mnemonic,
         birthday: BlockHeight,
         network: Network,
-        pool: ShieldedProtocol,
+        pool: ShieldedPool,
     ) -> anyhow::Result<()> {
         let dir = ensure_db_dir(db_name)?;
 
@@ -151,7 +203,7 @@ impl WalletConfig {
         birthday: BlockHeight,
         network: Network,
         zkv_address: &str,
-        pool: ShieldedProtocol,
+        pool: ShieldedPool,
     ) -> anyhow::Result<()> {
         let dir = ensure_db_dir(db_name)?;
         write_config(
@@ -256,10 +308,15 @@ struct ConfigEncoding {
 /// `keys.toml` encoding for a pool. Orchard is the implied default and is
 /// omitted, so newly-created Orchard databases keep byte-identical config to
 /// pre-pool-field databases.
-fn pool_encoding(pool: ShieldedProtocol) -> Option<String> {
+fn pool_encoding(pool: ShieldedPool) -> Option<String> {
     match pool {
-        ShieldedProtocol::Orchard => None,
-        ShieldedProtocol::Sapling => Some(pool_label(pool).to_owned()),
+        // Orchard is the implied default: omit it so legacy databases keep
+        // byte-identical config.
+        ShieldedPool::Orchard => None,
+        ShieldedPool::Sapling => Some(pool_label(pool).to_owned()),
+        // Ironwood (the default for databases created since NU6.3) is written
+        // explicitly; absence still means legacy Orchard.
+        ShieldedPool::Ironwood => Some(pool_label(pool).to_owned()),
     }
 }
 
@@ -382,35 +439,91 @@ mod tests {
 
     #[test]
     fn parse_pool_accepts_known_values_case_insensitively() {
-        assert_eq!(parse_pool("orchard"), Ok(ShieldedProtocol::Orchard));
-        assert_eq!(parse_pool("sapling"), Ok(ShieldedProtocol::Sapling));
-        assert_eq!(parse_pool("  Sapling "), Ok(ShieldedProtocol::Sapling));
-        assert_eq!(parse_pool("ORCHARD"), Ok(ShieldedProtocol::Orchard));
+        // parse_pool is literal; the Ironwood/Orchard network policy is applied
+        // separately (see resolve_pool_for_network).
+        assert_eq!(parse_pool("orchard"), Ok(ShieldedPool::Orchard));
+        assert_eq!(parse_pool("ironwood"), Ok(ShieldedPool::Ironwood));
+        assert_eq!(parse_pool("sapling"), Ok(ShieldedPool::Sapling));
+        assert_eq!(parse_pool("  Sapling "), Ok(ShieldedPool::Sapling));
+        assert_eq!(parse_pool("ORCHARD"), Ok(ShieldedPool::Orchard));
+        assert_eq!(parse_pool("Ironwood"), Ok(ShieldedPool::Ironwood));
         assert!(parse_pool("transparent").is_err());
         assert!(parse_pool("").is_err());
     }
 
     #[test]
+    fn pool_network_policy() {
+        use Network::{Main as MainNetwork, Regtest, Test as TestNetwork};
+        // Ironwood is available everywhere except mainnet (testnet + regtest).
+        assert!(!ironwood_available(MainNetwork));
+        assert!(ironwood_available(TestNetwork));
+        assert!(ironwood_available(Regtest));
+        // Defaults: mainnet -> Orchard, testnet/regtest -> Ironwood.
+        assert_eq!(default_pool_for_network(MainNetwork), ShieldedPool::Orchard);
+        assert_eq!(
+            default_pool_for_network(TestNetwork),
+            ShieldedPool::Ironwood
+        );
+        assert_eq!(default_pool_for_network(Regtest), ShieldedPool::Ironwood);
+        // resolve_pool_for_network: unspecified falls back to the network
+        // default; Ironwood on mainnet is rejected; Orchard/Sapling are fine
+        // everywhere; Ironwood on testnet is fine.
+        assert_eq!(
+            resolve_pool_for_network(None, MainNetwork).unwrap(),
+            ShieldedPool::Orchard
+        );
+        assert_eq!(
+            resolve_pool_for_network(None, TestNetwork).unwrap(),
+            ShieldedPool::Ironwood
+        );
+        assert!(resolve_pool_for_network(Some(ShieldedPool::Ironwood), MainNetwork).is_err());
+        assert_eq!(
+            resolve_pool_for_network(Some(ShieldedPool::Orchard), MainNetwork).unwrap(),
+            ShieldedPool::Orchard
+        );
+        assert_eq!(
+            resolve_pool_for_network(Some(ShieldedPool::Ironwood), TestNetwork).unwrap(),
+            ShieldedPool::Ironwood
+        );
+        assert_eq!(
+            resolve_pool_for_network(Some(ShieldedPool::Sapling), MainNetwork).unwrap(),
+            ShieldedPool::Sapling
+        );
+    }
+
+    #[test]
     fn absent_or_unknown_pool_label_defaults_to_orchard() {
-        // Legacy keys.toml has no `pool` field at all.
-        assert_eq!(pool_from_label(None), ShieldedProtocol::Orchard);
+        // Legacy keys.toml has no `pool` field at all: still legacy Orchard.
+        assert_eq!(pool_from_label(None), ShieldedPool::Orchard);
         // Unknown labels fall back to Orchard rather than erroring on read.
-        assert_eq!(pool_from_label(Some("bogus")), ShieldedProtocol::Orchard);
-        assert_eq!(pool_from_label(Some("sapling")), ShieldedProtocol::Sapling);
-        assert_eq!(pool_from_label(Some("orchard")), ShieldedProtocol::Orchard);
+        assert_eq!(pool_from_label(Some("bogus")), ShieldedPool::Orchard);
+        assert_eq!(pool_from_label(Some("sapling")), ShieldedPool::Sapling);
+        // An explicit legacy "orchard" label stays Orchard; new databases write
+        // "ironwood".
+        assert_eq!(pool_from_label(Some("orchard")), ShieldedPool::Orchard);
+        assert_eq!(pool_from_label(Some("ironwood")), ShieldedPool::Ironwood);
     }
 
     #[test]
     fn pool_encoding_omits_orchard_and_round_trips() {
-        // Orchard is omitted so new Orchard databases keep byte-identical
+        // Orchard is omitted so legacy Orchard databases keep byte-identical
         // config to pre-pool-field ones.
-        assert_eq!(pool_encoding(ShieldedProtocol::Orchard), None);
+        assert_eq!(pool_encoding(ShieldedPool::Orchard), None);
         assert_eq!(
-            pool_encoding(ShieldedProtocol::Sapling),
+            pool_encoding(ShieldedPool::Sapling),
             Some("sapling".to_owned())
         );
+        // Ironwood is written explicitly.
+        assert_eq!(
+            pool_encoding(ShieldedPool::Ironwood),
+            Some("ironwood".to_owned())
+        );
         // Encoding then reading back is the identity on the pool.
-        for pool in [ShieldedProtocol::Orchard, ShieldedProtocol::Sapling] {
+        for pool in [
+            ShieldedPool::Orchard,
+            ShieldedPool::Sapling,
+            ShieldedPool::Ironwood,
+        ] {
             let label = pool_encoding(pool);
             assert_eq!(pool_from_label(label.as_deref()), pool);
         }

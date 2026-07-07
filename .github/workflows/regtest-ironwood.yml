@@ -1,0 +1,119 @@
+name: Regtest E2E (Ironwood)
+
+# Ironwood (NU6.3) live tier. Same harness as `regtest.yml`, but against the
+# Ironwood stack: `zfnd/zebra:6.0.0-rc.0` (the official Ironwood zebra RC) with
+# development lightwalletd + zcash-devtool images (emersonian/*), all pinned by
+# digest, and `ZKV_REGTEST_NU6_3=1` so the harness emits zebra's `"NU6.3"`
+# activation-height key and the devtool funder's `--activation-heights` carry
+# `nu6_3` (stock zebra rejects the unknown `"NU6.3"` key, so this can only run
+# against an Ironwood-capable zebra).
+#
+# Gated to schedule + manual dispatch + the Ironwood feature branch's PRs. The
+# lightwalletd/devtool images are dev artifacts, so this job must never gate an
+# unrelated PR's CI; on any other PR the job is skipped (see the job `if:`).
+#
+# All three NU6.3 activation heights must agree (or consensus diverges):
+#   - zebra:   `"NU6.3" = 8` (harness `zebrad_toml`, gated on ZKV_REGTEST_NU6_3)
+#   - wallet:  `network::REGTEST_NU6_3_HEIGHT = 8` (crates/zkv/src/network.rs)
+#   - funder:  devtool `--activation-heights` `nu6_3 = 8` (harness `Funder::init`)
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, off-peak and on an odd minute distinct from regtest.yml's cron.
+    - cron: "31 7 * * 2"
+  pull_request:
+    paths:
+      - "regtest-harness/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/regtest-ironwood.yml"
+
+concurrency:
+  group: regtest-ironwood-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# NB: no env var may start with `ZEBRA_` — zebrad parses `ZEBRA_*` as config
+# overrides and exits on unknown fields (the harness also scrubs them).
+env:
+  ZEBRAD_IMAGE: "zfnd/zebra:6.0.0-rc.0"
+  LWD_IMAGE: "emersonian/zcash-lwd-ironwood@sha256:5f63b64ed788330ad8fe859fbbb334ceea844cf8a376318e7e25fbd3351b2f9f"
+  DEVTOOL_IMAGE: "emersonian/zcash-devtool@sha256:fd95d8b432f47d3eec6e5f1eca0bdfbb8daa094c28742d230bec3ac47957bd6c"
+
+jobs:
+  regtest-ironwood:
+    runs-on: ubuntu-latest
+    # On a pull request, run only for the Ironwood branch: the emersonian/*
+    # dev images must not gate anyone else's PR. schedule / workflow_dispatch
+    # always run.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.head_ref == 'claude/zkv-ironwood-support-5s6bfn'
+    name: regtest-ironwood
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            regtest-harness
+
+      # Release build: writes prove Orchard spends, and debug proving is >20s
+      # per transaction. The lean CLI build skips the GUI asset/licensing steps.
+      - name: Build zkv (release, lean CLI)
+        run: cargo build --release -p zkv --bin zkv --no-default-features --features cli,transparent-inputs
+
+      # Extract zebrad + lightwalletd + zcash-devtool from their Docker images.
+      # The harness drives all three as subprocesses (it reads ZEBRAD_BIN /
+      # LIGHTWALLETD_BIN / DEVTOOL_BIN), so we only need the binaries.
+      - name: Provision zebrad + lightwalletd + devtool from images
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          extract() {
+            img="$1"; name="$2"; out="$RUNNER_TEMP/bin/$name"
+            docker pull -q "$img"
+            cid=$(docker create "$img")
+            rel=$(docker export "$cid" | tar -tf - | grep -m1 -E "(^|/)${name}\$" || true)
+            if [ -z "$rel" ]; then echo "::error::could not locate $name in $img"; docker rm "$cid" >/dev/null; exit 1; fi
+            docker cp "$cid:/$rel" "$out"
+            docker rm "$cid" >/dev/null
+            chmod +x "$out"
+            echo "$name -> $out"; file -b "$out" || true
+          }
+          extract "$ZEBRAD_IMAGE" zebrad
+          extract "$LWD_IMAGE" lightwalletd
+          extract "$DEVTOOL_IMAGE" zcash-devtool
+          echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
+          echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
+          echo "DEVTOOL_BIN=$RUNNER_TEMP/bin/zcash-devtool" >> "$GITHUB_ENV"
+
+      # The harness is its own workspace, so the root ci.yml's clippy never
+      # sees it; lint it here where it is already being compiled.
+      - name: Clippy (harness)
+        run: cargo clippy --all-targets --locked --manifest-path regtest-harness/Cargo.toml -- -D warnings
+
+      - name: Run regtest end-to-end harness (Ironwood)
+        env:
+          ZKV_BIN: ${{ github.workspace }}/target/release/zkv
+          # Enable the NU6.3 (Ironwood) activation-height wiring on all three
+          # sides (harness zebrad config + devtool funder --activation-heights).
+          ZKV_REGTEST_NU6_3: "1"
+          # DEVTOOL_BIN / ZEBRAD_BIN / LIGHTWALLETD_BIN are exported above.
+          ZEBRAD_STDERR: ${{ runner.temp }}/zebrad.log
+        # --locked build against the committed lock; single-threaded so the
+        # zebrad+lightwalletd stack plus Orchard proving don't contend on a
+        # 2-core runner; --no-fail-fast runs every test binary.
+        run: cargo test --locked --manifest-path regtest-harness/Cargo.toml --test regtest_unfunded --test regtest_kv --no-fail-fast -- --nocapture --test-threads=1
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "== disk =="
+          df -h / "$RUNNER_TEMP" || true
+          echo "== zebrad log (last 200 lines) =="
+          tail -n 200 "$RUNNER_TEMP/zebrad.log" 2>/dev/null || echo "(no zebrad log was written)"

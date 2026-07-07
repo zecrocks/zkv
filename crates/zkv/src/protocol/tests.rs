@@ -189,7 +189,7 @@ fn zkv_addr_encodes_under_zkv_hrp_and_round_trips() {
         ),
     ] {
         let ufvk = sample_ufvk(net, 0x7a);
-        let addr = encode_zkv_addr(&ufvk, &net, ShieldedProtocol::Orchard, 1_234_567).unwrap();
+        let addr = encode_zkv_addr(&ufvk, &net, ShieldedPool::Orchard, 1_234_567).unwrap();
         // The address is a single bech32m token under the zkv HRP (no colon,
         // no birthday suffix).
         assert!(addr.starts_with(hrp), "got {addr}");
@@ -197,7 +197,15 @@ fn zkv_addr_encodes_under_zkv_hrp_and_round_trips() {
 
         let parsed = parse_zkv_addr(&addr).expect("parses");
         assert_eq!(parsed.network, nt);
-        assert_eq!(parsed.pool, ShieldedProtocol::Orchard);
+        // An Orchard-receiver address resolves to Ironwood where NU6.3 is
+        // available (testnet) and plain Orchard on mainnet; they share the
+        // receiver, so importing an old Orchard wallet is lossless either way.
+        let expected_pool = if nt == NetworkType::Main {
+            ShieldedPool::Orchard
+        } else {
+            ShieldedPool::Ironwood
+        };
+        assert_eq!(parsed.pool, expected_pool);
         assert_eq!(
             parsed.birthday, 1_234_567,
             "birthday rides inside the meta item"
@@ -205,13 +213,8 @@ fn zkv_addr_encodes_under_zkv_hrp_and_round_trips() {
 
         // Re-encoding the parsed key reproduces the exact address (the meta
         // item + HRP are deterministic).
-        let addr2 = encode_zkv_addr(
-            &parsed.ufvk,
-            &net,
-            ShieldedProtocol::Orchard,
-            parsed.birthday,
-        )
-        .unwrap();
+        let addr2 =
+            encode_zkv_addr(&parsed.ufvk, &net, ShieldedPool::Orchard, parsed.birthday).unwrap();
         assert_eq!(addr, addr2);
 
         // `--view-key`: the same bytes under the standard uview HRP, which
@@ -229,7 +232,7 @@ fn parse_zkv_addr_rejects_plain_uview_and_missing_meta() {
     let ufvk = sample_ufvk(net, 0x55);
     // A plain uview (no zkv HRP, no meta) is not a zkv address; the
     // rejection must guide the user toward enabling it for zkv.
-    let plain_uview = encode_ufvk_for_pool(&ufvk, &net, ShieldedProtocol::Orchard);
+    let plain_uview = encode_ufvk_for_pool(&ufvk, &net, ShieldedPool::Orchard);
     let uview_err = parse_zkv_addr(&plain_uview).unwrap_err().to_string();
     assert!(
         uview_err.contains("viewing key") && uview_err.contains("enabled for zkv"),
@@ -493,9 +496,9 @@ fn receiver_domain_binds_network() {
     let ufvk = UnifiedSpendingKey::from_seed(&main, &seed, zip32::AccountId::ZERO)
         .unwrap()
         .to_unified_full_viewing_key();
-    let dom_main = receiver_domain(&ufvk, ShieldedProtocol::Orchard, NetworkType::Main).unwrap();
-    let dom_test = receiver_domain(&ufvk, ShieldedProtocol::Orchard, NetworkType::Test).unwrap();
-    let dom_reg = receiver_domain(&ufvk, ShieldedProtocol::Orchard, NetworkType::Regtest).unwrap();
+    let dom_main = receiver_domain(&ufvk, ShieldedPool::Orchard, NetworkType::Main).unwrap();
+    let dom_test = receiver_domain(&ufvk, ShieldedPool::Orchard, NetworkType::Test).unwrap();
+    let dom_reg = receiver_domain(&ufvk, ShieldedPool::Orchard, NetworkType::Regtest).unwrap();
     assert!(dom_main.starts_with("main:"));
     assert!(dom_test.starts_with("test:"));
     assert!(dom_reg.starts_with("regtest:"));
@@ -804,7 +807,7 @@ fn encode_ufvk_for_orchard_strips_sapling() {
         "control: USK-derived UFVK should contain sapling",
     );
 
-    let stripped = encode_ufvk_for_pool(&ufvk, &params, ShieldedProtocol::Orchard);
+    let stripped = encode_ufvk_for_pool(&ufvk, &params, ShieldedPool::Orchard);
     let (_, stripped_container) = unified::Ufvk::decode(&stripped).expect("decode stripped");
     let items = stripped_container.items();
     assert!(
@@ -820,10 +823,64 @@ fn encode_ufvk_for_orchard_strips_sapling() {
         "Orchard-pool UFVK must retain orchard",
     );
 
-    let zkv_addr = encode_zkv_addr(&ufvk, &params, ShieldedProtocol::Orchard, 3_000_000).unwrap();
+    let zkv_addr = encode_zkv_addr(&ufvk, &params, ShieldedPool::Orchard, 3_000_000).unwrap();
     let parsed = parse_zkv_addr(&zkv_addr).expect("round-trip parses");
     assert_eq!(parsed.birthday, 3_000_000);
-    assert_eq!(parsed.pool, ShieldedProtocol::Orchard);
+    // An Orchard-receiver address resolves to Ironwood (shared receiver).
+    assert_eq!(parsed.pool, ShieldedPool::Ironwood);
+}
+
+/// Ironwood shares the Orchard receiver, so a wallet's Orchard and Ironwood
+/// framings are indistinguishable at the address / receiver / signing layer.
+/// This is what makes "import an old Orchard wallet as Ironwood" and
+/// "auto-upgrade to Ironwood on the first send" lossless: the zkv address, the
+/// funding UA, and the signing domain (which binds the receiver bytes, not the
+/// pool label) are all byte-identical, so every historical signature still
+/// verifies after the relabel and the reader sees the same memos.
+#[test]
+fn orchard_and_ironwood_are_receiver_identical() {
+    for (net, nt) in [
+        (consensus::Network::MainNetwork, NetworkType::Main),
+        (consensus::Network::TestNetwork, NetworkType::Test),
+    ] {
+        let ufvk = sample_ufvk(net, 0x5a);
+
+        // Same zkv address bytes under either framing.
+        let orchard_addr = encode_zkv_addr(&ufvk, &net, ShieldedPool::Orchard, 999).unwrap();
+        let ironwood_addr = encode_zkv_addr(&ufvk, &net, ShieldedPool::Ironwood, 999).unwrap();
+        assert_eq!(
+            orchard_addr, ironwood_addr,
+            "Orchard and Ironwood must encode to the identical zkv address"
+        );
+
+        // Same signing domain (the raw receiver bytes): a signature produced
+        // under the Orchard framing verifies under Ironwood and vice versa.
+        let dom_orchard = receiver_domain(&ufvk, ShieldedPool::Orchard, nt).unwrap();
+        let dom_ironwood = receiver_domain(&ufvk, ShieldedPool::Ironwood, nt).unwrap();
+        assert_eq!(
+            dom_orchard, dom_ironwood,
+            "receiver domain must not depend on the Orchard/Ironwood label"
+        );
+
+        // Same funding UA (an Orchard receiver in both).
+        let (ua_o, _) = ufvk
+            .default_address(ua_request_for_pool(ShieldedPool::Orchard))
+            .unwrap();
+        let (ua_i, _) = ufvk
+            .default_address(ua_request_for_pool(ShieldedPool::Ironwood))
+            .unwrap();
+        assert_eq!(ua_o.encode(&net), ua_i.encode(&net));
+
+        // Importing an Orchard-receiver address yields Ironwood where NU6.3 is
+        // available (testnet) and plain Orchard on mainnet; either way it reads
+        // the identical memos, since the receiver is the same.
+        let expected = if nt == NetworkType::Main {
+            ShieldedPool::Orchard
+        } else {
+            ShieldedPool::Ironwood
+        };
+        assert_eq!(parse_zkv_addr(&orchard_addr).unwrap().pool, expected);
+    }
 }
 
 #[test]
@@ -836,7 +893,7 @@ fn encode_ufvk_for_sapling_strips_orchard() {
         UnifiedSpendingKey::from_seed(&params, &seed, zip32::AccountId::ZERO).expect("derive USK");
     let ufvk = usk.to_unified_full_viewing_key();
 
-    let stripped = encode_ufvk_for_pool(&ufvk, &params, ShieldedProtocol::Sapling);
+    let stripped = encode_ufvk_for_pool(&ufvk, &params, ShieldedPool::Sapling);
     let (_, stripped_container) = unified::Ufvk::decode(&stripped).expect("decode stripped");
     let items = stripped_container.items();
     assert!(
@@ -854,10 +911,10 @@ fn encode_ufvk_for_sapling_strips_orchard() {
 
     // A Sapling-only zkv address parses, infers the Sapling pool, and
     // still derives the (transparent-based) signing pubkey.
-    let zkv_addr = encode_zkv_addr(&ufvk, &params, ShieldedProtocol::Sapling, 2_500_000).unwrap();
+    let zkv_addr = encode_zkv_addr(&ufvk, &params, ShieldedPool::Sapling, 2_500_000).unwrap();
     let parsed = parse_zkv_addr(&zkv_addr).expect("sapling address parses");
     assert_eq!(parsed.birthday, 2_500_000);
-    assert_eq!(parsed.pool, ShieldedProtocol::Sapling);
+    assert_eq!(parsed.pool, ShieldedPool::Sapling);
     zkv_verifying_pubkey(&parsed.ufvk).expect("sapling address still has a signing pubkey");
 }
 
@@ -872,7 +929,11 @@ fn funding_ua_never_includes_a_transparent_receiver() {
     let params = consensus::Network::TestNetwork;
     let ufvk = sample_ufvk(params, 0x42);
 
-    for pool in [ShieldedProtocol::Orchard, ShieldedProtocol::Sapling] {
+    for pool in [
+        ShieldedPool::Orchard,
+        ShieldedPool::Sapling,
+        ShieldedPool::Ironwood,
+    ] {
         let (ua, _) = ufvk
             .default_address(ua_request_for_pool(pool))
             .unwrap_or_else(|e| panic!("derive {pool:?} funding UA: {e}"));
@@ -887,11 +948,12 @@ fn funding_ua_never_includes_a_transparent_receiver() {
         // The matching shielded receiver IS present (sanity: we didn't
         // produce an empty/wrong-pool UA).
         match pool {
-            ShieldedProtocol::Orchard => assert!(
+            // Ironwood shares the Orchard receiver.
+            ShieldedPool::Orchard | ShieldedPool::Ironwood => assert!(
                 ua.orchard().is_some() && ua.sapling().is_none(),
-                "Orchard funding UA must carry only an orchard receiver",
+                "Orchard/Ironwood funding UA must carry only an orchard receiver",
             ),
-            ShieldedProtocol::Sapling => assert!(
+            ShieldedPool::Sapling => assert!(
                 ua.sapling().is_some() && ua.orchard().is_none(),
                 "Sapling funding UA must carry only a sapling receiver",
             ),

@@ -30,7 +30,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{Mutex, Semaphore};
 use tokio::task::JoinSet;
 
-use zcash_protocol::ShieldedProtocol;
+use zcash_protocol::ShieldedPool;
 
 use crate::{
     config::{Role, WalletConfig},
@@ -135,7 +135,8 @@ pub struct DbSummary {
     pub name: String,
     pub role: String,
     pub network: String,
-    /// Shielded pool this database lives in: `"sapling"` or `"orchard"`.
+    /// Shielded pool this database lives in: `"ironwood"`, `"sapling"`, or the
+    /// legacy `"orchard"` (Ironwood and Orchard share the Orchard receiver).
     pub pool: String,
     /// lightwalletd endpoint for this db's network. Resolved locally (no
     /// round-trip), so the status bar can show the clicked db's server the
@@ -210,7 +211,8 @@ pub struct DbDetail {
     pub name: String,
     pub role: String,
     pub network: String,
-    /// Shielded pool this database lives in: `"sapling"` or `"orchard"`.
+    /// Shielded pool this database lives in: `"ironwood"`, `"sapling"`, or the
+    /// legacy `"orchard"` (Ironwood and Orchard share the Orchard receiver).
     pub pool: String,
     /// lightwalletd endpoint for this db's network (e.g. `zec.rocks:443`).
     /// Resolved locally (no network round-trip), so the status bar can show
@@ -537,7 +539,8 @@ pub struct SignPreviewResp {
 pub struct ZkvAddrInfoResp {
     /// `"mainnet"` / `"testnet"` / `"regtest"`.
     pub network: String,
-    /// Shielded pool this database lives in: `"sapling"` or `"orchard"`.
+    /// Shielded pool this database lives in: `"ironwood"`, `"sapling"`, or the
+    /// legacy `"orchard"` (Ironwood and Orchard share the Orchard receiver).
     pub pool: String,
     /// The wallet birthday height encoded inside the address.
     pub birthday: u32,
@@ -647,6 +650,11 @@ impl Engine {
         // that console should carry only `tracing` log events. See
         // `ui::set_quiet`.
         crate::ui::set_quiet();
+        // For the same reason, forbid the reorg-recovery path from blocking on a
+        // `[y/N]` stdin prompt: a GUI launched from a terminal inherits its TTY,
+        // so the `is_terminal()` guard alone wouldn't stop a background auto-sync
+        // from hijacking stdin and hanging the app.
+        crate::internal::sync::set_interactive_prompts_enabled(false);
         let server_label = server_endpoint(&conn, Network::Main);
         Arc::new(Engine {
             conn,
@@ -1341,7 +1349,7 @@ impl Engine {
         &self,
         name: String,
         network: Network,
-        pool: ShieldedProtocol,
+        pool: ShieldedPool,
         phrase: Option<String>,
     ) -> Result<CreateResp, ZkvError> {
         let lock = self.db_lock(&name);
@@ -1516,7 +1524,7 @@ impl Engine {
         name: String,
         phrase: String,
         network: Network,
-        pool: ShieldedProtocol,
+        pool: ShieldedPool,
         birthday: Option<u32>,
     ) -> Result<AddDbResp, ZkvError> {
         // A bare phrase (no zkv address, no height) has no safe starting point:

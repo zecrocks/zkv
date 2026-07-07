@@ -16,7 +16,7 @@ use zcash_keys::keys::{ReceiverRequirement, UnifiedAddressRequest, UnifiedFullVi
 use zcash_protocol::{
     consensus::{self, NetworkType},
     memo::{Memo, MemoBytes},
-    ShieldedProtocol,
+    ShieldedPool,
 };
 
 mod address;

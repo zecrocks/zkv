@@ -10,7 +10,7 @@ pub struct ParsedZkvAddr {
     /// The shielded pool this database delivers memos in, inferred from which
     /// shielded component the published UFVK carries (Orchard if present, else
     /// Sapling).
-    pub pool: ShieldedProtocol,
+    pub pool: ShieldedPool,
 }
 
 /// Private-use unified typecode carrying zkv metadata: currently just the
@@ -87,7 +87,7 @@ pub(crate) fn relabel_hrp(src: &str, new_hrp: &str) -> anyhow::Result<String> {
 fn zkv_container<P: consensus::Parameters>(
     ufvk: &UnifiedFullViewingKey,
     params: &P,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     birthday: u32,
 ) -> anyhow::Result<(NetworkType, unified::Ufvk)> {
     let stripped = encode_ufvk_for_pool(ufvk, params, pool);
@@ -111,7 +111,7 @@ fn zkv_container<P: consensus::Parameters>(
 pub fn encode_zkv_addr<P: consensus::Parameters>(
     ufvk: &UnifiedFullViewingKey,
     params: &P,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
     birthday: u32,
 ) -> anyhow::Result<String> {
     let (net, with_meta) = zkv_container(ufvk, params, pool, birthday)?;
@@ -141,7 +141,7 @@ pub fn zkv_addr_to_uview(zkv_addr: &str) -> anyhow::Result<String> {
 pub fn encode_ufvk_for_pool<P: consensus::Parameters>(
     ufvk: &UnifiedFullViewingKey,
     params: &P,
-    pool: ShieldedProtocol,
+    pool: ShieldedPool,
 ) -> String {
     let full = ufvk.encode(params);
     let (network_type, container) =
@@ -150,9 +150,12 @@ pub fn encode_ufvk_for_pool<P: consensus::Parameters>(
         .items()
         .into_iter()
         .filter(|item| match pool {
-            // Keep the chosen pool; drop the other shielded item.
-            ShieldedProtocol::Orchard => !matches!(item, unified::Fvk::Sapling(_)),
-            ShieldedProtocol::Sapling => !matches!(item, unified::Fvk::Orchard(_)),
+            // Keep the chosen pool; drop the other shielded item. Ironwood shares
+            // the Orchard receiver, so it keeps the Orchard component.
+            ShieldedPool::Orchard | ShieldedPool::Ironwood => {
+                !matches!(item, unified::Fvk::Sapling(_))
+            }
+            ShieldedPool::Sapling => !matches!(item, unified::Fvk::Orchard(_)),
         })
         .collect();
     unified::Ufvk::try_from_items(items)
@@ -164,10 +167,11 @@ pub fn encode_ufvk_for_pool<P: consensus::Parameters>(
 /// receiver in that pool only (no transparent receiver; memo writes are
 /// shielded). zkv databases publish a one-pool UA, so the recipient address a
 /// writer/broadcaster pays is unambiguous.
-pub fn ua_request_for_pool(pool: ShieldedProtocol) -> UnifiedAddressRequest {
+pub fn ua_request_for_pool(pool: ShieldedPool) -> UnifiedAddressRequest {
     match pool {
-        ShieldedProtocol::Orchard => UnifiedAddressRequest::ORCHARD,
-        ShieldedProtocol::Sapling => UnifiedAddressRequest::unsafe_custom(
+        // Ironwood shares the Orchard receiver, so both publish an Orchard-only UA.
+        ShieldedPool::Orchard | ShieldedPool::Ironwood => UnifiedAddressRequest::ORCHARD,
+        ShieldedPool::Sapling => UnifiedAddressRequest::unsafe_custom(
             ReceiverRequirement::Omit,
             ReceiverRequirement::Require,
             ReceiverRequirement::Omit,
@@ -251,11 +255,21 @@ pub fn parse_zkv_addr(s: &str) -> anyhow::Result<ParsedZkvAddr> {
         );
     }
     // A zkv database lives in exactly one shielded pool. Infer it from the
-    // published UFVK: prefer Orchard when present, otherwise Sapling.
+    // published UFVK: an Orchard receiver means Ironwood on networks where NU6.3
+    // is available (testnet), or plain Orchard on mainnet (until NU6.3 activates
+    // there); otherwise Sapling. Ironwood and Orchard share the Orchard receiver
+    // and signing domain, so importing an Orchard address is lossless either
+    // way: history stays valid and the wallet's first send builds the right
+    // transaction version for the network.
+    let ironwood_ok = !matches!(network, NetworkType::Main);
     let pool = if ufvk.orchard().is_some() {
-        ShieldedProtocol::Orchard
+        if ironwood_ok {
+            ShieldedPool::Ironwood
+        } else {
+            ShieldedPool::Orchard
+        }
     } else if ufvk.sapling().is_some() {
-        ShieldedProtocol::Sapling
+        ShieldedPool::Sapling
     } else {
         bail!(
             "this zkv address has no shielded pool (Sapling or Orchard), so it can't \

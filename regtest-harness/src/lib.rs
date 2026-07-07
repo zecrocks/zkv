@@ -24,6 +24,7 @@
 //! adapted from zecd's regtest harness, which pioneered this
 //! Zcash-Foundation-standard stack (zebra `generate` RPC, no zingo-infra).
 
+use std::io::Write;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
@@ -57,6 +58,26 @@ pub fn resolve_bin(env_var: &str) -> Option<PathBuf> {
 /// Must match `zkv`'s `network::Network::Regtest` activation heights
 /// (`crates/zkv/src/network.rs`).
 const NU6_2_ACTIVATION_HEIGHT: u32 = 4;
+/// Height at which NU6.3 (Ironwood) activates on our regtest chain, emitted into
+/// zebrad's config only for the Ironwood tier (see [`nu6_3_height`]). **Must**
+/// match `zkv`'s `network::REGTEST_NU6_3_HEIGHT` and the devtool funder's
+/// `--activation-heights`, or NU6.3 consensus diverges. A few blocks after
+/// NU6.2, mirroring how NU6.2 trails NU6.
+const NU6_3_ACTIVATION_HEIGHT: u32 = 8;
+
+/// The NU6.3 (Ironwood) regtest activation height, or `None` for a pre-Ironwood
+/// (stock zebra) run. Enabled by setting `ZKV_REGTEST_NU6_3=1` (the CI Ironwood
+/// tier does this). Opt-in because stock zebra rejects the unknown `"NU6.3"`
+/// activation-height key at startup, so it can only be emitted against an
+/// Ironwood-capable zebra (e.g. `zfnd/zebra:6.0.0-rc.0`). An Ironwood zkv build
+/// always activates NU6.3 at this height on regtest, so it agrees with the chain
+/// only when this is enabled.
+fn nu6_3_height() -> Option<u32> {
+    match std::env::var("ZKV_REGTEST_NU6_3") {
+        Ok(v) if !v.is_empty() && v != "0" => Some(NU6_3_ACTIVATION_HEIGHT),
+        _ => None,
+    }
+}
 /// ZIP-271 one-time lockbox disbursement paid in the NU6.1 activation block's
 /// coinbase. A P2SH regtest address and a token amount (<= the pool accrued by
 /// [`NU6_2_ACTIVATION_HEIGHT`]).
@@ -270,6 +291,12 @@ fn zebrad_toml(net_port: u16, rpc_port: u16, miner_address: &str, cache_dir: &st
     let nu6_2 = NU6_2_ACTIVATION_HEIGHT;
     let lockbox_addr = LOCKBOX_DISBURSEMENT_ADDR;
     let lockbox_amount = LOCKBOX_DISBURSEMENT_ZATS;
+    // Ironwood tier only: stock zebra rejects the unknown "NU6.3" key at startup,
+    // so emit it solely when running against an Ironwood-capable zebra.
+    let nu6_3_line = match nu6_3_height() {
+        Some(h) => format!("\n\"NU6.3\" = {h}"),
+        None => String::new(),
+    };
     format!(
         r#"[network]
 network = "Regtest"
@@ -289,7 +316,7 @@ disable_pow = true
 NU5 = 1
 NU6 = 1
 "NU6.1" = {nu6_2}
-"NU6.2" = {nu6_2}
+"NU6.2" = {nu6_2}{nu6_3_line}
 
 # A deferred (lockbox) funding stream so the pool has something to disburse at NU6.1.
 [[network.testnet_parameters.funding_streams]]
@@ -470,11 +497,10 @@ impl Funder {
             .ok_or_else(|| anyhow!("no Transparent Address in derive-address output:\n{out}"))
     }
 
-    /// Initialise the funding wallet against a lightwalletd. Non-interactive
-    /// via `--mnemonic`; `--birthday 2` is the lowest height with a tree state
-    /// (init fetches `GetTreeState(birthday-1)`, which needs a real block;
-    /// birthday 0/1 requests genesis and is rejected). The funder's
-    /// transparent coinbase is detected regardless of birthday.
+    /// Initialise the funding wallet against a lightwalletd. `--birthday 2` is
+    /// the lowest height with a tree state (init fetches `GetTreeState(birthday-1)`,
+    /// which needs a real block; birthday 0/1 requests genesis and is rejected).
+    /// The funder's transparent coinbase is detected regardless of birthday.
     pub fn init(bin: &Path, lwd_port: u16) -> Result<Funder> {
         let dir = tempfile::tempdir().context("create funder dir")?;
         let funder = Funder {
@@ -482,23 +508,56 @@ impl Funder {
             dir,
         };
         let identity = funder.identity();
-        funder.run(
-            "init",
-            &[
-                "--name",
-                "funder",
-                "--network",
-                "regtest",
-                "--identity",
-                &identity,
-                "--mnemonic",
-                FUNDER_MNEMONIC,
-                "--birthday",
-                "2",
-            ],
-            Some(lwd_port),
-        )?;
+        let mut args: Vec<String> = vec![
+            "--name".into(),
+            "funder".into(),
+            "--network".into(),
+            "regtest".into(),
+            "--identity".into(),
+            identity,
+            "--birthday".into(),
+            "2".into(),
+        ];
+        // Two devtool generations differ in how `wallet init` takes the seed and
+        // the regtest activation heights, so gate both on the Ironwood-tier
+        // marker (see `nu6_3_height`):
+        //   - Ironwood devtool: `wallet init` no longer accepts `--mnemonic`; it
+        //     reads the phrase from stdin when stdin is not a terminal. It also
+        //     *requires* `--activation-heights` for `-n regtest` (rejecting it
+        //     otherwise); the heights must match the zebrad config and zkv's
+        //     `network::Network::Regtest` exactly, or NU6.3 consensus diverges.
+        //   - Stock (pre-Ironwood) devtool: takes `--mnemonic` and has no
+        //     `--activation-heights` flag.
+        let stdin = if nu6_3_height().is_some() {
+            let path = funder.write_activation_heights()?;
+            args.push("--activation-heights".into());
+            args.push(path);
+            Some(format!("{FUNDER_MNEMONIC}\n"))
+        } else {
+            args.push("--mnemonic".into());
+            args.push(FUNDER_MNEMONIC.into());
+            None
+        };
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        funder.run_with_stdin("init", &arg_refs, Some(lwd_port), stdin.as_deref())?;
         Ok(funder)
+    }
+
+    /// Write the regtest activation-heights TOML the Ironwood devtool's
+    /// `wallet init --activation-heights <file>` consumes (the
+    /// `ActivationHeights` schema: one optional height per upgrade). Must match
+    /// the zebrad config ([`zebrad_toml`]) and zkv's `network::Network::Regtest`
+    /// heights, or the funder's transactions carry the wrong consensus branch id.
+    fn write_activation_heights(&self) -> Result<String> {
+        let path = self.dir.path().join("activation-heights.toml");
+        let nu6_2 = NU6_2_ACTIVATION_HEIGHT;
+        let nu6_3 = NU6_3_ACTIVATION_HEIGHT;
+        let toml = format!(
+            "overwinter = 1\nsapling = 1\nblossom = 1\nheartwood = 1\ncanopy = 1\n\
+             nu5 = 1\nnu6 = 1\nnu6_1 = {nu6_2}\nnu6_2 = {nu6_2}\nnu6_3 = {nu6_3}\n"
+        );
+        std::fs::write(&path, toml).context("write activation-heights.toml")?;
+        Ok(path.to_string_lossy().into_owned())
     }
 
     fn identity(&self) -> String {
@@ -546,6 +605,19 @@ impl Funder {
 
     /// Run `zcash-devtool wallet -w <dir> <subcommand> <extra...> [--server .. --connection direct]`.
     fn run(&self, subcommand: &str, extra: &[&str], lwd_port: Option<u16>) -> Result<String> {
+        self.run_with_stdin(subcommand, extra, lwd_port, None)
+    }
+
+    /// Like [`Funder::run`], but optionally pipes `stdin_input` to the child's
+    /// stdin. The Ironwood devtool's `wallet init` reads its mnemonic from
+    /// stdin (it no longer takes `--mnemonic`).
+    fn run_with_stdin(
+        &self,
+        subcommand: &str,
+        extra: &[&str],
+        lwd_port: Option<u16>,
+        stdin_input: Option<&str>,
+    ) -> Result<String> {
         let mut args: Vec<String> = vec![
             "wallet".into(),
             "-w".into(),
@@ -561,10 +633,28 @@ impl Funder {
                 "direct".into(),
             ]);
         }
-        let output = Command::new(&self.bin)
-            .args(&args)
-            .output()
-            .with_context(|| format!("spawn devtool {subcommand}"))?;
+        let mut cmd = Command::new(&self.bin);
+        cmd.args(&args);
+        let output = if let Some(input) = stdin_input {
+            cmd.stdin(Stdio::piped());
+            cmd.stdout(Stdio::piped());
+            cmd.stderr(Stdio::piped());
+            let mut child = cmd
+                .spawn()
+                .with_context(|| format!("spawn devtool {subcommand}"))?;
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(input.as_bytes())
+                .with_context(|| format!("write stdin to devtool {subcommand}"))?;
+            child
+                .wait_with_output()
+                .with_context(|| format!("wait for devtool {subcommand}"))?
+        } else {
+            cmd.output()
+                .with_context(|| format!("spawn devtool {subcommand}"))?
+        };
         if !output.status.success() {
             bail!(
                 "devtool {subcommand} failed ({}):\nstdout: {}\nstderr: {}",

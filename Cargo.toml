@@ -60,13 +60,63 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "json"] }
 
 # Zcash ecosystem: version-locked as a set.
-transparent = { package = "zcash_transparent", version = "0.8" }
-zcash_address = "0.12"
-zcash_note_encryption = "0.4"
+#
+# Ironwood (NU6.3 / V6 transaction) support. The consensus-layer crates are
+# bumped to their librustzcash Ironwood `-pre` releases; the higher-level wallet
+# crates (zcash_client_backend, zcash_client_sqlite) keep their crates.io version
+# numbers but must be rebuilt against the `-pre` lower crates, so the whole set is
+# repointed at the zecrocks librustzcash `ironwood-scan-model` branch via
+# [patch.crates-io] below (mirroring zecrocks/zcash-devtool@ironwood-valar).
+transparent = { package = "zcash_transparent", version = "0.9.0-pre.0" }
+zcash_address = "0.13.0-pre.0"
+zcash_note_encryption = "0.4.1"
 zcash_client_backend = { version = "0.23", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt"] }
 zcash_client_sqlite = { version = "0.21", features = ["unstable", "orchard", "serde"] }
-zcash_keys = { version = "0.14", features = ["orchard", "unstable"] }
-zcash_primitives = "0.28"
-zcash_protocol = { version = "0.9", features = ["local-consensus"] }
+zcash_keys = { version = "0.15.0-pre.0", features = ["orchard", "unstable"] }
+zcash_primitives = "0.29.0-pre.0"
+zcash_protocol = { version = "0.10.0-pre.0", features = ["local-consensus"] }
 zip32 = "0.2"
 zip321 = "0.8"
+
+# Ironwood (NU6.3 / V6 transaction) support: repoint every librustzcash crate we
+# depend on (directly or transitively) to the zecrocks librustzcash fork's
+# `ironwood-scan-model` branch. The higher-level crates (zcash_client_backend,
+# zcash_client_sqlite, pczt, zip321) keep their crates.io version numbers but
+# depend on the `-pre` lower crates, so the crates.io releases can't be used
+# directly: a git source is required. `rev afd1f1fb` is the current head of that
+# branch, which extends the upstream ironwood line (Ironwood *send* +
+# *receive* wiring) with the full **Ironwood scan model**: selecting and
+# spending received Ironwood notes, counting them in the account balance, the
+# Orchard-turnstile enforcement, and V6-PCZT construction for Ironwood targets.
+# zkv both writes and reads memos in the Orchard/Ironwood pool, so this fuller
+# wallet support is what lets a post-NU6.3 database spend its own notes and see
+# its own V6 writes. Patches must live in the workspace root to take effect.
+# Follows zecrocks/zcash-devtool@ironwood-valar.
+#
+# The branch depends on `orchard 0.15.0-pre.2` (published on crates.io, so it is
+# NOT patched here; our direct dependency in crates/zkv is bumped to match) and
+# on an unreleased `shardtree`/`incrementalmerkletree` (explicit checkpoint
+# retention, zcash/incrementalmerkletree `decefc46`). A `[patch]` only takes
+# effect from the workspace root, so we must mirror that incrementalmerkletree
+# patch here or the branch's crates won't resolve against a compatible shardtree.
+[patch.crates-io]
+equihash = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+f4jumble = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+zcash_address = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+zcash_encoding = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+zcash_protocol = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+zip321 = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+pczt = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+zcash_keys = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+zcash_client_backend = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+zcash_client_sqlite = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+zcash_primitives = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+zcash_proofs = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+zcash_transparent = { git = "https://github.com/zecrocks/librustzcash", rev = "afd1f1fbe48fdd5fd5f9bc96dfb22a7c05e889a3" }
+
+# The scan-model branch needs unreleased checkpoint-retention APIs; mirror its
+# incrementalmerkletree patch (zcash/incrementalmerkletree main, includes #184).
+shardtree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
+incrementalmerkletree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "decefc469dbf1e686b20b7e7dcaa7cb4f122125b" }
+# incrementalmerkletree-testing is a dev-only dep the branch patches for its own
+# tests; it is not in zkv's crate graph, so patching it here is unused. Omitted.

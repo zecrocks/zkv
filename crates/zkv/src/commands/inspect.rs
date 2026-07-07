@@ -1,6 +1,6 @@
 use clap::{Args, ValueEnum};
 use serde::Serialize;
-use zcash_protocol::{consensus::NetworkType, ShieldedProtocol};
+use zcash_protocol::{consensus::NetworkType, ShieldedPool};
 
 use crate::internal::protocol::{
     network_from_type, parse_zkv_addr, pubkey_bech32, receiver_domain, ua_request_for_pool,
@@ -90,10 +90,11 @@ fn network_label(net: NetworkType) -> &'static str {
     }
 }
 
-fn pool_label(pool: ShieldedProtocol) -> &'static str {
+fn pool_label(pool: ShieldedPool) -> &'static str {
     match pool {
-        ShieldedProtocol::Orchard => "orchard",
-        ShieldedProtocol::Sapling => "sapling",
+        ShieldedPool::Orchard => "orchard",
+        ShieldedPool::Sapling => "sapling",
+        ShieldedPool::Ironwood => "ironwood",
     }
 }
 
@@ -145,11 +146,7 @@ mod tests {
 
     use crate::internal::protocol::encode_zkv_addr;
 
-    fn sample_addr<P: consensus::Parameters>(
-        net: P,
-        pool: ShieldedProtocol,
-        birthday: u32,
-    ) -> String {
+    fn sample_addr<P: consensus::Parameters>(net: P, pool: ShieldedPool, birthday: u32) -> String {
         let ufvk = UnifiedSpendingKey::from_seed(&net, &[0x42; 32], zip32::AccountId::ZERO)
             .expect("derive USK")
             .to_unified_full_viewing_key();
@@ -160,14 +157,16 @@ mod tests {
     fn describes_a_testnet_orchard_address() {
         let addr = sample_addr(
             consensus::Network::TestNetwork,
-            ShieldedProtocol::Orchard,
+            ShieldedPool::Orchard,
             1_234_567,
         );
         let info = describe(&addr).expect("describe");
 
         assert_eq!(info.zkv_address, addr);
         assert_eq!(info.network, "testnet");
-        assert_eq!(info.pool, "orchard");
+        // An Orchard-receiver address resolves to Ironwood (shared receiver):
+        // this is the "old Orchard wallet imports as Ironwood" behavior.
+        assert_eq!(info.pool, "ironwood");
         assert_eq!(info.birthday, 1_234_567);
         // The fields derived from the viewing key are populated and well-formed.
         assert!(
@@ -186,7 +185,7 @@ mod tests {
     fn pool_is_inferred_from_the_published_key() {
         let addr = sample_addr(
             consensus::Network::MainNetwork,
-            ShieldedProtocol::Sapling,
+            ShieldedPool::Sapling,
             900_000,
         );
         let info = describe(&addr).expect("describe");
@@ -200,11 +199,13 @@ mod tests {
     fn describes_a_regtest_address() {
         // The regtest HRP family (`zkvregtest1...`) round-trips offline just
         // like the public networks; the regtest e2e harness relies on this.
-        let addr = sample_addr(crate::data::Network::Regtest, ShieldedProtocol::Orchard, 42);
+        let addr = sample_addr(crate::data::Network::Regtest, ShieldedPool::Orchard, 42);
         assert!(addr.starts_with("zkvregtest1"), "{addr}");
         let info = describe(&addr).expect("describe");
         assert_eq!(info.network, "regtest");
-        assert_eq!(info.pool, "orchard");
+        // Ironwood is available on regtest (a testnet-flavored local chain), so
+        // an Orchard-receiver address resolves to Ironwood there.
+        assert_eq!(info.pool, "ironwood");
         assert_eq!(info.birthday, 42);
         assert!(
             info.signing_key.starts_with("zkvid1"),

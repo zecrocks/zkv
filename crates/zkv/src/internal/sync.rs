@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
 use futures_util::{StreamExt, TryStreamExt};
@@ -523,6 +523,35 @@ fn needs_recovery(e: &anyhow::Error) -> bool {
     msg.contains("no such table: scan_queue")
 }
 
+/// Whether the reorg/corruption recovery path may block on an interactive
+/// stdin `[y/N]` prompt. On (the default) for the `zkv` CLI, where a foreground
+/// command owns the terminal. The GUI turns it OFF (`Engine::new` calls
+/// [`set_interactive_prompts_enabled`]`(false)`): a GUI process can inherit the
+/// launching shell's TTY (e.g. `zkv gui` run from a terminal), so an
+/// `is_terminal()` check alone would let a background auto-sync steal stdin and
+/// hang the app behind a prompt nobody can answer.
+static INTERACTIVE_PROMPTS: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable interactive recovery prompts process-wide. See the
+/// `INTERACTIVE_PROMPTS` static. The GUI disables them at startup.
+pub fn set_interactive_prompts_enabled(enabled: bool) {
+    INTERACTIVE_PROMPTS.store(enabled, Ordering::Relaxed);
+}
+
+/// Databases already auto-wiped this process (GUI self-heal). Bounds the
+/// non-interactive recovery to one wipe per database so a persistent reorg
+/// can't drive an endless wipe/rescan loop.
+static AUTO_WIPED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
+
+/// Record an auto-wipe for `db_name`; returns true the first time this process
+/// wipes it (wipe allowed), false on every subsequent unrecoverable failure.
+fn auto_wipe_first_time(db_name: &str) -> bool {
+    AUTO_WIPED
+        .lock()
+        .map(|mut wiped| wiped.insert(db_name.to_owned()))
+        .unwrap_or(false)
+}
+
 fn prompt_for_wipe(db_name: &str, err: &anyhow::Error) -> anyhow::Result<bool> {
     use std::io::{stderr, stdin, BufRead, IsTerminal, Write};
     eprintln!();
@@ -543,11 +572,40 @@ fn prompt_for_wipe(db_name: &str, err: &anyhow::Error) -> anyhow::Result<bool> {
         );
         return Ok(false);
     }
+    // GUI mode disables interactive prompts (a background auto-sync must never
+    // block on a `[y/N]` stdin read; the GUI can also inherit the launching
+    // shell's TTY, so `is_terminal()` alone wouldn't stop it). There the
+    // recovery self-heals: the wiped sidecars (data.sqlite, block cache,
+    // snapshot) are all re-derivable from the seed/UFVK and the chain, so a
+    // wipe+resync is safe and the app recovers on its own. Bound it to ONE
+    // auto-wipe per database per process, though: if a reorg keeps recurring, a
+    // second wipe would just loop on a full rescan, so surface the error and let
+    // the user intervene instead.
+    if !INTERACTIVE_PROMPTS.load(Ordering::Relaxed) {
+        if auto_wipe_first_time(db_name) {
+            tracing::warn!(
+                db = db_name,
+                "unrecoverable reorg / corrupt sidecar: auto-wiping and resyncing from the chain \
+                 (one-time self-heal)"
+            );
+            return Ok(true);
+        }
+        tracing::warn!(
+            db = db_name,
+            "unrecoverable reorg / corrupt sidecar persists after a one-time auto-wipe; not wiping \
+             again to avoid a rescan loop. Resync manually by deleting data.sqlite, \
+             blockmeta.sqlite, blocks/, and zkv_state.sqlite under the database directory."
+        );
+        return Ok(false);
+    }
+    // CLI with a non-TTY stdin (piped): can't confirm, and the user didn't opt
+    // into auto-wipe, so refuse rather than destroy local state unprompted.
     if !stdin().is_terminal() {
         eprintln!(
-            "stdin is not a TTY; refusing to auto-wipe. Re-run interactively to confirm, or \
-             manually delete the sidecar files (data.sqlite, blockmeta.sqlite, blocks/, \
-             zkv_state.sqlite) under the database directory."
+            "Refusing to auto-wipe without an interactive confirmation. Re-run the affected \
+             database from an interactive `zkv` CLI to confirm, or manually delete the sidecar \
+             files (data.sqlite, blockmeta.sqlite, blocks/, zkv_state.sqlite) under the database \
+             directory to force a fresh resync."
         );
         return Ok(false);
     }
@@ -967,6 +1025,10 @@ fn find_shallow_rewind_target(
         db_data_path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    // Read-only, so we can't set the journal mode (the file is already WAL from
+    // the read/write opens); just wait rather than fail if a writer holds the
+    // lock momentarily.
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
     let h: Option<u32> = conn
         .query_row(
             "SELECT MAX(blocks.height) FROM blocks
@@ -1112,6 +1174,15 @@ async fn refresh_utxos<P: Parameters>(
                     Script(script::Code(reply.script)),
                 ),
                 Some(BlockHeight::from(u32::try_from(reply.height)?)),
+                // recipient_account / recipient_key_scope / funding_account (added in
+                // the Ironwood RC): account-attribution metadata we don't have for a
+                // UTXO discovered via lightwalletd's GetAddressUtxos. The sqlite layer
+                // resolves the owning account by looking the recipient address up in
+                // the `addresses` table (put_transparent_output), so None here
+                // preserves the prior behavior.
+                None,
+                None,
+                None,
             )
             .ok_or(anyhow!("non-standard UTXO"))
         })

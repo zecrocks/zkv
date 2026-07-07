@@ -386,7 +386,7 @@ pub fn init_dbs<P: Parameters + 'static>(
     ensure_db_dir(name)?;
     let (db_cache, db_data) = get_db_paths(name)?;
     let mut db_cache = FsBlockDb::for_path(db_cache).map_err(error::Error::from)?;
-    let mut db_data = WalletDb::for_path(db_data, params, SystemClock, OsRng)?;
+    let mut db_data = open_wallet_conn(db_data, params)?;
     init_blockmeta_db(&mut db_cache)?;
     init_wallet_db(&mut db_data, None)?;
     Ok(db_data)
@@ -413,9 +413,74 @@ pub fn open_wallet_db<P: Parameters + 'static>(
     path: impl AsRef<Path>,
     params: P,
 ) -> anyhow::Result<WalletDb<rusqlite::Connection, P, SystemClock, OsRng>> {
-    let mut db_data = WalletDb::for_path(path, params, SystemClock, OsRng)?;
+    let path = path.as_ref();
+    let mut db_data = open_wallet_conn(path, params)?;
     init_wallet_db(&mut db_data, None)?;
+    ensure_ironwood_retained_checkpoints(path)?;
     Ok(db_data)
+}
+
+/// Create the `ironwood_tree_retained_checkpoints` table if the migration set
+/// didn't.
+///
+/// The zecrocks ironwood-scan-model migration `ironwood_shardtree` creates the
+/// Ironwood note-commitment-tree's `ironwood_tree_{shards,cap,checkpoints,
+/// checkpoint_marks_removed}` tables but omits `ironwood_tree_retained_checkpoints`,
+/// even though Sapling and Orchard both get theirs from the older
+/// `tree_retained_checkpoints` migration. The Ironwood `SqliteShardStore` writes
+/// to that table whenever it persists a *retained* checkpoint, so its absence
+/// makes the scan fail (`PutBlocksCommitmentTree { pool: Ironwood, .. no such
+/// table: ironwood_tree_retained_checkpoints }`) once a checkpoint is retained,
+/// which strands any Ironwood/NU6.3 database shortly after INIT.
+///
+/// Run after `init_wallet_db` (so if a future upstream migration adds the table,
+/// this becomes a no-op) with the same trivial schema as the Orchard/Sapling
+/// variants. Remove once the upstream migration creates it. Uses its own
+/// short-lived connection with the standard pragmas.
+fn ensure_ironwood_retained_checkpoints(path: &Path) -> anyhow::Result<()> {
+    let conn = rusqlite::Connection::open(path)?;
+    configure_sqlite(&conn)?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS ironwood_tree_retained_checkpoints (
+             checkpoint_id INTEGER PRIMARY KEY
+         );",
+    )?;
+    Ok(())
+}
+
+/// Apply the SQLite pragmas zkv relies on for concurrent access to a
+/// `data.sqlite`. Used for every handle onto the file: the [`WalletDb`]
+/// connection and the short-lived read-path connections
+/// ([`crate::internal::state`] / funding / sync).
+///
+/// - **`busy_timeout`**: the GUI syncs one database (a commitment-tree write)
+///   while its UI reads another, and the read paths open their own connections,
+///   so a writer and a reader briefly contend on the same file. Without a busy
+///   timeout SQLite returns `SQLITE_BUSY` ("database is locked") *immediately*
+///   instead of waiting; a few-second timeout lets the contending side retry
+///   transparently rather than failing the whole sync.
+/// - **WAL journal mode**: lets readers proceed while a write is in flight (the
+///   common GUI pattern), which plain rollback journaling does not. WAL is a
+///   persistent per-file property, so once set every later connection uses it.
+pub(crate) fn configure_sqlite(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(std::time::Duration::from_secs(30))?;
+    // `execute_batch` (sqlite3_exec) ignores the row `PRAGMA journal_mode`
+    // returns, unlike `pragma_update`.
+    conn.execute_batch("PRAGMA journal_mode=WAL;")?;
+    Ok(())
+}
+
+/// Open a `data.sqlite` [`WalletDb`] on a connection pre-configured by
+/// [`configure_sqlite`]. Mirrors `WalletDb::for_path` (open + load the `array`
+/// vtab module) but lets us set the pragmas first, via `from_connection`.
+fn open_wallet_conn<P: Parameters + 'static>(
+    path: impl AsRef<Path>,
+    params: P,
+) -> anyhow::Result<WalletDb<rusqlite::Connection, P, SystemClock, OsRng>> {
+    let conn = rusqlite::Connection::open(path)?;
+    configure_sqlite(&conn)?;
+    rusqlite::vtab::array::load_module(&conn)?;
+    Ok(WalletDb::from_connection(conn, params, SystemClock, OsRng))
 }
 
 #[cfg(test)]

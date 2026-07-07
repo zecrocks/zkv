@@ -16,7 +16,7 @@ use zcash_client_backend::proto::service::{
 };
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::TxId;
-use zcash_protocol::{consensus::BlockHeight, ShieldedProtocol};
+use zcash_protocol::{consensus::BlockHeight, ShieldedPool};
 
 use super::{decrypt, validate, ShallowError, CHUNK};
 use crate::internal::sync;
@@ -55,7 +55,7 @@ pub trait ChainSource {
 pub struct GrpcSource {
     pub(crate) client: CompactTxStreamerClient<Channel>,
     pub(crate) network: crate::network::Network,
-    pub(crate) pool: ShieldedProtocol,
+    pub(crate) pool: ShieldedPool,
     pub(crate) ufvk: UnifiedFullViewingKey,
     pub(crate) ivk: decrypt::PreparedIvk,
 }

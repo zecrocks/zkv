@@ -52,7 +52,9 @@ async fn regtest_unfunded_surface() {
     // network, pool, birthday, and the creator's signing key from the string.
     let info = zkv.inspect_json(&addr).expect("inspect");
     assert_eq!(info["network"], "regtest");
-    assert_eq!(info["pool"], "orchard");
+    // Regtest is testnet-flavored, so the default pool is Ironwood (see
+    // `config::default_pool_for_network`); `create_db` passes no `--pool`.
+    assert_eq!(info["pool"], "ironwood");
     let birthday = info["birthday"].as_u64().expect("birthday");
     assert!(
         birthday >= 1 && birthday <= u64::from(INITIAL_BLOCKS),
