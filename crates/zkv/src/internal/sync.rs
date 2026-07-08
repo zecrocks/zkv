@@ -34,8 +34,10 @@ use zcash_client_backend::{
     },
 };
 use zcash_client_sqlite::{
-    chain::BlockMeta, error::SqliteClientError, util::SystemClock, FsBlockDb, FsBlockDbError,
-    WalletDb,
+    chain::{init::init_blockmeta_db, BlockMeta},
+    error::SqliteClientError,
+    util::SystemClock,
+    FsBlockDb, FsBlockDbError, WalletDb,
 };
 use zcash_keys::encoding::AddressCodec;
 use zcash_primitives::{
@@ -630,6 +632,14 @@ async fn run_sync_inner(
     let (fsblockdb_root, db_data_path) = get_db_paths(db_name)?;
     let fsblockdb_root = fsblockdb_root.as_path();
     let mut db_cache = FsBlockDb::for_path(fsblockdb_root).map_err(error::Error::from)?;
+    // `for_path` opens (creating an empty file if absent) but does not create the
+    // `compactblocks_meta` schema; only `data::init_dbs` does, at database
+    // creation. So a block cache that was pruned or deleted from an existing
+    // database (documented as safe: it rebuilds on next sync) would otherwise
+    // fail here with "no such table: compactblocks_meta". The migrator is
+    // idempotent, so running it every sync is cheap and makes the cache
+    // self-healing.
+    init_blockmeta_db(&mut db_cache).map_err(|e| anyhow!("init block cache schema: {e:?}"))?;
     let mut db_data = open_wallet_db(&db_data_path, params)?;
     let mut client = conn.connect(params).await?;
 
