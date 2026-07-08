@@ -416,36 +416,7 @@ pub fn open_wallet_db<P: Parameters + 'static>(
     let path = path.as_ref();
     let mut db_data = open_wallet_conn(path, params)?;
     init_wallet_db(&mut db_data, None)?;
-    ensure_ironwood_retained_checkpoints(path)?;
     Ok(db_data)
-}
-
-/// Create the `ironwood_tree_retained_checkpoints` table if the migration set
-/// didn't.
-///
-/// The zecrocks ironwood-scan-model migration `ironwood_shardtree` creates the
-/// Ironwood note-commitment-tree's `ironwood_tree_{shards,cap,checkpoints,
-/// checkpoint_marks_removed}` tables but omits `ironwood_tree_retained_checkpoints`,
-/// even though Sapling and Orchard both get theirs from the older
-/// `tree_retained_checkpoints` migration. The Ironwood `SqliteShardStore` writes
-/// to that table whenever it persists a *retained* checkpoint, so its absence
-/// makes the scan fail (`PutBlocksCommitmentTree { pool: Ironwood, .. no such
-/// table: ironwood_tree_retained_checkpoints }`) once a checkpoint is retained,
-/// which strands any Ironwood/NU6.3 database shortly after INIT.
-///
-/// Run after `init_wallet_db` (so if a future upstream migration adds the table,
-/// this becomes a no-op) with the same trivial schema as the Orchard/Sapling
-/// variants. Remove once the upstream migration creates it. Uses its own
-/// short-lived connection with the standard pragmas.
-fn ensure_ironwood_retained_checkpoints(path: &Path) -> anyhow::Result<()> {
-    let conn = rusqlite::Connection::open(path)?;
-    configure_sqlite(&conn)?;
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS ironwood_tree_retained_checkpoints (
-             checkpoint_id INTEGER PRIMARY KEY
-         );",
-    )?;
-    Ok(())
 }
 
 /// Apply the SQLite pragmas zkv relies on for concurrent access to a

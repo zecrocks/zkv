@@ -173,6 +173,21 @@ async fn regtest_kv_lifecycle() {
     zebrad.generate_blocks(CONFIRM_BLOCKS).await.expect("mine");
     wait_for_value(&zkv, DB, "greeting", Some("hello")).await;
 
+    // Regression guard for the Ironwood self-send memo. A zkv write is a shielded
+    // payment to the database's OWN address, so the writer reads its value back
+    // from its own *received* note. Compact-block scanning stores that note with a
+    // NULL memo; librustzcash's `backfill_self_send_memos` pass fills it in
+    // post-scan from the stored raw transaction. The read path no longer carries a
+    // `sent_notes` fallback (that band-aid was removed once the received note
+    // became authoritative), so a regression in that backfill would surface here
+    // as a NULL memo and this read would return None.
+    assert_eq!(
+        zkv.get(DB, "greeting", 1).expect("read own greeting"),
+        Some("hello".to_owned()),
+        "writer must read its own Ironwood self-send memo back from the received note, \
+         not a sent_notes fallback"
+    );
+
     // SET (overwrite): last-write-wins, and the second write must carry a
     // nonzero replay-protection sequence on the wire (asserted in Phase 4).
     zkv.set(DB, "greeting", "world")

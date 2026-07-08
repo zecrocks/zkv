@@ -60,5 +60,7 @@ unknown-git = "deny"
 # come back out. See the workspace Cargo.toml comment.
 allow-git = [
     "https://github.com/zecrocks/librustzcash",
-    "https://github.com/zcash/incrementalmerkletree",
+    # zecrocks fork of zcash/incrementalmerkletree: upstream decefc46 plus the
+    # shardtree clear_flags checkpoint-pruning panic fix (see workspace Cargo.toml).
+    "https://github.com/zecrocks/incrementalmerkletree",
 ]

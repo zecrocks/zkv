@@ -12,7 +12,7 @@ use zcash_client_backend::{
     data_api::{
         wallet::{
             create_proposed_transactions,
-            input_selection::{GreedyInputSelector, TransparentSpendPolicy},
+            input_selection::{GreedyInputSelector, SpendPolicy},
             propose_transfer, ConfirmationsPolicy, SpendingKeys,
         },
         Account, WalletRead,
@@ -313,12 +313,13 @@ pub async fn pay(
         &change_strategy,
         request,
         ConfirmationsPolicy::default(),
-        // spend_policy (added in the Ironwood RC, transparent-inputs feature):
-        // ShieldedOnly (the library default). zkv's funding UA is shielded-only
+        // spend_policy (Ironwood RC, transparent-inputs feature): the library
+        // default is shielded-only (every shielded pool in the build, no
+        // transparent UTXOs). zkv's funding UA is shielded-only
         // (ua_request_for_pool omits the transparent receiver), so writes are
         // funded by and spent from shielded notes; there are no transparent
         // inputs to select.
-        &TransparentSpendPolicy::default(),
+        &SpendPolicy::default(),
         // proposed_version (unstable feature): let the wallet pick the tx version
         // for the target height (Ironwood/V6 past NU6.3).
         None,

@@ -92,27 +92,15 @@ fn scan_memos_past_watermark(
     watermark: &snapshot::Watermark,
     pool: ShieldedPool,
 ) -> anyhow::Result<Vec<DecodedRow>> {
-    // Ironwood self-send memo recovery: the Orchard->Ironwood auto-upgrade
-    // records the wallet's own memo output in `sent_notes` under the Orchard
-    // receiver's pool code (3) while the on-chain note is scanned as Ironwood
-    // (pool 4). `v_tx_outputs` joins received notes to `sent_notes` on matching
-    // pool code, so the pool-4 received note is left with a NULL memo even
-    // though the memo sits in the pool-3 `sent_notes` row. Recover it
-    // via a scalar subquery matching `sent_notes` on `(txid, output_index)`
-    // *ignoring* the pool code: codes 3 and 4 alias the same Orchard value pool
-    // and receiver, so the same output position identifies the same memo. Only
-    // the wallet's own sends (`from_account_uuid`) can be NULL-and-recoverable,
-    // so the extra `OR from_account` term keeps foreign traffic untouched.
+    // The received note carries its own memo directly. For the wallet's own
+    // Ironwood self-sends, librustzcash's `backfill_self_send_memos` pass (run
+    // post-scan in `put_blocks`) fills the received-note memo from the stored raw
+    // transaction, so no `sent_notes` fallback is needed. (An earlier build read
+    // the memo via a `COALESCE` scalar subquery against `sent_notes` because the
+    // pool-4 received note was scanned with a NULL memo; that workaround is gone
+    // now that the received note is populated at its own pool code.)
     let mut stmt = conn.prepare(&format!(
-        "SELECT COALESCE(v.memo, (
-                    SELECT sn.memo FROM sent_notes sn
-                    JOIN transactions stx ON stx.id_tx = sn.transaction_id
-                    WHERE stx.txid = v.txid
-                      AND sn.output_index = v.output_index
-                      AND sn.output_pool IN ({pools})
-                      AND sn.memo IS NOT NULL
-                    LIMIT 1
-                )) AS memo,
+        "SELECT v.memo AS memo,
                 t.mined_height, t.block_time, v.from_account_uuid, v.txid, v.output_index
          FROM v_tx_outputs v
          JOIN v_transactions t ON t.txid = v.txid AND t.account_uuid = v.to_account_uuid
