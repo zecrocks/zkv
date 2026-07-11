@@ -1,7 +1,7 @@
 name: Regtest E2E (Ironwood)
 
 # Ironwood (NU6.3) live tier. Same harness as `regtest.yml`, but against the
-# Ironwood stack: `zfnd/zebra:6.0.0-rc.0` (the official Ironwood zebra RC) with
+# Ironwood stack: `zfnd/zebra:6.0.0` (the official Ironwood zebra release) with
 # development lightwalletd + zcash-devtool images (emersonian/*), all pinned by
 # digest, and `ZKV_REGTEST_NU6_3=1` so the harness emits zebra's `"NU6.3"`
 # activation-height key and the devtool funder's `--activation-heights` carry
@@ -22,6 +22,14 @@ on:
   schedule:
     # Weekly, off-peak and on an odd minute distinct from regtest.yml's cron.
     - cron: "31 7 * * 2"
+  push:
+    branches: [main]
+    paths:
+      - "regtest-harness/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/regtest-ironwood.yml"
   pull_request:
     paths:
       - "regtest-harness/**"
@@ -37,19 +45,16 @@ concurrency:
 # NB: no env var may start with `ZEBRA_` — zebrad parses `ZEBRA_*` as config
 # overrides and exits on unknown fields (the harness also scrubs them).
 env:
-  ZEBRAD_IMAGE: "zfnd/zebra:6.0.0-rc.0"
+  ZEBRAD_IMAGE: "zfnd/zebra:6.0.0"
   LWD_IMAGE: "emersonian/zcash-lwd-ironwood@sha256:5f63b64ed788330ad8fe859fbbb334ceea844cf8a376318e7e25fbd3351b2f9f"
   DEVTOOL_IMAGE: "emersonian/zcash-devtool@sha256:fd95d8b432f47d3eec6e5f1eca0bdfbb8daa094c28742d230bec3ac47957bd6c"
 
 jobs:
   regtest-ironwood:
     runs-on: ubuntu-latest
-    # On a pull request, run only for the Ironwood branch: the emersonian/*
-    # dev images must not gate anyone else's PR. schedule / workflow_dispatch
-    # always run.
-    if: >-
-      github.event_name != 'pull_request' ||
-      github.head_ref == 'claude/zkv-ironwood-support-5s6bfn'
+    # The canonical regtest tier for this repo: Ironwood is the default pool on
+    # regtest, so the Ironwood-capable zebra + lightwalletd/devtool images run
+    # on every PR and on pushes to main.
     name: regtest-ironwood
     steps:
       - uses: actions/checkout@v4
