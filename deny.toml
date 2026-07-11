@@ -51,16 +51,18 @@ wildcards = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Ironwood (NU6.3) support pins the librustzcash crate set to the zecrocks fork's
-# ironwood-scan-model branch via [patch.crates-io] in the workspace Cargo.toml
+# Ironwood (NU6.3) support pins the librustzcash crate set to upstream
+# `zcash/librustzcash` main via [patch.crates-io] in the workspace Cargo.toml
 # (the crates.io releases of the wallet crates depend on the `-pre` lower crates
-# and so can't be used directly), and that branch in turn needs an unreleased
-# shardtree/incrementalmerkletree. Allow those two git sources until the NU6.3
-# crates are published to crates.io, at which point the patches and these entries
-# come back out. See the workspace Cargo.toml comment.
+# and so can't be used directly), and upstream in turn needs an unreleased
+# orchard and shardtree/incrementalmerkletree. Allow those official zcash git
+# sources until the NU6.3 crates are published to crates.io, at which point the
+# patches and these entries come back out. See the workspace Cargo.toml comment.
 allow-git = [
-    "https://github.com/zecrocks/librustzcash",
-    # zecrocks fork of zcash/incrementalmerkletree: upstream decefc46 plus the
+    "https://github.com/zcash/librustzcash",
+    # orchard git rev: padded BundleType::DEFAULT + Ironwood bundle fields.
+    "https://github.com/zcash/orchard",
+    # zcash/incrementalmerkletree main: the checkpoint-retention APIs plus the
     # shardtree clear_flags checkpoint-pruning panic fix (see workspace Cargo.toml).
-    "https://github.com/zecrocks/incrementalmerkletree",
+    "https://github.com/zcash/incrementalmerkletree",
 ]

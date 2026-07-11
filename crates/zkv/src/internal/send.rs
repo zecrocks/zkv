@@ -320,8 +320,10 @@ pub async fn pay(
         // funded by and spent from shielded notes; there are no transparent
         // inputs to select.
         &SpendPolicy::default(),
-        // proposed_version (unstable feature): let the wallet pick the tx version
-        // for the target height (Ironwood/V6 past NU6.3).
+        // proposed_version (stabilized upstream): None lets the wallet pick the
+        // tx version for the target height (Ironwood/V6 past NU6.3). It rides on
+        // the resulting Proposal, so create_proposed_transactions reads it back
+        // (upstream dropped the separate arg it used to take).
         None,
     )
     .map_err(error::Error::from)?;
@@ -336,7 +338,6 @@ pub async fn pay(
         &SpendingKeys::from_unified_spending_key(usk),
         OvkPolicy::Sender,
         &proposal,
-        None,
     )
     .map_err(error::Error::from)?;
 
