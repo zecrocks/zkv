@@ -267,7 +267,7 @@ jobs:
 
       - name: Install Tauri CLI
         if: ${{ matrix.kind == 'browser' }}
-        run: npm install -g @tauri-apps/cli@^2
+        run: npm install -g @tauri-apps/cli@2.11.4
 
       # Linux desktop needs the system WebView (WebKitGTK 4.1) + GTK dev
       # libraries to compile and bundle; macOS/Windows ship their webview

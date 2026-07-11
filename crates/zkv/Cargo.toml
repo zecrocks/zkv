@@ -6,6 +6,12 @@ rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "A Redis-style key-value store backed by Zcash Orchard memos."
 publish = false
+# This crate ships two binaries: the `zkv` CLI and the `zkv-browser` desktop
+# GUI launcher. Name the GUI launcher as the default so `tauri build` bundles
+# it (matching `mainBinaryName` in tauri.conf.json) rather than the CLI. Without
+# this, a newer unpinned tauri-cli resolves the app binary to the package-named
+# `zkv` bin and the desktop .app just prints CLI help and exits on launch.
+default-run = "zkv-browser"
 
 [[bin]]
 name = "zkv"
