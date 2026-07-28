@@ -61,82 +61,29 @@ axum = { version = "0.7", default-features = false, features = ["tokio", "http1"
 
 # Zcash ecosystem: version-locked as a set.
 #
-# Ironwood (NU6.3 / V6 transaction) support. The consensus-layer crates are
-# bumped to their librustzcash Ironwood `-pre` releases; the higher-level wallet
-# crates (zcash_client_backend, zcash_client_sqlite) keep their crates.io version
-# numbers but must be rebuilt against the `-pre` lower crates, so the whole set is
-# repointed at upstream `zcash/librustzcash` main via [patch.crates-io] below
-# (the full Ironwood scan model has landed upstream; the zecrocks fork is no
-# longer needed).
-transparent = { package = "zcash_transparent", version = "0.9.0-pre.0" }
-zcash_address = "0.13.0-pre.0"
-zcash_note_encryption = "0.4.1"
-zcash_client_backend = { version = "0.23", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt"] }
-zcash_client_sqlite = { version = "0.21", features = ["unstable", "orchard", "serde"] }
-zcash_keys = { version = "0.15.0-pre.0", features = ["orchard", "unstable"] }
-zcash_primitives = "0.29.0-pre.0"
-zcash_protocol = { version = "0.10.0-pre.0", features = ["local-consensus"] }
+# Ironwood (NU6.3 / V6 transaction) support, consumed **straight from crates.io**
+# (same model as zecd): the released Ironwood librustzcash line carries the NU6.3
+# mainnet activation height (3_428_143, 2026-07-28) that the old `-pre` git pin
+# lacked; with the pin, transactions built after mainnet activation would commit
+# to the NU6.2 branch ID and be rejected. Leaf crates are finals
+# (`zcash_primitives`/`zcash_proofs 0.29`, `orchard 0.15`, `zcash_protocol 0.10`,
+# `zcash_keys 0.15`); the wallet crates ride the release candidates
+# (`zcash_client_backend 0.24.0-rc.1`, `zcash_client_sqlite 0.22.0-rc.1`,
+# `pczt 0.8.0-rc.1`, `zip321 0.9.0-rc.1`). The shardtree checkpoint-retention
+# APIs (#184) and the checkpoint-prune panic fix (#192) both shipped in
+# `shardtree 0.7.0`, so the incrementalmerkletree git pins are gone too: no
+# forks, no git pins, no [patch.crates-io].
+transparent = { package = "zcash_transparent", version = "0.9" }
+zcash_address = "0.13"
+zcash_note_encryption = "0.4.2"
+# The wallet RCs are `=`-pinned: later RCs in the same line moved to
+# `zcash_keys 0.16`, which would split the graph into two zcash_keys versions
+# (zecd pins the same rc.1 pair).
+zcash_client_backend = { version = "=0.24.0-rc.1", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt"] }
+zcash_client_sqlite = { version = "=0.22.0-rc.1", features = ["unstable", "orchard", "serde"] }
+zcash_keys = { version = "0.15.0", features = ["orchard", "unstable"] }
+zcash_primitives = "0.29"
+zcash_protocol = { version = "0.10", features = ["local-consensus"] }
 zip32 = "0.2"
-zip321 = "0.8"
+zip321 = "=0.9.0-rc.1"
 
-# Ironwood (NU6.3 / V6 transaction) support: repoint every librustzcash crate we
-# depend on (directly or transitively) to upstream `zcash/librustzcash` main. The
-# higher-level crates (zcash_client_backend, zcash_client_sqlite, pczt, zip321)
-# keep their crates.io version numbers but depend on the `-pre` lower crates, so
-# the crates.io releases can't be used directly: a git source is required. `rev
-# d700a59a` is the current head of upstream main, which now carries the full
-# **Ironwood scan model** (PR #2539 `dw/ironwood-scan-model`) plus follow-up
-# fixes (`Implement missing ironwood support`, #2564 `todo-ironwood`, the
-# stabilized proposed-transaction-version API): selecting and spending received
-# Ironwood notes, counting them in the account balance, the Orchard-turnstile
-# enforcement, V6-PCZT construction for Ironwood targets, and the
-# `ironwood_tree_retained_checkpoints` migration table (so the wallet creates it,
-# not zkv out of band; see the note in `data.rs`). This previously pointed at the
-# zecrocks `ironwood-scan-model` fork; that work is now upstream, so the fork is
-# no longer a dependency. Patches must live in the workspace root to take effect.
-#
-# Upstream main patches two more sources, which we mirror here:
-#   - `orchard` to a git rev (keeps `BundleType::DEFAULT` padded and adds the
-#     Ironwood bundle fields), NOT the crates.io `0.15.0-pre.2` the old fork
-#     used. Our direct `orchard = "=0.15.0-pre.2"` pin in crates/zkv matches the
-#     rev's version, so the exact pin resolves against the patched source.
-#   - `shardtree`/`incrementalmerkletree`, unreleased (explicit checkpoint
-#     retention, #184). We track the latest `zcash/incrementalmerkletree` main
-#     (`7b23adb`): upstream `decefc46` plus the shardtree checkpoint-prune
-#     retention fixes (#192, `clear_flags` no longer panics "Tree state
-#     inconsistent with checkpoints." when pruning collapses densely-packed
-#     checkpoint positions into a single pruned leaf). That panic is reachable on
-#     a sparsely-used Ironwood tree still checkpointed every block by cross-pool
-#     sync, so it is load-bearing. This is now the official upstream fix (it
-#     replaces the earlier zecrocks stopgap fork of the same). Same crate
-#     versions (shardtree 0.6.2, incrementalmerkletree 0.8.2), still compatible
-#     with upstream librustzcash. A `[patch]` only takes effect from the
-#     workspace root, so we pin it here.
-[patch.crates-io]
-equihash = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-f4jumble = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-zcash_address = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-zcash_encoding = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-zcash_protocol = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-zip321 = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-pczt = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-zcash_keys = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-zcash_client_backend = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-zcash_client_sqlite = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-zcash_primitives = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-zcash_proofs = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-zcash_transparent = { git = "https://github.com/zcash/librustzcash", rev = "d700a59ac19be4c8292348acfcda3e8353c93ab6" }
-
-# Ironwood needs an unreleased orchard (padded `BundleType::DEFAULT` + Ironwood
-# bundle fields); the same git rev upstream librustzcash main pins.
-orchard = { git = "https://github.com/zcash/orchard", rev = "475ef0ff77d45aebff93cb039d639250d82518a3" }
-
-# Unreleased checkpoint-retention APIs (#184) plus the shardtree checkpoint-prune
-# retention fixes (#192, the `clear_flags` panic fix). Latest official
-# `zcash/incrementalmerkletree` main; 4 commits past the `decefc46` upstream
-# librustzcash pins, same crate versions. This is the upstream home of the fix
-# the zecrocks incrementalmerkletree stopgap fork used to carry.
-shardtree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "7b23adb67044d2a9f4a68759f1e6340c3fc4735a" }
-incrementalmerkletree = { git = "https://github.com/zcash/incrementalmerkletree", rev = "7b23adb67044d2a9f4a68759f1e6340c3fc4735a" }
-# incrementalmerkletree-testing is a dev-only dep upstream patches for its own
-# tests; it is not in zkv's crate graph, so patching it here is unused. Omitted.

@@ -47,13 +47,12 @@ pub(crate) struct Command {
     #[arg(long, default_value = "mainnet", value_parser = Network::parse)]
     pub(crate) network: Network,
 
-    /// Shielded pool for this database: "ironwood", "orchard", or "sapling".
-    /// Fixed at creation; every memo is read from and written to this pool.
-    /// Defaults to the network's pool when omitted: Ironwood on testnet (the
-    /// NU6.3 Orchard pool), Orchard on mainnet (Ironwood is rejected on mainnet
-    /// until NU6.3 activates there). Ironwood and Orchard share the Orchard
-    /// receiver, so the choice only affects the label and the transaction
-    /// version a send builds.
+    /// Shielded pool for this database: "ironwood" or "sapling". Fixed at
+    /// creation; every memo is read from and written to this pool. Defaults
+    /// to Ironwood (the NU6.3 Orchard pool) when omitted, on every network.
+    /// The legacy "orchard" label is import-only: it shares the Ironwood
+    /// receiver, so new databases use Ironwood, and `zkv restore` still
+    /// accepts "orchard" for wallets originally created with it.
     #[arg(long, value_parser = parse_pool)]
     pub(crate) pool: Option<ShieldedPool>,
 
@@ -120,7 +119,7 @@ impl Command {
         // Resolve the pool now that the network is known: default per network
         // (Ironwood on testnet, Orchard on mainnet) and reject Ironwood on
         // mainnet, before minting a seed or touching the chain.
-        let pool = crate::config::resolve_pool_for_network(self.pool, params)?;
+        let pool = crate::config::resolve_pool_for_new_database(self.pool, params)?;
 
         // Mnemonic ceremony first; user sees their phrase even if the network is down.
         let mnemonic = Mnemonic::generate(Count::Words24);

@@ -552,9 +552,9 @@ const CreateFlow = ({ onCancel, onCreate, onGeneratePhrase, onInit, pollDb, minI
   const [step, setStep] = React.useState(0);
   const [name, setName] = React.useState("");
   const [network, setNetwork] = React.useState("mainnet");
-  // Default pool tracks the network (mainnet → orchard, testnet → ironwood);
-  // initial network is mainnet, so the initial pool is orchard.
-  const [pool, setPool] = React.useState("orchard");
+  // Default pool tracks the network; Ironwood is the default everywhere now
+  // that NU6.3 is active on mainnet, so the initial pool is ironwood.
+  const [pool, setPool] = React.useState("ironwood");
   // Until the user picks a pool explicitly, it tracks the network's default
   // (see `defaultPoolFor`).
   const [poolTouched, setPoolTouched] = React.useState(false);
@@ -587,11 +587,11 @@ const CreateFlow = ({ onCancel, onCreate, onGeneratePhrase, onInit, pollDb, minI
     confirmWords[11] === words[11] &&
     confirmWords[19] === words[19];
 
-  // Ironwood (the NU6.3 Orchard pool) is testnet-only for now: it is the
-  // default on testnet, while mainnet defaults to plain Orchard (NU6.3 is not
-  // yet active there). Ironwood and Orchard share the Orchard receiver, so an
-  // old Orchard wallet auto-upgrades to Ironwood once NU6.3 reaches mainnet.
-  const ironwoodAvailable = (net: string) => net !== "mainnet";
+  // Ironwood (the NU6.3 Orchard pool) is live on every network since NU6.3
+  // activated on mainnet (height 3,428,143, 2026-07-28), and is the default
+  // everywhere. Ironwood and Orchard share the Orchard receiver, so an old
+  // Orchard wallet keeps working and upgrades on its first Ironwood send.
+  const ironwoodAvailable = (_net: string) => true;
   const defaultPoolFor = (net: string) => (ironwoodAvailable(net) ? "ironwood" : "orchard");
   const selectNetwork = (net: string) => {
     setNetwork(net);
@@ -850,25 +850,16 @@ const CreateFlow = ({ onCancel, onCreate, onGeneratePhrase, onInit, pollDb, minI
                 <div className="field-block">
                   <label>Shielded pool</label>
                   <div className="seg">
-                    <button
-                      className={pool === "ironwood" ? "on" : ""}
-                      disabled={!ironwoodAvailable(network)}
-                      title={ironwoodAvailable(network) ? undefined : "Ironwood is not yet available on mainnet (NU6.3)"}
-                      onClick={() => selectPool("ironwood")}
-                    >
+                    <button className={pool === "ironwood" ? "on" : ""} onClick={() => selectPool("ironwood")}>
                       <Icon name="trees" size={12} /> ironwood
-                    </button>
-                    <button className={pool === "orchard" ? "on" : ""} onClick={() => selectPool("orchard")}>
-                      <Icon name="shield" size={12} /> orchard
                     </button>
                     <button className={pool === "sapling" ? "on" : ""} onClick={() => selectPool("sapling")}>
                       <Icon name="leaf" size={12} /> sapling
                     </button>
                   </div>
                   <div className="hint" style={{ fontSize: 12.5, color: "var(--fg-3)", marginTop: 4 }}>
-                    {ironwoodAvailable(network)
-                      ? "Ironwood is the current Orchard pool (NU6.3). Old Orchard wallets import as Ironwood."
-                      : "Ironwood (NU6.3) is not yet available on mainnet; mainnet databases use Orchard."}
+                    Ironwood is the current Orchard pool (NU6.3); the legacy Orchard label is
+                    available only when importing an existing wallet.
                   </div>
                 </div>
               </div>

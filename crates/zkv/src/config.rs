@@ -79,10 +79,10 @@ pub struct WalletConfig {
 /// Parse a `--pool` value into a [`ShieldedPool`]: `"ironwood"`, `"orchard"`,
 /// or `"sapling"`. Ironwood and Orchard share the Orchard receiver and are
 /// chain-identical; which one a new database uses is a per-network policy
-/// (see [`default_pool_for_network`] / [`ironwood_available`]): Ironwood is the
-/// testnet default, Orchard the mainnet one (NU6.3 is not yet active on
-/// mainnet). The `String` error feeds clap; network validation happens at the
-/// creation call site, not here.
+/// (see [`default_pool_for_network`] / [`ironwood_available`]): Ironwood is
+/// the default on every network now that NU6.3 is active on mainnet. The
+/// `String` error feeds clap; network validation happens at the creation call
+/// site, not here.
 pub fn parse_pool(s: &str) -> Result<ShieldedPool, String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "sapling" => Ok(ShieldedPool::Sapling),
@@ -94,18 +94,17 @@ pub fn parse_pool(s: &str) -> Result<ShieldedPool, String> {
     }
 }
 
-/// Whether the Ironwood (NU6.3) pool can back a database on `network`. Ironwood
-/// is live on testnet and regtest but not yet on mainnet, so it is available on
-/// every network except mainnet; on mainnet the equivalent pool is plain
-/// Orchard (an Orchard wallet auto-upgrades to Ironwood once NU6.3 activates on
-/// mainnet, since they share the Orchard receiver).
-pub fn ironwood_available(network: Network) -> bool {
-    !matches!(network, Network::Main)
+/// Whether the Ironwood (NU6.3) pool can back a database on `network`. NU6.3
+/// activated on mainnet at height 3_428_143 (2026-07-28), so Ironwood is now
+/// live on every network (mainnet, testnet, and regtest). Existing Orchard
+/// databases keep working unchanged: Ironwood and Orchard share the Orchard
+/// receiver, and the tx builder picks the V6 Ironwood bundle by chain height.
+pub fn ironwood_available(_network: Network) -> bool {
+    true
 }
 
-/// The default shielded pool for a new database on `network`: Ironwood on
-/// testnet/regtest (the current NU6.3 Orchard pool), Orchard on mainnet (until
-/// NU6.3 activates there).
+/// The default shielded pool for a new database on `network`: Ironwood (the
+/// NU6.3 Orchard pool) on every network.
 pub fn default_pool_for_network(network: Network) -> ShieldedPool {
     if ironwood_available(network) {
         ShieldedPool::Ironwood
@@ -114,10 +113,12 @@ pub fn default_pool_for_network(network: Network) -> ShieldedPool {
     }
 }
 
-/// Resolve the pool for a **new** database: fall back to the network default
-/// when unspecified, and reject Ironwood on a network where it isn't available
-/// yet (mainnet). Shared by `zkv init`/`restore` and the facade so the policy
-/// lives in one place.
+/// Resolve the pool for a database being **imported** (`zkv restore`, watch
+/// databases): fall back to the network default when unspecified, and reject
+/// Ironwood on a network where it isn't available (none today; the guard stays
+/// so the policy lives in one place). Orchard is accepted here so existing
+/// Orchard wallets load unchanged; brand-new databases go through
+/// [`resolve_pool_for_new_database`], which additionally rejects it.
 pub fn resolve_pool_for_network(
     pool: Option<ShieldedPool>,
     network: Network,
@@ -125,8 +126,30 @@ pub fn resolve_pool_for_network(
     let pool = pool.unwrap_or_else(|| default_pool_for_network(network));
     if pool == ShieldedPool::Ironwood && !ironwood_available(network) {
         anyhow::bail!(
-            "the Ironwood pool is not yet available on mainnet (NU6.3 has not activated \
-             there); create the database with `--pool orchard`, or use testnet"
+            "the Ironwood pool is not available on this network; create the database \
+             with `--pool orchard` instead"
+        );
+    }
+    Ok(pool)
+}
+
+/// Resolve the pool for a **brand-new** database (`zkv init`, the GUI create
+/// flow, the facade's `init_admin`): like [`resolve_pool_for_network`], but
+/// additionally rejects Orchard. Orchard is the legacy label for the same
+/// chain pool as Ironwood (identical receiver), so new databases take
+/// Ironwood; Orchard stays accepted on the import paths only (`zkv restore`,
+/// watch databases), where it must match the pool the wallet was originally
+/// created with.
+pub fn resolve_pool_for_new_database(
+    pool: Option<ShieldedPool>,
+    network: Network,
+) -> anyhow::Result<ShieldedPool> {
+    let pool = resolve_pool_for_network(pool, network)?;
+    if pool == ShieldedPool::Orchard {
+        anyhow::bail!(
+            "new databases cannot use the legacy Orchard pool; use `--pool ironwood` \
+             (the same pool under NU6.3, identical receiver). Orchard remains available \
+             when importing an existing wallet with `zkv restore`"
         );
     }
     Ok(pool)
@@ -454,29 +477,36 @@ mod tests {
     #[test]
     fn pool_network_policy() {
         use Network::{Main as MainNetwork, Regtest, Test as TestNetwork};
-        // Ironwood is available everywhere except mainnet (testnet + regtest).
-        assert!(!ironwood_available(MainNetwork));
+        // Ironwood is available on every network since NU6.3 activated on
+        // mainnet (height 3_428_143, 2026-07-28).
+        assert!(ironwood_available(MainNetwork));
         assert!(ironwood_available(TestNetwork));
         assert!(ironwood_available(Regtest));
-        // Defaults: mainnet -> Orchard, testnet/regtest -> Ironwood.
-        assert_eq!(default_pool_for_network(MainNetwork), ShieldedPool::Orchard);
+        // Ironwood is the default everywhere.
+        assert_eq!(
+            default_pool_for_network(MainNetwork),
+            ShieldedPool::Ironwood
+        );
         assert_eq!(
             default_pool_for_network(TestNetwork),
             ShieldedPool::Ironwood
         );
         assert_eq!(default_pool_for_network(Regtest), ShieldedPool::Ironwood);
         // resolve_pool_for_network: unspecified falls back to the network
-        // default; Ironwood on mainnet is rejected; Orchard/Sapling are fine
-        // everywhere; Ironwood on testnet is fine.
+        // default (Ironwood everywhere); explicit Ironwood/Orchard/Sapling are
+        // all accepted on every network.
         assert_eq!(
             resolve_pool_for_network(None, MainNetwork).unwrap(),
-            ShieldedPool::Orchard
+            ShieldedPool::Ironwood
         );
         assert_eq!(
             resolve_pool_for_network(None, TestNetwork).unwrap(),
             ShieldedPool::Ironwood
         );
-        assert!(resolve_pool_for_network(Some(ShieldedPool::Ironwood), MainNetwork).is_err());
+        assert_eq!(
+            resolve_pool_for_network(Some(ShieldedPool::Ironwood), MainNetwork).unwrap(),
+            ShieldedPool::Ironwood
+        );
         assert_eq!(
             resolve_pool_for_network(Some(ShieldedPool::Orchard), MainNetwork).unwrap(),
             ShieldedPool::Orchard
@@ -487,6 +517,23 @@ mod tests {
         );
         assert_eq!(
             resolve_pool_for_network(Some(ShieldedPool::Sapling), MainNetwork).unwrap(),
+            ShieldedPool::Sapling
+        );
+        // resolve_pool_for_new_database: same fallback (Ironwood), but the
+        // legacy Orchard label is import-only and rejected for creation;
+        // Ironwood/Sapling stay creatable.
+        assert_eq!(
+            resolve_pool_for_new_database(None, MainNetwork).unwrap(),
+            ShieldedPool::Ironwood
+        );
+        assert!(resolve_pool_for_new_database(Some(ShieldedPool::Orchard), MainNetwork).is_err());
+        assert!(resolve_pool_for_new_database(Some(ShieldedPool::Orchard), TestNetwork).is_err());
+        assert_eq!(
+            resolve_pool_for_new_database(Some(ShieldedPool::Ironwood), MainNetwork).unwrap(),
+            ShieldedPool::Ironwood
+        );
+        assert_eq!(
+            resolve_pool_for_new_database(Some(ShieldedPool::Sapling), TestNetwork).unwrap(),
             ShieldedPool::Sapling
         );
     }

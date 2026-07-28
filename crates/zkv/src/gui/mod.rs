@@ -677,8 +677,8 @@ fn parse_network(s: &str) -> Result<Network, ApiError> {
 }
 
 /// Parse the optional `pool` field from a create request. Absent means the
-/// network's default pool (Ironwood on testnet, Orchard on mainnet). The facade
-/// additionally rejects Ironwood on mainnet.
+/// network's default pool (Ironwood everywhere). The facade additionally
+/// rejects the legacy Orchard label for brand-new databases (import-only).
 fn parse_pool(s: Option<&str>, network: Network) -> Result<ShieldedPool, ApiError> {
     match s {
         None => Ok(crate::config::default_pool_for_network(network)),

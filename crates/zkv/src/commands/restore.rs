@@ -42,11 +42,11 @@ pub(crate) struct Command {
     /// Shielded pool of the database being restored: "ironwood", "orchard", or
     /// "sapling". Must match the pool chosen at the original `zkv init`, or the
     /// reconstructed zkv address won't match and the database will look empty.
-    /// Defaults to the network's pool when omitted (Ironwood on testnet, Orchard
-    /// on mainnet). Ironwood and Orchard share the Orchard receiver, so an old
-    /// Orchard wallet restored as Ironwood on testnet derives the identical
-    /// address and reads the identical memos. Ignored when `--address` is given
-    /// (the address carries the pool).
+    /// Defaults to Ironwood when omitted, on every network. Ironwood and
+    /// Orchard share the Orchard receiver, so an old Orchard wallet restored
+    /// as Ironwood derives the identical address and reads the identical
+    /// memos. Ignored when `--address` is given (the address carries the
+    /// pool).
     #[arg(long, value_parser = parse_pool)]
     pub(crate) pool: Option<ShieldedPool>,
 

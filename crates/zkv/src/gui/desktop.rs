@@ -118,8 +118,8 @@ mod ipc {
     }
 
     /// Parse the optional `pool` IPC argument. Absent means the network's
-    /// default pool (Ironwood on testnet, Orchard on mainnet); the facade also
-    /// rejects Ironwood on mainnet.
+    /// default pool (Ironwood everywhere); the facade also rejects the legacy
+    /// Orchard label for brand-new databases (import-only).
     fn parse_pool(s: Option<String>, network: Network) -> Result<ShieldedPool, CmdError> {
         match s {
             None => Ok(crate::config::default_pool_for_network(network)),

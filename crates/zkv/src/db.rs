@@ -452,11 +452,12 @@ impl Database {
     }
 
     /// Like [`Database::init_admin`], but lets the caller pick the shielded
-    /// pool (Ironwood, Orchard, or Sapling) the database lives in. Every memo is
-    /// read from and written to this pool; it is fixed at creation. `init_admin`
-    /// defaults to the network's pool (Ironwood on testnet, Orchard on mainnet).
-    /// Ironwood shares the Orchard receiver and is rejected on mainnet until
-    /// NU6.3 activates there ([`ZkvError::Other`]).
+    /// pool (Ironwood or Sapling) the database lives in. Every memo is read
+    /// from and written to this pool; it is fixed at creation. `init_admin`
+    /// defaults to Ironwood on every network. The legacy Orchard label is
+    /// rejected here ([`ZkvError::Other`]): it shares the Ironwood receiver,
+    /// so new databases use Ironwood, while [`Database::restore_admin_with_pool`]
+    /// still accepts Orchard for wallets originally created with it.
     pub async fn init_admin_with_pool(
         name: &str,
         network: Network,
@@ -466,6 +467,7 @@ impl Database {
         use bip0039::{Count, Mnemonic};
 
         ensure_pool_available(pool, network)?;
+        ensure_pool_creatable(pool)?;
         let mnemonic = Mnemonic::generate(Count::Words24);
         let phrase = mnemonic.phrase().to_owned();
         let db = create_admin(name, network, &mnemonic, None, pool, conn).await?;
@@ -1522,14 +1524,30 @@ pub fn find_duplicate_watch_database(zkv_address: &str) -> Result<Option<String>
 }
 
 /// Reject a pool that isn't available on the target network. Ironwood (NU6.3)
-/// is live on testnet but not yet on mainnet; a mainnet database uses plain
-/// Orchard instead (the two share the Orchard receiver). Shared by the admin
-/// creation paths so the CLI, GUI, and library all enforce the same policy.
+/// is live on every network since mainnet activation (height 3_428_143,
+/// 2026-07-28), so today this never fires; the guard stays so the CLI, GUI,
+/// and library keep enforcing the policy from one place.
 fn ensure_pool_available(pool: ShieldedPool, network: Network) -> Result<()> {
     if pool == ShieldedPool::Ironwood && !crate::config::ironwood_available(network) {
         return Err(ZkvError::Other(anyhow::anyhow!(
-            "the Ironwood pool is not yet available on mainnet (NU6.3 has not activated \
-             there); create the database with the Orchard pool, or use testnet"
+            "the Ironwood pool is not available on this network; create the database \
+             with the Orchard pool instead"
+        )));
+    }
+    Ok(())
+}
+
+/// Reject pools a brand-new database can't be created with: the legacy
+/// Orchard label is import-only (it shares the Ironwood receiver, so new
+/// databases use Ironwood; restore/watch paths still accept Orchard for
+/// wallets originally created with it). Guards the creation facade so the
+/// CLI, GUI, and library all enforce the same policy.
+fn ensure_pool_creatable(pool: ShieldedPool) -> Result<()> {
+    if pool == ShieldedPool::Orchard {
+        return Err(ZkvError::Other(anyhow::anyhow!(
+            "new databases cannot use the legacy Orchard pool; use Ironwood (the same \
+             pool under NU6.3, identical receiver). Orchard remains available when \
+             restoring an existing wallet"
         )));
     }
     Ok(())

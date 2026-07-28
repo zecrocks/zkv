@@ -255,13 +255,13 @@ pub fn parse_zkv_addr(s: &str) -> anyhow::Result<ParsedZkvAddr> {
         );
     }
     // A zkv database lives in exactly one shielded pool. Infer it from the
-    // published UFVK: an Orchard receiver means Ironwood on networks where NU6.3
-    // is available (testnet), or plain Orchard on mainnet (until NU6.3 activates
-    // there); otherwise Sapling. Ironwood and Orchard share the Orchard receiver
-    // and signing domain, so importing an Orchard address is lossless either
-    // way: history stays valid and the wallet's first send builds the right
+    // published UFVK: an Orchard receiver means Ironwood on networks where
+    // NU6.3 is available (every network, per `config::ironwood_available`);
+    // otherwise Sapling. Ironwood and Orchard share the Orchard receiver and
+    // signing domain, so importing an Orchard address is lossless either way:
+    // history stays valid and the wallet's first send builds the right
     // transaction version for the network.
-    let ironwood_ok = !matches!(network, NetworkType::Main);
+    let ironwood_ok = crate::config::ironwood_available(network_from_type(network)?);
     let pool = if ufvk.orchard().is_some() {
         if ironwood_ok {
             ShieldedPool::Ironwood

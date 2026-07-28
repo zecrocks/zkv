@@ -197,15 +197,10 @@ fn zkv_addr_encodes_under_zkv_hrp_and_round_trips() {
 
         let parsed = parse_zkv_addr(&addr).expect("parses");
         assert_eq!(parsed.network, nt);
-        // An Orchard-receiver address resolves to Ironwood where NU6.3 is
-        // available (testnet) and plain Orchard on mainnet; they share the
-        // receiver, so importing an old Orchard wallet is lossless either way.
-        let expected_pool = if nt == NetworkType::Main {
-            ShieldedPool::Orchard
-        } else {
-            ShieldedPool::Ironwood
-        };
-        assert_eq!(parsed.pool, expected_pool);
+        // An Orchard-receiver address resolves to Ironwood on every network
+        // now that NU6.3 is active on mainnet; they share the receiver, so
+        // importing an old Orchard wallet is lossless.
+        assert_eq!(parsed.pool, ShieldedPool::Ironwood);
         assert_eq!(
             parsed.birthday, 1_234_567,
             "birthday rides inside the meta item"
@@ -871,15 +866,13 @@ fn orchard_and_ironwood_are_receiver_identical() {
             .unwrap();
         assert_eq!(ua_o.encode(&net), ua_i.encode(&net));
 
-        // Importing an Orchard-receiver address yields Ironwood where NU6.3 is
-        // available (testnet) and plain Orchard on mainnet; either way it reads
-        // the identical memos, since the receiver is the same.
-        let expected = if nt == NetworkType::Main {
-            ShieldedPool::Orchard
-        } else {
+        // Importing an Orchard-receiver address yields Ironwood on every
+        // network now that NU6.3 is active on mainnet; it reads the identical
+        // memos, since the receiver is the same.
+        assert_eq!(
+            parse_zkv_addr(&orchard_addr).unwrap().pool,
             ShieldedPool::Ironwood
-        };
-        assert_eq!(parse_zkv_addr(&orchard_addr).unwrap().pool, expected);
+        );
     }
 }
 
