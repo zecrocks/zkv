@@ -490,6 +490,9 @@ const KeyList = ({
   tab,
   onTab,
   loading,
+  error,
+  onRetry,
+  syncError,
   history,
   historyLoading,
   selectedHistoryIdx,
@@ -620,6 +623,33 @@ const KeyList = ({
         </button>
       </div>
 
+      {/* Non-blocking notice: the most recent *background* auto-sync failure for
+          this db (server unreachable, stale block cache, locked by another zkv
+          process, …). Shown here — the same panel as the load-error card — so
+          background failures don't stay hidden in the terminal. Keys still show
+          below; this clears itself the moment the next sync of this db succeeds. */}
+      {syncError && (
+        <div
+          role="status"
+          title={syncError}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+            padding: "8px 16px",
+            background: "rgba(245, 158, 11, 0.10)",
+            borderBottom: "1px solid var(--border-1)",
+            color: "var(--fg-2)",
+            fontSize: 12,
+          }}
+        >
+          <Icon name="alert-triangle" size={14} color="var(--amber-400)" />
+          <span style={{ overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+            {syncError}
+          </span>
+        </div>
+      )}
+
       {firstSyncPending && <FirstSyncPanel detail={detail} chainTip={chainTip} />}
 
       {!firstSyncPending && tab === "browse" && (
@@ -690,7 +720,8 @@ const KeyList = ({
               {rows.length === 0 && (() => {
                 const init = detail && detail.init;
                 const remaining = Math.max(0, (detail?.init_required || 0) - (detail?.init_done || 0));
-                const glyph = loading ? "loader"
+                const glyph = error ? "alert-triangle"
+                  : loading ? "loader"
                   : init === "uninitialized" ? "zap"
                   : init === "initializing" ? "loader"
                   : "inbox";
@@ -701,7 +732,17 @@ const KeyList = ({
                       <div className="glyph">
                         <Icon name={glyph} size={28} />
                       </div>
-                      {loading ? (
+                      {error ? (
+                        <div>
+                          <strong style={{ color: "var(--fg-1)" }}>Couldn't load this database.</strong>
+                          <div style={{ marginTop: 6, color: "var(--fg-3)", fontSize: 13, maxWidth: 360 }}>{error}</div>
+                          <div style={{ marginTop: 14 }}>
+                            <button className="btn primary sm" onClick={() => onRetry && onRetry()}>
+                              <Icon name="refresh-cw" className="icon" /> Retry
+                            </button>
+                          </div>
+                        </div>
+                      ) : loading ? (
                         <div>Loading keys…</div>
                       ) : filter ? (
                         <div>
@@ -1109,7 +1150,7 @@ const PaginationBar = ({ total, offset, pageSize, onPage, loading }: {
 };
 
 // ============ KEY DETAIL ============
-const KeyDetail = ({ row, db, timeZone, onWriteKey, onDelete, onCopy, onViewHistory, onOpenTxid, signer, roles, onOpenRole, loading }: {
+const KeyDetail = ({ row, db, timeZone, onWriteKey, onDelete, onCopy, onViewHistory, onOpenTxid, signer, roles, onOpenRole, loading, error, onRetry }: {
   row: KeyRow | null;
   db: ActiveDb | null;
   timeZone?: string | null;
@@ -1122,21 +1163,34 @@ const KeyDetail = ({ row, db, timeZone, onWriteKey, onDelete, onCopy, onViewHist
   roles: RoleRow[] | null;
   onOpenRole?: (pk: string) => void;
   loading?: boolean;
+  error?: string | null;
+  onRetry?: () => void;
 }) => {
   if (!row) {
-    // Mirror the table's loading affordance so the two panes never disagree:
-    // one showing a spinner while the other invites a selection.
+    // Mirror the table's affordance so the two panes never disagree: error +
+    // Retry, else a loading spinner, else the "select a key" invite.
     return (
       <aside className="detail">
         <div className="empty">
           <div className="glyph">
-            <Icon name={loading ? "loader" : "mouse-pointer-click"} size={28} />
+            <Icon name={error ? "alert-triangle" : loading ? "loader" : "mouse-pointer-click"} size={28} />
           </div>
-          <div>
-            {loading
-              ? "Loading…"
-              : "Select a key to inspect its current value and on-chain write."}
-          </div>
+          {error ? (
+            <div>
+              <div>Couldn't load this database.</div>
+              <div style={{ marginTop: 14 }}>
+                <button className="btn primary sm" onClick={() => onRetry && onRetry()}>
+                  <Icon name="refresh-cw" className="icon" /> Retry
+                </button>
+              </div>
+            </div>
+          ) : (
+            <div>
+              {loading
+                ? "Loading…"
+                : "Select a key to inspect its current value and on-chain write."}
+            </div>
+          )}
         </div>
       </aside>
     );

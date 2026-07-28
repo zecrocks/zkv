@@ -258,7 +258,7 @@ pub async fn pay(
     let account_ids = db_data.get_account_ids()?;
     let account_id = match account_ids.as_slice() {
         [id] => *id,
-        [] => anyhow::bail!("database {db_name:?} has no accounts"),
+        [] => return Err(crate::internal::account::no_account_error(db_name)),
         _ => anyhow::bail!("database {db_name:?} has multiple accounts; zkv assumes one"),
     };
     let account = db_data

@@ -49,6 +49,10 @@ function App() {
   // ===== Live data =====
   const [databases, setDatabases] = React.useState<DbSummary[]>([]);
   const [detail, setDetail] = React.useState<DbDetail | null>(null);
+  // A failed `detail` load, kept distinct from "still loading" so the keys/detail
+  // panels can show an error + Retry instead of an eternal spinner. Cleared when
+  // a load succeeds or a new db is opened. `null` = no error.
+  const [detailError, setDetailError] = React.useState<string | null>(null);
   // True from the moment you click a *different* db until its detail lands. We
   // keep the previous db's panel rendered during this gap (no blank flash);
   // `switchSlow` only flips true if the load drags past a short threshold, at
@@ -170,16 +174,26 @@ function App() {
         const d = await api.detail(name);
         if (seq !== loadSeqRef.current) return d; // superseded; drop the result
         setDetail(d);
+        setDetailError(null);
         return d;
       } catch (e) {
         if (seq !== loadSeqRef.current) return null; // superseded; stay quiet
-        flash("Couldn't open " + name + ": " + (e as Error).message, "error");
+        // Record the failure durably instead of only flashing a transient
+        // toast: `detail` stays null, so without this the keys/detail panels
+        // (loading = detail === null) would spin forever on a load that has
+        // actually failed. The panels render this message + a Retry button.
         setDetail(null);
+        setDetailError((e as Error).message || "Couldn't open " + name + ".");
         return null;
       }
     },
     [flash]
   );
+
+  // Retry the current db's detail load (from the panels' error state).
+  const retryDetail = React.useCallback(() => {
+    if (activeName) loadDetail(activeName);
+  }, [activeName, loadDetail]);
 
   const loadHistory = React.useCallback(
     async (name: string, filter: string, offset?: number, locate?: string | null) => {
@@ -465,6 +479,9 @@ function App() {
       setFundingOffset(0);
       setSwitching(true);
       setSwitchSlow(false);
+      // Drop any prior db's load error so it can't linger over the new db while
+      // its detail is in flight (a fresh failure re-sets it in loadDetail).
+      setDetailError(null);
       // Note: selecting a db here deliberately does NOT write the CLI's
       // `current` marker. The GUI tracks its own `activeName`; the `current`
       // marker is a CLI concern, so GUI browsing never perturbs which db the
@@ -764,6 +781,9 @@ function App() {
   // for a beat. Content (rows/key detail) may show through that beat, but any
   // per-db *truth* (the status-bar height) must not trust a mismatched detail.
   const detailMatches = !!detail && detail.name === activeName;
+  // The current db's detail load failed (as opposed to still in flight). Drives
+  // the panels' error+Retry state; takes precedence over the loading spinner.
+  const detailFailed = detail === null && detailError !== null;
   const activeDb = detail
     ? {
         name: detail.name,
@@ -1335,8 +1355,14 @@ function App() {
               // Show the loading state only with nothing to display yet (cold
               // open) or when a switch is dragging (switchSlow). During a normal
               // fast switch we keep the previous db's rows on screen instead of
-              // flashing empty, then swap them when the new detail lands.
-              loading={detail === null || switchSlow}
+              // flashing empty, then swap them when the new detail lands. A
+              // failed load shows `error` instead (which the panel prioritizes).
+              loading={(detail === null && !detailFailed) || switchSlow}
+              error={detailFailed ? detailError : null}
+              onRetry={retryDetail}
+              // Background auto-sync failure for this db (non-blocking banner),
+              // only when the loaded detail is for the db we're viewing.
+              syncError={detailMatches ? detail && detail.sync_error : null}
               // First-import sync gate: while a freshly-imported db (the demo,
               // any zkv1 watch) is still scanning birthday->tip we can't yet
               // conclude whether it has a valid INIT, so hold every tab in a
@@ -1425,7 +1451,9 @@ function App() {
                 signer={activeDb && activeDb.signer}
                 roles={rolesRows}
                 onOpenRole={openRole}
-                loading={detail === null || switchSlow}
+                loading={(detail === null && !detailFailed) || switchSlow}
+                error={detailFailed ? detailError : null}
+                onRetry={retryDetail}
               />
             )}
           </>

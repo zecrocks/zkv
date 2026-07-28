@@ -514,15 +514,32 @@ async fn run_sync_tol(
     }
 }
 
-/// Errors that warrant offering a wipe-and-rebootstrap recovery: an
-/// unrecoverable reorg, or an uninitialized/corrupt wallet schema (e.g.
-/// `no such table: scan_queue` from a half-deleted data.sqlite).
+/// Errors that warrant offering a wipe-and-rebootstrap recovery:
+///
+/// - an unrecoverable reorg ([`UnrecoverableRewind`]);
+/// - an uninitialized/corrupt wallet schema (e.g. `no such table: scan_queue`
+///   from a half-deleted data.sqlite);
+/// - a commitment-tree write failure during scan (`PutBlocksCommitmentTree`,
+///   e.g. a shardtree `Insert(Conflict(..))`): the on-disk Sapling/Orchard
+///   note-commitment tree is structurally inconsistent with the blocks being
+///   scanned. Normal reorgs are caught earlier as continuity errors and rewound
+///   (see `scan_blocks`), so a conflict that reaches here is genuine tree
+///   corruption — a DB left inconsistent by an earlier bug or built against a
+///   different shardtree revision — that only a rebuild-from-chain fixes. The
+///   wiped sidecars are all re-derivable from the seed/UFVK, so this is safe,
+///   and both callers bound it to a single wipe (CLI `tried_recovery`, GUI
+///   `auto_wipe_first_time`) so a reproducible failure can't loop.
+///
+/// The scan error reaches us as an opaque `anyhow!("{:?}", e)` string (see
+/// `scan_blocks`), so the schema/commitment-tree cases are matched on the
+/// error's text rather than by downcast, mirroring the existing `scan_queue`
+/// check.
 fn needs_recovery(e: &anyhow::Error) -> bool {
     if e.downcast_ref::<UnrecoverableRewind>().is_some() {
         return true;
     }
     let msg = format!("{e:#}");
-    msg.contains("no such table: scan_queue")
+    msg.contains("no such table: scan_queue") || msg.contains("PutBlocksCommitmentTree")
 }
 
 /// Whether the reorg/corruption recovery path may block on an interactive
@@ -642,6 +659,38 @@ async fn run_sync_inner(
     init_blockmeta_db(&mut db_cache).map_err(|e| anyhow!("init block cache schema: {e:?}"))?;
     let mut db_data = open_wallet_db(&db_data_path, params)?;
     let mut client = conn.connect(params).await?;
+
+    // Self-heal a wallet whose account is missing: the wallet DB opens but holds
+    // zero accounts because its local data was reset/wiped without the key being
+    // restored (e.g. a watch-only import whose UFVK didn't survive a data reset).
+    // Every scan below would otherwise fail with `no_account_error`. If
+    // `keys.toml` still has recoverable material — an admin seed, or a watch db's
+    // stored `zkv_address` — rebuild the account from it before syncing; the
+    // chain is the source of truth, so the wiped sidecars re-derive on the
+    // rescan that follows. Watch dbs predating the stored `zkv_address` aren't
+    // recoverable this way, so we leave those for the read path to report.
+    if WalletRead::get_account_ids(&db_data)?.is_empty() {
+        let recoverable = match config.role {
+            Role::Admin => true,
+            Role::Watch => config.zkv_address.is_some(),
+        };
+        if recoverable {
+            tracing::warn!(
+                db = db_name,
+                "wallet has no account; rebuilding it from keys.toml before syncing (self-heal)"
+            );
+            // Release the handles to the files we're about to delete.
+            drop(db_data);
+            drop(db_cache);
+            crate::internal::recover::wipe_sidecars(db_name)?;
+            crate::internal::recover::rebootstrap(db_name, &mut client).await?;
+            // Re-open the freshly rebuilt sidecars for the rest of the sync.
+            db_cache = FsBlockDb::for_path(fsblockdb_root).map_err(error::Error::from)?;
+            init_blockmeta_db(&mut db_cache)
+                .map_err(|e| anyhow!("init block cache schema: {e:?}"))?;
+            db_data = open_wallet_db(&db_data_path, params)?;
+        }
+    }
 
     // Fast path: if the wallet's last-known chain height matches the live tip
     // and there's no pending scan or enhance work, skip the whole pipeline.

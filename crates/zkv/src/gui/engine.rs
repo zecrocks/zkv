@@ -50,8 +50,21 @@ pub(crate) const DEFAULT_SYNC_WORKERS: usize = 5;
 pub(crate) const MAX_SYNC_WORKERS: usize = 16;
 /// Delay between background sync cycles.
 const AUTO_SYNC_INTERVAL: Duration = Duration::from_secs(20);
+/// How long `detail` waits on the (provisional) "synced to tip?" probe for an
+/// uninitialized database before giving up. This is a single unary round-trip
+/// to lightwalletd; the direct channel bounds only the *connect* (15s) and dead
+/// connections (~40s keepalive), not an individual RPC, so a server that
+/// accepts the socket but stalls the response could otherwise hang the whole
+/// key-loading path. A timeout here is safe: the verdict only softens the
+/// "uninitialized" copy in the UI, so falling back to `false` ("not confirmed
+/// synced") on a slow/flaky server is the correct conservative default.
+const DETAIL_TIP_PROBE_TIMEOUT: Duration = Duration::from_secs(8);
 /// Default history page size when the client doesn't specify one.
 const DEFAULT_HISTORY_PAGE: u32 = 100;
+/// How many consecutive cycles a (non-benign) auto-sync error must recur before
+/// it surfaces as a GUI banner. A single transient blip clears before this, so
+/// the banner reflects a genuinely stuck sync rather than momentary noise.
+const SYNC_ERROR_THRESHOLD: u32 = 2;
 
 // ===================================================================
 // Response DTOs (serialized identically by axum Json and Tauri invoke)
@@ -266,6 +279,11 @@ pub struct DbDetail {
     pub blocks_read: bool,
     /// Whether this (out-of-date) client must refuse to broadcast writes.
     pub blocks_write: bool,
+    /// The most recent background auto-sync failure for this db, as a
+    /// display-ready sentence (see [`friendly_sync_error`]), or `None` if the
+    /// last sync succeeded. Surfaced as a non-blocking warning in the keys
+    /// panel so background failures don't stay hidden in the terminal.
+    pub sync_error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -634,6 +652,24 @@ pub struct Engine {
     /// `pending.toml`, so cache the derived counts keyed by both and reuse them
     /// when neither moved. See [`Engine::list_databases`] / [`CachedSummary`].
     summary_cache: Arc<std::sync::Mutex<HashMap<String, CachedSummary>>>,
+    /// Last background auto-sync error per database, as a display-ready string
+    /// (see [`friendly_sync_error`]). The auto-sync loop only *logs* failures to
+    /// stderr; recording the latest one here lets the GUI surface it (a db that
+    /// can't reach the server, has a stale block cache, is locked by another
+    /// process, …) instead of the user having to watch the terminal. An entry is
+    /// removed the moment that db's sync next succeeds, so it reflects only a
+    /// *currently* failing sync. Keyed by db name. Only *persistent, meaningful*
+    /// failures land here: a benign self-healing transient (a block-cache
+    /// pruning race, which recovers next cycle while the wallet stays synced) is
+    /// filtered out (see [`is_benign_sync_error`]), and the rest must recur for
+    /// [`SYNC_ERROR_THRESHOLD`] cycles (see `sync_fail_counts`) before surfacing,
+    /// so a single blip can't flash a warning that contradicts the "synced" bar.
+    sync_errors: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Consecutive non-benign auto-sync failure count per database. A meaningful
+    /// error only becomes a user-facing [`sync_errors`] banner once it has
+    /// recurred [`SYNC_ERROR_THRESHOLD`] times; any success (or a benign
+    /// transient, which proves the server was reachable) resets it.
+    sync_fail_counts: Arc<std::sync::Mutex<HashMap<String, u32>>>,
     /// Cached build-freshness verdict. The mainnet height probe runs once (on
     /// the first [`Engine::status`] call) and the answer is reused for the
     /// process lifetime: we don't care about the long-running edge case where a
@@ -665,6 +701,8 @@ impl Engine {
             paused_all: AtomicBool::new(false),
             sync_cancel: Arc::new(AtomicBool::new(false)),
             summary_cache: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sync_errors: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sync_fail_counts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             out_of_date: tokio::sync::OnceCell::new(),
         })
     }
@@ -881,6 +919,7 @@ impl Engine {
     pub async fn detail(&self, name: String) -> Result<DbDetail, ZkvError> {
         let conn = self.conn.clone();
         let paused = self.paused.lock().unwrap().contains(&name);
+        let sync_error = self.sync_errors.lock().unwrap().get(&name).cloned();
         run_blocking(move |h| {
             let cfg = WalletConfig::read(&name).map_err(|e| classify_unknown(e, &name))?;
             let db = Database::open(&name, conn.clone())?;
@@ -892,7 +931,16 @@ impl Engine {
             // worth a tip probe. For initialized/initializing the frontend's
             // gate already treats the verdict as final, so skip the round-trip.
             let synced_to_tip = if matches!(result.init, InitState::Uninitialized) {
-                h.block_on(db.synced_to_tip()).unwrap_or(false)
+                // Bound the probe: only a completed-in-time `Ok(true)` counts.
+                // A timeout (`Err`) or a probe error (`Ok(Err)`) both fall back
+                // to `false`, so a flaky server can't stall `detail` (and with
+                // it the "Loading keys…" panel) past DETAIL_TIP_PROBE_TIMEOUT.
+                h.block_on(async {
+                    matches!(
+                        tokio::time::timeout(DETAIL_TIP_PROBE_TIMEOUT, db.synced_to_tip()).await,
+                        Ok(Ok(true))
+                    )
+                })
             } else {
                 false
             };
@@ -939,6 +987,7 @@ impl Engine {
                 blocks_sync: result.version.blocks_sync(),
                 blocks_read: result.version.blocks_read(),
                 blocks_write: result.version.blocks_write(),
+                sync_error,
             })
         })
         .await
@@ -1746,13 +1795,58 @@ impl Engine {
                     let conn = engine.conn.clone();
                     let cancel = engine.sync_cancel.clone();
                     let label = name.clone();
-                    if let Err(e) = run_blocking(move |h| {
+                    let result = run_blocking(move |h| {
+                        // Non-blocking cross-process lock: if another zkv process
+                        // holds it, don't stall this worker thread on a blocking
+                        // flock — report the db as in-use and try again next
+                        // cycle. Held across the sync; `sync_cancellable`'s own
+                        // (reentrant) acquire shares it via the lock registry.
+                        let _xlock = match crate::internal::lock::DbLock::try_acquire(&name)? {
+                            Some(g) => g,
+                            None => {
+                                return Err(ZkvError::Other(anyhow::anyhow!(
+                                    "another zkv process is using this database"
+                                )))
+                            }
+                        };
                         let db = Database::open(&name, conn)?;
                         h.block_on(db.sync_cancellable(Some(cancel)))
                     })
-                    .await
-                    {
-                        tracing::warn!("auto-sync {label}: {e}");
+                    .await;
+                    // Record the failure for the GUI (the log line always stays
+                    // for the terminal). Only *persistent, meaningful* errors
+                    // surface as a banner: a benign self-healing transient is
+                    // dropped, and the rest must recur `SYNC_ERROR_THRESHOLD`
+                    // times, so a momentary blip can't flash a warning that
+                    // contradicts the "synced" bar.
+                    let clear = |engine: &Engine, label: &str| {
+                        engine.sync_errors.lock().unwrap().remove(label);
+                        engine.sync_fail_counts.lock().unwrap().remove(label);
+                    };
+                    match result {
+                        Ok(_) => clear(&engine, &label),
+                        Err(e) => {
+                            let raw = e.to_string();
+                            tracing::warn!("auto-sync {label}: {raw}");
+                            if is_benign_sync_error(&raw) {
+                                // Self-heals next cycle; the wallet stays synced.
+                                clear(&engine, &label);
+                            } else {
+                                let strikes = {
+                                    let mut c = engine.sync_fail_counts.lock().unwrap();
+                                    let n = c.entry(label.clone()).or_insert(0);
+                                    *n += 1;
+                                    *n
+                                };
+                                if strikes >= SYNC_ERROR_THRESHOLD {
+                                    engine
+                                        .sync_errors
+                                        .lock()
+                                        .unwrap()
+                                        .insert(label, friendly_sync_error(&raw));
+                                }
+                            }
+                        }
                     }
                 });
             }
@@ -1840,6 +1934,43 @@ where
     tokio::task::spawn_blocking(move || f(handle))
         .await
         .map_err(|e| ZkvError::Other(anyhow::anyhow!("background task failed: {e}")))?
+}
+
+/// Whether a raw sync-error string is a benign, self-healing transient that
+/// should NOT be surfaced to the user. The block-cache `NotFound` case is the
+/// one that matters: compact blocks are pruned right after they're scanned, so
+/// a scan can momentarily race that pruning, error once, and fully recover on
+/// the next cycle — all while the wallet stays synced to the tip. Surfacing it
+/// would contradict the "synced" indicator. Reaching this error also proves the
+/// server was reachable and blocks were downloading, so we treat it as good as
+/// a success for banner purposes (it clears any prior banner + strike count).
+fn is_benign_sync_error(raw: &str) -> bool {
+    let low = raw.to_ascii_lowercase();
+    low.contains("blocksource") || low.contains("no such file") || low.contains("notfound")
+}
+
+/// Map a raw background-sync error string to a short, user-facing sentence for
+/// the GUI's per-database error surface. Unknown errors pass through verbatim
+/// (a raw message beats a silent failure), but the common transient cases get
+/// friendlier copy than their internal `Debug`/`Display` form.
+fn friendly_sync_error(raw: &str) -> String {
+    let low = raw.to_ascii_lowercase();
+    if low.contains("another zkv process") {
+        "Another zkv process is using this database. It will sync once that finishes.".to_owned()
+    } else if low.contains("no wallet key") || low.contains("has no account") {
+        "This database's wallet key is missing; it rebuilds automatically on the next sync."
+            .to_owned()
+    } else if low.contains("transport error")
+        || low.contains("connect")
+        || low.contains("eof")
+        || low.contains("timeout")
+        || low.contains("unavailable")
+        || low.contains("dns")
+    {
+        "Can't reach the lightwalletd server right now; retrying automatically.".to_owned()
+    } else {
+        raw.to_owned()
+    }
 }
 
 fn role_str(role: Role) -> &'static str {
@@ -2335,6 +2466,37 @@ fn qr_svg(data: &str) -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn benign_sync_errors_are_not_surfaced() {
+        // Block-cache misses self-heal while the wallet stays synced, so they
+        // must be classified benign (and thus never shown as a banner).
+        for raw in [
+            "BlockSource(Fs(Os { code: 2, kind: NotFound, message: \"No such file or directory\" }))",
+            "no such file or directory",
+        ] {
+            assert!(is_benign_sync_error(raw), "should be benign: {raw}");
+        }
+        // Errors the user can act on (or that persist) are NOT benign.
+        for raw in [
+            "transport error",
+            "another zkv process is using this database",
+            "the \"x\" database has no wallet key imported yet",
+        ] {
+            assert!(!is_benign_sync_error(raw), "should not be benign: {raw}");
+        }
+    }
+
+    #[test]
+    fn friendly_sync_error_rewrites_known_cases_and_passes_others_through() {
+        assert!(friendly_sync_error("transport error").contains("Can't reach"));
+        assert!(friendly_sync_error("another zkv process is using this database")
+            .contains("Another zkv process"));
+        assert!(friendly_sync_error("database has no wallet key imported yet")
+            .contains("wallet key is missing"));
+        // Unknown errors pass through verbatim rather than vanishing.
+        assert_eq!(friendly_sync_error("something weird"), "something weird");
+    }
 
     #[test]
     fn qr_svg_renders_scannable_svg() {

@@ -138,6 +138,9 @@ declare global {
     blocks_sync: boolean;
     blocks_read: boolean;
     blocks_write: boolean;
+    // Most recent background auto-sync failure for this db (display-ready), or
+    // null if the last sync succeeded. Shown as a non-blocking warning banner.
+    sync_error?: string | null;
   }
 
   // The compact per-database projection App builds from a DbDetail for the

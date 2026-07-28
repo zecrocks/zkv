@@ -24,6 +24,22 @@ use crate::{
     },
 };
 
+/// The error surfaced when a database's wallet DB exists but holds no imported
+/// account (no seed-derived key, no watch UFVK). This is distinct from "not
+/// initialized" (a zkv-protocol / on-chain INIT concept): here the underlying
+/// Zcash wallet itself is empty, so we can't even derive the address. It arises
+/// when the local wallet data was reset/wiped without the key being re-imported
+/// (or a watch import that never completed). The wallet self-heals on the next
+/// sync when `keys.toml` still holds the seed or the `zkv_address` (see
+/// [`crate::internal::recover::rebootstrap`]).
+pub fn no_account_error(db_name: &str) -> anyhow::Error {
+    anyhow!(
+        "the {db_name:?} database has no wallet key imported yet — its local wallet data was \
+         reset before the key was restored (this is different from an uninitialized database). \
+         It rebuilds automatically on the next sync; if it persists, re-import the database."
+    )
+}
+
 /// Read-side material derived from a zkv database's single account.
 ///
 /// All fields are owned: callers don't need to keep the wallet DB open.
@@ -57,9 +73,7 @@ pub(crate) fn account_keys(cfg: &WalletConfig, db_name: &str) -> anyhow::Result<
     let db_data = open_wallet_db(&db_data_path, cfg.network)?;
 
     let ids = db_data.get_account_ids()?;
-    let account_id = *ids
-        .first()
-        .ok_or_else(|| anyhow!("database {db_name:?} has no accounts"))?;
+    let account_id = *ids.first().ok_or_else(|| no_account_error(db_name))?;
     let account = db_data
         .get_account(account_id)?
         .ok_or_else(|| anyhow!("account vanished"))?;

@@ -27,6 +27,7 @@ function App() {
   const [focusPubkey, setFocusPubkey] = React.useState(null);
   const [databases, setDatabases] = React.useState([]);
   const [detail, setDetail] = React.useState(null);
+  const [detailError, setDetailError] = React.useState(null);
   const [switching, setSwitching] = React.useState(false);
   const [switchSlow, setSwitchSlow] = React.useState(false);
   const [status, setStatus] = React.useState(null);
@@ -106,16 +107,20 @@ function App() {
         const d = await api.detail(name);
         if (seq !== loadSeqRef.current) return d;
         setDetail(d);
+        setDetailError(null);
         return d;
       } catch (e) {
         if (seq !== loadSeqRef.current) return null;
-        flash("Couldn't open " + name + ": " + e.message, "error");
         setDetail(null);
+        setDetailError(e.message || "Couldn't open " + name + ".");
         return null;
       }
     },
     [flash]
   );
+  const retryDetail = React.useCallback(() => {
+    if (activeName) loadDetail(activeName);
+  }, [activeName, loadDetail]);
   const loadHistory = React.useCallback(
     async (name, filter2, offset, locate) => {
       setHistoryLoading(true);
@@ -317,6 +322,7 @@ function App() {
       setFundingOffset(0);
       setSwitching(true);
       setSwitchSlow(false);
+      setDetailError(null);
       await loadDetail(name);
       setSwitching(false);
     },
@@ -539,6 +545,7 @@ function App() {
     }
   };
   const detailMatches = !!detail && detail.name === activeName;
+  const detailFailed = detail === null && detailError !== null;
   const activeDb = detail ? {
     name: detail.name,
     role: detail.role,
@@ -865,7 +872,10 @@ function App() {
       onTogglePause: doTogglePause,
       onManualSync: doManualSync,
       manualSyncing,
-      loading: detail === null || switchSlow,
+      loading: detail === null && !detailFailed || switchSlow,
+      error: detailFailed ? detailError : null,
+      onRetry: retryDetail,
+      syncError: detailMatches ? detail && detail.sync_error : null,
       chainTip: tipKnown ? status.chain_tip : 0,
       firstSyncPending,
       history: historyEntries,
@@ -954,7 +964,9 @@ function App() {
       signer: activeDb && activeDb.signer,
       roles: rolesRows,
       onOpenRole: openRole,
-      loading: detail === null || switchSlow
+      loading: detail === null && !detailFailed || switchSlow,
+      error: detailFailed ? detailError : null,
+      onRetry: retryDetail
     }
   ))), /* @__PURE__ */ React.createElement(
     StatusBar,

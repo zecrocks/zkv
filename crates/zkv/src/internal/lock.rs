@@ -133,6 +133,48 @@ impl DbLock {
             _inner: Some(inner),
         })
     }
+
+    /// Like [`DbLock::acquire`], but never blocks: if another **process** holds
+    /// the lock, returns `Ok(None)` immediately instead of waiting. Reentrant
+    /// within this process (a lock already held here is shared and returns
+    /// `Some`). Used by the GUI's background auto-sync, which must not stall a
+    /// worker thread on a flock another process is holding — it reports the db
+    /// as "in use" and retries on the next cycle instead.
+    pub fn try_acquire(db_name: &str) -> anyhow::Result<Option<DbLock>> {
+        let lock_path = db_dir(db_name)?.join(LOCK_FILE);
+        // No database directory yet → nothing to protect (see `acquire_at`).
+        match lock_path.parent() {
+            Some(parent) if !parent.exists() => return Ok(Some(DbLock { _inner: None })),
+            _ => {}
+        }
+        let mut reg = registry().lock().expect("db-lock registry poisoned");
+        if let Some(inner) = reg.get(&lock_path).and_then(Weak::upgrade) {
+            // Reentrant: this process already holds the lock; share it.
+            return Ok(Some(DbLock {
+                _inner: Some(inner),
+            }));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("opening lock file {}", lock_path.display()))?;
+        match fs4::FileExt::try_lock(&file) {
+            Ok(()) => {
+                let inner = Arc::new(LockInner { _file: file });
+                reg.insert(lock_path.clone(), Arc::downgrade(&inner));
+                Ok(Some(DbLock {
+                    _inner: Some(inner),
+                }))
+            }
+            Err(TryLockError::WouldBlock) => Ok(None),
+            Err(TryLockError::Error(e)) => {
+                Err(e).with_context(|| format!("locking database {db_name:?}"))
+            }
+        }
+    }
 }
 
 #[cfg(test)]

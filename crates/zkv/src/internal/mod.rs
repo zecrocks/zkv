@@ -1,6 +1,6 @@
 //! Internal (non-CLI) helpers shared across commands.
 
-pub(crate) mod account;
+pub mod account;
 pub mod funding;
 pub mod lock;
 pub mod pending;

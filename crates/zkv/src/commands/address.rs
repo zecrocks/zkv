@@ -35,7 +35,7 @@ impl Command {
         let ids = db_data.get_account_ids()?;
         let account_id = *ids
             .first()
-            .ok_or_else(|| anyhow!("database {name:?} has no accounts"))?;
+            .ok_or_else(|| crate::internal::account::no_account_error(&name))?;
         let account = db_data
             .get_account(account_id)?
             .ok_or_else(|| anyhow!("account vanished"))?;

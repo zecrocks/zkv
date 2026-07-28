@@ -20,16 +20,35 @@ use zcash_client_backend::{
     proto::service::compact_tx_streamer_client::CompactTxStreamerClient,
 };
 
+/// Delete a SQLite database file *and* its `-wal`/`-shm` companions.
+///
+/// Removing only the main file while a stale write-ahead log survives is a
+/// footgun: on the next open SQLite recovers the WAL into the freshly
+/// re-created database, resurrecting the old contents — including an old
+/// on-disk *schema*. That is exactly what broke a rebootstrap across a
+/// librustzcash schema change: a leftover `data.sqlite-wal` carrying the
+/// previous `addresses` layout got replayed into the new DB, and the upstream
+/// migration then failed ("addresses_new has 11 columns but 12 values were
+/// supplied"). Best-effort: a missing companion is fine.
+fn remove_sqlite_db(path: &std::path::Path) {
+    let _ = fs::remove_file(path);
+    for suffix in ["-wal", "-shm"] {
+        let mut companion = path.as_os_str().to_os_string();
+        companion.push(suffix);
+        let _ = fs::remove_file(std::path::PathBuf::from(companion));
+    }
+}
+
 /// Delete the wallet sidecars (data.sqlite, blockmeta.sqlite, blocks/,
-/// zkv_state.sqlite) under the named database directory. Leaves
-/// `keys.toml` and the `security-theater-key` age identity (legacy name
-/// `.id`) intact so admin databases can re-bootstrap.
+/// zkv_state.sqlite — each with its `-wal`/`-shm` companions) under the named
+/// database directory. Leaves `keys.toml` and the `security-theater-key` age
+/// identity (legacy name `.id`) intact so admin databases can re-bootstrap.
 pub fn wipe_sidecars(db_name: &str) -> anyhow::Result<()> {
     let dir = db_dir(db_name)?;
     let (_root, db_data_path) = get_db_paths(db_name)?;
-    let _ = fs::remove_file(&db_data_path);
-    let _ = fs::remove_file(dir.join("blockmeta.sqlite"));
-    let _ = fs::remove_file(zkv_state_path(db_name)?);
+    remove_sqlite_db(&db_data_path);
+    remove_sqlite_db(&dir.join("blockmeta.sqlite"));
+    remove_sqlite_db(&zkv_state_path(db_name)?);
     let blocks_dir = dir.join("blocks");
     if blocks_dir.exists() {
         fs::remove_dir_all(&blocks_dir)
@@ -85,4 +104,36 @@ pub async fn rebootstrap(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::remove_sqlite_db;
+
+    /// A wipe must take the `-wal`/`-shm` companions with the main file; leaving
+    /// a stale WAL behind lets SQLite resurrect the old (possibly
+    /// incompatible-schema) database on the next open.
+    #[test]
+    fn remove_sqlite_db_deletes_wal_and_shm_companions() {
+        let base = std::env::temp_dir().join(format!(
+            "zkv-wipe-{}-{:?}.sqlite",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let companion = |suffix: &str| {
+            let mut p = base.as_os_str().to_os_string();
+            p.push(suffix);
+            std::path::PathBuf::from(p)
+        };
+        let wal = companion("-wal");
+        let shm = companion("-shm");
+        for p in [&base, &wal, &shm] {
+            std::fs::write(p, b"x").unwrap();
+            assert!(p.exists());
+        }
+        remove_sqlite_db(&base);
+        assert!(!base.exists(), "main db file should be removed");
+        assert!(!wal.exists(), "-wal companion should be removed");
+        assert!(!shm.exists(), "-shm companion should be removed");
+    }
 }
