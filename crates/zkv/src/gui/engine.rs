@@ -2490,10 +2490,14 @@ mod tests {
     #[test]
     fn friendly_sync_error_rewrites_known_cases_and_passes_others_through() {
         assert!(friendly_sync_error("transport error").contains("Can't reach"));
-        assert!(friendly_sync_error("another zkv process is using this database")
-            .contains("Another zkv process"));
-        assert!(friendly_sync_error("database has no wallet key imported yet")
-            .contains("wallet key is missing"));
+        assert!(
+            friendly_sync_error("another zkv process is using this database")
+                .contains("Another zkv process")
+        );
+        assert!(
+            friendly_sync_error("database has no wallet key imported yet")
+                .contains("wallet key is missing")
+        );
         // Unknown errors pass through verbatim rather than vanishing.
         assert_eq!(friendly_sync_error("something weird"), "something weird");
     }
