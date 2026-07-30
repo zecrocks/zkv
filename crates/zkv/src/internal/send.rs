@@ -128,8 +128,9 @@ pub fn validate_recipient(
 /// A validated recipient: its kind label plus the network and shielded pool it
 /// pays into, for a richer "valid X address (network, pool)" UI hint. `pool` is
 /// `None` for transparent / TEX recipients (no shielded pool); for a unified
-/// address it is the preferred shielded pool present (Orchard over Sapling), or
-/// transparent if the UA carries only a transparent receiver.
+/// address it is the preferred shielded pool present (`"ironwood/orchard"` over
+/// Sapling; every Orchard receiver is an Ironwood receiver, they share the
+/// pool), or transparent if the UA carries only a transparent receiver.
 pub struct RecipientInfo {
     pub kind: String,
     pub network: String,
@@ -153,7 +154,7 @@ pub fn describe_recipient(
     match addr.convert_if_network::<Address>(network.network_type()) {
         Ok(Address::Unified(ua)) => {
             let pool = if ua.has_orchard() {
-                "orchard"
+                "ironwood/orchard"
             } else if ua.has_sapling() {
                 "sapling"
             } else {
@@ -443,6 +444,23 @@ mod tests {
         let info = describe_recipient(zs, crate::network::Network::Main).expect("valid sapling");
         assert_eq!(info.kind, "sapling");
         assert_eq!(info.pool.as_deref(), Some("sapling"));
+        // A UA with an Orchard receiver is labeled ironwood/orchard (every
+        // Orchard receiver is an Ironwood receiver, they share the pool).
+        let ua = {
+            use crate::internal::protocol::ua_request_for_pool;
+            let net = crate::network::Network::Main;
+            UnifiedSpendingKey::from_seed(&net, &[0x42; 32], zip32::AccountId::ZERO)
+                .expect("derive USK")
+                .to_unified_full_viewing_key()
+                .default_address(ua_request_for_pool(ShieldedPool::Ironwood))
+                .expect("orchard UA")
+                .0
+                .encode(&net)
+        };
+        let info = describe_recipient(&ua, crate::network::Network::Main).expect("valid unified");
+        assert_eq!(info.kind, "unified");
+        assert_eq!(info.network, "mainnet");
+        assert_eq!(info.pool.as_deref(), Some("ironwood/orchard"));
         // Wrong network is a clear error, not a misclassification.
         assert!(describe_recipient(zs, crate::network::Network::Test).is_err());
         // Empty and garbage are rejected before any network check.

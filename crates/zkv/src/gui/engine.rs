@@ -532,8 +532,9 @@ pub struct AddrCheckResp {
     /// The address's network label (`main`/`test`/`regtest` → `mainnet`/…),
     /// so the UI can show "valid X address (network, pool)". `None` on failure.
     pub network: Option<String>,
-    /// The shielded pool the recipient pays into (`orchard`/`sapling`), or
-    /// `transparent` for a transparent / TEX recipient. `None` on failure.
+    /// The shielded pool the recipient pays into (`ironwood/orchard` or
+    /// `sapling`), or `transparent` for a transparent / TEX recipient.
+    /// `None` on failure.
     pub pool: Option<String>,
     pub error: Option<String>,
 }
