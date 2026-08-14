@@ -1,0 +1,209 @@
+name: Regtest E2E
+
+# Live tier: brings up a zebra (Regtest) node with a lightwalletd in front of
+# it and drives the real zkv CLI binary through the full database lifecycle
+# (init, fund, INIT, set/get/del, history, roles, watch-only, shallow); see
+# regtest-harness/. It also runs zcash-devtool (regtest-enabled) as the
+# funding wallet, used to shield a mined transparent coinbase into Orchard and
+# fund the zkv wallet (regtest can't mine an Orchard coinbase directly).
+# No zingo-infra: the harness mines via zebrad's Regtest-only `generate` RPC,
+# so it has no zebra crate dependency. zebrad, lightwalletd and zcash-devtool
+# are all extracted from Docker images.
+#
+# This is the ONE live tier. It used to be split in two: this workflow ran a
+# pre-Ironwood (stock zebra) stack, and `regtest-ironwood.yml` ran the Ironwood
+# stack for the Ironwood feature branch only. Once that branch merged, zkv
+# activated NU6.3 at regtest height 8 unconditionally, which made the stock
+# stack unable to pass at all (the wallet builds V6 transactions the old zebrad
+# rejects) while the tier that *could* pass was gated off ordinary PRs. Both
+# halves are folded back together here, on the Ironwood stack.
+#
+# Runs on PRs and pushes to main against the pinned zebra image. The weekly
+# schedule tests BOTH the pinned image (re-validating the baseline) and
+# zfnd/zebra:latest (an early-warning canary for upstream zebra changes).
+#
+# The pattern (and much of the harness) follows zecd's Regtest E2E workflow.
+
+on:
+  workflow_dispatch:
+    inputs:
+      zebra-image:
+        description: "zfnd/zebra image tag to test against (e.g. 5.0.0, latest)"
+        required: false
+        default: ""
+  schedule:
+    # Weekly canary against zfnd/zebra:latest (Tuesdays 06:43 UTC; an off-peak
+    # odd minute).
+    - cron: "43 6 * * 2"
+  push:
+    # Mainline only: feature branches (incl. claude/**) are covered by the
+    # pull_request trigger below, so listing them here too would run every job
+    # twice on a PR push.
+    branches: [main, master]
+    paths:
+      - "regtest-harness/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/regtest.yml"
+  pull_request:
+    paths:
+      - "regtest-harness/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/regtest.yml"
+
+# The pinned zebra image used by PR/push runs; the schedule runs `latest` as
+# well, and a manual dispatch can name any tag. Bumping zebra = changing this
+# one value (the harness drives zebrad purely over JSON-RPC, so nothing else
+# needs to move in lockstep).
+#
+# The pin must be an **Ironwood-capable** zebra. zkv's
+# `network::REGTEST_NU6_3_HEIGHT` activates NU6.3 at height 8 on regtest
+# unconditionally, so the wallet builds V6 transactions past that height; a
+# pre-Ironwood zebrad cannot parse them and rejects the broadcast with
+# `-22 parse error: bad tx header`. `6.0.0` is the released Ironwood zebra,
+# and the tag this tier has been green against.
+#
+# The lightwalletd and zcash-devtool images are likewise Ironwood builds, and
+# are digest-pinned because they are development artifacts rather than tagged
+# upstream releases. Official Ironwood-capable lightwalletd releases have
+# started appearing (`electriccoinco/lightwalletd:v0.5.x`); moving onto them is
+# a follow-up worth doing on its own so a failure is attributable to the image
+# swap.
+#
+# IMPORTANT: no workflow env var may start with `ZEBRA_`; zebrad parses
+# ZEBRA_*-prefixed environment variables as config overrides and exits with
+# "unknown field" on ones it doesn't recognise. (The harness also scrubs
+# ZEBRA_* before spawning zebrad, as a second line of defence.)
+env:
+  ZEBRAD_IMAGE_PINNED: "6.0.0"
+  LWD_IMAGE: "emersonian/zcash-lwd-ironwood@sha256:5f63b64ed788330ad8fe859fbbb334ceea844cf8a376318e7e25fbd3351b2f9f"
+  DEVTOOL_IMAGE: "emersonian/zcash-devtool@sha256:fd95d8b432f47d3eec6e5f1eca0bdfbb8daa094c28742d230bec3ac47957bd6c"
+
+concurrency:
+  group: regtest-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  regtest:
+    runs-on: ubuntu-latest
+    # NB: new harness test files must be added to the matrix `tests` list here
+    # (it enumerates --test targets; nothing runs them implicitly).
+    #
+    # The `image` dimension is "event" except on the weekly schedule, where
+    # both the pinned baseline and `latest` run ("event" resolves the tag from
+    # the trigger: dispatch input or the pinned default).
+    strategy:
+      fail-fast: false
+      matrix:
+        suite: [zkv]
+        image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
+        include:
+          - suite: zkv
+            tests: --test regtest_unfunded --test regtest_kv
+    name: regtest (${{ matrix.suite }}, ${{ matrix.image }})
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            .
+            regtest-harness
+
+      # Release build: writes prove Orchard spends, and debug proving is >20s
+      # per transaction; release keeps the harness snappy. The lean CLI build
+      # skips the GUI asset/licensing build steps.
+      - name: Build zkv (release, lean CLI)
+        run: cargo build --release -p zkv --bin zkv --no-default-features --features cli,transparent-inputs
+
+      # Pick the zebra image. The matrix names it outright on the weekly
+      # schedule (pinned + latest legs); otherwise ("event") it comes from the
+      # trigger: a manual dispatch's input, or the pinned tag for PR/push runs.
+      - name: Select zebra image tag
+        run: |
+          case "${{ matrix.image }}" in
+            pinned) tag="$ZEBRAD_IMAGE_PINNED" ;;
+            latest) tag="latest" ;;
+            *)
+              case "${{ github.event_name }}" in
+                workflow_dispatch) tag="${{ inputs.zebra-image }}"; tag="${tag:-$ZEBRAD_IMAGE_PINNED}" ;;
+                *) tag="$ZEBRAD_IMAGE_PINNED" ;;
+              esac
+              ;;
+          esac
+          echo "Testing against zfnd/zebra:$tag"
+          echo "ZEBRAD_IMAGE_TAG=$tag" >> "$GITHUB_ENV"
+
+      # Extract zebrad + lightwalletd + zcash-devtool from their Docker images.
+      # The harness drives all three as subprocesses (it reads ZEBRAD_BIN /
+      # LIGHTWALLETD_BIN / DEVTOOL_BIN), so we only need the binaries.
+      #
+      # zcash-devtool is the funding wallet: it shields a mined transparent
+      # coinbase into Orchard and sends it to the zkv wallet, since regtest
+      # can't mine an Orchard coinbase a shielded wallet would scan. It comes
+      # from an image rather than a source build because the Ironwood devtool
+      # is what the harness's funder path targets (see `Funder::init`:
+      # `wallet init` reads the mnemonic from stdin and requires
+      # `--activation-heights` for regtest).
+      - name: Provision zebrad + lightwalletd + devtool from images
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/bin"
+          extract() {
+            img="$1"; name="$2"; out="$RUNNER_TEMP/bin/$name"
+            docker pull -q "$img"
+            cid=$(docker create "$img")
+            rel=$(docker export "$cid" | tar -tf - | grep -m1 -E "(^|/)${name}\$" || true)
+            if [ -z "$rel" ]; then echo "::error::could not locate $name in $img"; docker rm "$cid" >/dev/null; exit 1; fi
+            docker cp "$cid:/$rel" "$out"
+            docker rm "$cid" >/dev/null
+            chmod +x "$out"
+            echo "$name -> $out"; file -b "$out" || true
+          }
+          extract "zfnd/zebra:$ZEBRAD_IMAGE_TAG" zebrad
+          extract "$LWD_IMAGE" lightwalletd
+          extract "$DEVTOOL_IMAGE" zcash-devtool
+          echo "ZEBRAD_BIN=$RUNNER_TEMP/bin/zebrad" >> "$GITHUB_ENV"
+          echo "LIGHTWALLETD_BIN=$RUNNER_TEMP/bin/lightwalletd" >> "$GITHUB_ENV"
+          echo "DEVTOOL_BIN=$RUNNER_TEMP/bin/zcash-devtool" >> "$GITHUB_ENV"
+
+      # The harness is its own workspace, so the root ci.yml's clippy never
+      # sees it; lint it here where it is already being compiled.
+      - name: Clippy (harness)
+        run: cargo clippy --all-targets --locked --manifest-path regtest-harness/Cargo.toml -- -D warnings
+
+      - name: Run regtest end-to-end harness
+        env:
+          ZKV_BIN: ${{ github.workspace }}/target/release/zkv
+          # Enable the NU6.3 (Ironwood) activation-height wiring on all three
+          # sides that must agree, or consensus diverges:
+          #   - zebra:  `"NU6.3" = 8` (harness `zebrad_toml`)
+          #   - wallet: `network::REGTEST_NU6_3_HEIGHT = 8` (crates/zkv/src/network.rs)
+          #   - funder: devtool `--activation-heights` `nu6_3 = 8` (harness `Funder::init`)
+          # zkv activates NU6.3 on regtest unconditionally, so this is not
+          # optional: without it the chain has no NU6.3 and the wallet's V6
+          # transactions are rejected as `bad tx header`.
+          ZKV_REGTEST_NU6_3: "1"
+          # Capture zebrad's logs so a startup failure is diagnosable from the
+          # CI run.
+          ZEBRAD_STDERR: ${{ runner.temp }}/zebrad.log
+          # ZEBRAD_BIN / LIGHTWALLETD_BIN / DEVTOOL_BIN are exported by the
+          # provisioning step above.
+        # --locked: build against the committed lock. Single-threaded: two
+        # zebrad+lightwalletd stacks plus Orchard proving would contend badly
+        # on a 2-core runner. --no-fail-fast: run every test binary even if an
+        # earlier one fails.
+        run: cargo test --locked --manifest-path regtest-harness/Cargo.toml ${{ matrix.tests }} --no-fail-fast -- --nocapture --test-threads=1
+
+      - name: Dump diagnostics on failure
+        if: failure()
+        run: |
+          echo "== disk =="
+          df -h / "$RUNNER_TEMP" || true
+          echo "== zebrad log (last 200 lines) =="
+          tail -n 200 "$RUNNER_TEMP/zebrad.log" 2>/dev/null || echo "(no zebrad log was written)"
