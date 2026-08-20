@@ -51,13 +51,13 @@ struct DecodedRow {
 /// matching `zcash_client_sqlite`'s `pool_code` (Sapling = 2, Orchard = 3,
 /// Ironwood = 4; transparent is 0 and carries no memo).
 ///
-/// The Orchard *value pool* spans two codes: `3` for V5 Orchard outputs and
-/// `4` for V6 Ironwood outputs. Ironwood shares the Orchard receiver and value
-/// pool, and a post-NU6.3 database's own writes are built as V6 (an Orchard
-/// wallet auto-upgrades on its first send), so a single Orchard/Ironwood
-/// database's memos can land under *either* code. Read paths must match both,
-/// or V6 memos (including this build's own writes on an Ironwood chain) are
-/// invisible. A Sapling database stays code 2 only.
+/// Orchard and Ironwood are *distinct value pools* that share the Orchard
+/// receiver, so one UFVK decrypts both and a single Orchard/Ironwood
+/// database's memos can land under *either* code: `3` for V5 Orchard outputs
+/// and `4` for V6 Ironwood ones (a post-NU6.3 database's own writes are built
+/// as V6, since an Orchard wallet auto-upgrades on its first send). Read paths
+/// must match both, or V6 memos (including this build's own writes on an
+/// Ironwood chain) are invisible. A Sapling database stays code 2 only.
 fn pool_output_codes(pool: ShieldedPool) -> &'static [i64] {
     match pool {
         ShieldedPool::Sapling => &[2],

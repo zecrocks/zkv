@@ -284,10 +284,9 @@ pub async fn pay(
     // the transaction has no shielded inputs. It must be a pool the fee/change
     // accounting models directly (`OutputManifest` has only Sapling and Orchard
     // slots): passing `Ironwood` trips a `total_shielded() == target_change_count`
-    // assertion in `zcash_client_backend`. Ironwood shares the Orchard pool
-    // on-chain, and the builder routes Orchard-pool change into the V6 Ironwood
-    // bundle when NU6.3 is active, so fold Ironwood to Orchard here (matching
-    // zcash-devtool, which always passes Orchard).
+    // assertion in `zcash_client_backend`. The builder routes Orchard-pool
+    // change into the V6 Ironwood bundle when NU6.3 is active, so fold Ironwood
+    // to Orchard here (matching zcash-devtool, which always passes Orchard).
     let fallback_change_pool = match config.pool {
         ShieldedPool::Ironwood => ShieldedPool::Orchard,
         other => other,
