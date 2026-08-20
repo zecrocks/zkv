@@ -129,8 +129,8 @@ pub fn validate_recipient(
 /// pays into, for a richer "valid X address (network, pool)" UI hint. `pool` is
 /// `None` for transparent / TEX recipients (no shielded pool); for a unified
 /// address it is the preferred shielded pool present (`"ironwood/orchard"` over
-/// Sapling; every Orchard receiver is an Ironwood receiver, they share the
-/// pool), or transparent if the UA carries only a transparent receiver.
+/// Sapling; Ironwood shares the Orchard receiver, so one receiver serves
+/// both), or transparent if the UA carries only a transparent receiver.
 pub struct RecipientInfo {
     pub kind: String,
     pub network: String,
@@ -444,8 +444,8 @@ mod tests {
         let info = describe_recipient(zs, crate::network::Network::Main).expect("valid sapling");
         assert_eq!(info.kind, "sapling");
         assert_eq!(info.pool.as_deref(), Some("sapling"));
-        // A UA with an Orchard receiver is labeled ironwood/orchard (every
-        // Orchard receiver is an Ironwood receiver, they share the pool).
+        // A UA with an Orchard receiver is labeled ironwood/orchard
+        // (Ironwood shares the Orchard receiver, so one receiver serves both).
         let ua = {
             use crate::internal::protocol::ua_request_for_pool;
             let net = crate::network::Network::Main;
