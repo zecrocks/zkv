@@ -5,12 +5,12 @@ all-features = true
 version = 2
 yanked = "deny"
 ignore = [
-    # time <0.3.47 stack-exhaustion DoS via RFC 2822 parsing. Reached only
-    # through rusqlite's internal timestamp handling; zkv never feeds user
-    # input into RFC 2822 parsers. Pin is enforced upstream by
-    # `zcash_client_backend`'s `time-core = "=0.1.2"` requirement, so we
-    # can't bump until librustzcash relaxes it.
-    "RUSTSEC-2026-0009",
+    # RUSTSEC-2026-0009 (time <0.3.47 stack-exhaustion DoS via RFC 2822
+    # parsing) used to be ignored here: `zcash_client_backend` pinned
+    # `time-core = "=0.1.2"`, which held `time` below the fixed release. The
+    # librustzcash bump drops that pin, so `time` now resolves to 0.3.55 and
+    # the advisory no longer applies.
+    #
     # proc-macro-error2 is unmaintained. It is a build-time proc-macro
     # dependency only (no runtime code path), pulled in transitively by
     # orchard (via getset) and age (via i18n-embed-fl); there is no
@@ -51,18 +51,10 @@ wildcards = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Ironwood (NU6.3) support pins the librustzcash crate set to upstream
-# `zcash/librustzcash` main via [patch.crates-io] in the workspace Cargo.toml
-# (the crates.io releases of the wallet crates depend on the `-pre` lower crates
-# and so can't be used directly), and upstream in turn needs an unreleased
-# orchard and shardtree/incrementalmerkletree. Allow those official zcash git
-# sources until the NU6.3 crates are published to crates.io, at which point the
-# patches and these entries come back out. See the workspace Cargo.toml comment.
-allow-git = [
-    "https://github.com/zcash/librustzcash",
-    # orchard git rev: padded BundleType::DEFAULT + Ironwood bundle fields.
-    "https://github.com/zcash/orchard",
-    # zcash/incrementalmerkletree main: the checkpoint-retention APIs plus the
-    # shardtree clear_flags checkpoint-pruning panic fix (see workspace Cargo.toml).
-    "https://github.com/zcash/incrementalmerkletree",
-]
+# Empty on purpose. The Ironwood (NU6.3) crate set used to be pinned to git
+# revisions of zcash/librustzcash, zcash/orchard, and
+# zcash/incrementalmerkletree via [patch.crates-io] in the workspace Cargo.toml,
+# because the wallet crates' crates.io releases still linked the pre-Ironwood
+# consensus crates. All of it is published now, the patches are gone, and the
+# whole dependency graph resolves from crates.io, so no git source is allowed.
+allow-git = []

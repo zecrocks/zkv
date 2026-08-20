@@ -61,29 +61,43 @@ axum = { version = "0.7", default-features = false, features = ["tokio", "http1"
 
 # Zcash ecosystem: version-locked as a set.
 #
-# Ironwood (NU6.3 / V6 transaction) support, consumed **straight from crates.io**
-# (same model as zecd): the released Ironwood librustzcash line carries the NU6.3
-# mainnet activation height (3_428_143, 2026-07-28) that the old `-pre` git pin
-# lacked; with the pin, transactions built after mainnet activation would commit
-# to the NU6.2 branch ID and be rejected. Leaf crates are finals
-# (`zcash_primitives`/`zcash_proofs 0.29`, `orchard 0.15`, `zcash_protocol 0.10`,
-# `zcash_keys 0.15`); the wallet crates ride the release candidates
-# (`zcash_client_backend 0.24.0-rc.1`, `zcash_client_sqlite 0.22.0-rc.1`,
-# `pczt 0.8.0-rc.1`, `zip321 0.9.0-rc.1`). The shardtree checkpoint-retention
-# APIs (#184) and the checkpoint-prune panic fix (#192) both shipped in
-# `shardtree 0.7.0`, so the incrementalmerkletree git pins are gone too: no
-# forks, no git pins, no [patch.crates-io].
-transparent = { package = "zcash_transparent", version = "0.9" }
+# Ironwood (NU6.3 / V6 transaction) support, now entirely from stable crates.io
+# releases. The whole librustzcash set used to be repointed at upstream
+# `zcash/librustzcash` main via [patch.crates-io] because the consensus-layer
+# crates were only available as `-pre` releases and the wallet crates' crates.io
+# builds still depended on the older stable ones. Upstream has since published
+# the real releases (zcash_primitives 0.30, zcash_keys 0.16, zcash_transparent
+# 0.10, zcash_address 0.13, zcash_protocol 0.10.4, plus orchard 0.15 and
+# shardtree 0.7), so the git patches are gone: see the note where
+# [patch.crates-io] used to live. The wallet crates have now reached their
+# final 0.24 / 0.22 releases too, so nothing here is a pre-release any more.
+# The released line also carries the NU6.3 mainnet activation height
+# (3_428_143, 2026-07-28), which the old `-pre` git pin lacked.
+transparent = { package = "zcash_transparent", version = "0.10" }
 zcash_address = "0.13"
 zcash_note_encryption = "0.4.2"
-# The wallet RCs are `=`-pinned: later RCs in the same line moved to
-# `zcash_keys 0.16`, which would split the graph into two zcash_keys versions
-# (zecd pins the same rc.1 pair).
-zcash_client_backend = { version = "=0.24.0-rc.1", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt"] }
-zcash_client_sqlite = { version = "=0.22.0-rc.1", features = ["unstable", "orchard", "serde"] }
-zcash_keys = { version = "0.15.0", features = ["orchard", "unstable"] }
-zcash_primitives = "0.29"
-zcash_protocol = { version = "0.10", features = ["local-consensus"] }
+zcash_client_backend = { version = "0.24", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt"] }
+zcash_client_sqlite = { version = "0.22", features = ["unstable", "orchard", "serde"] }
+zcash_keys = { version = "0.16.1", features = ["orchard", "unstable"] }
+zcash_primitives = "0.30"
+zcash_protocol = { version = "0.10.4", features = ["local-consensus"] }
 zip32 = "0.2"
-zip321 = "=0.9.0-rc.1"
+zip321 = "0.9"
 
+# NOTE: there is deliberately no [patch.crates-io] section any more.
+#
+# Ironwood (NU6.3 / V6 transaction) support used to require repointing every
+# librustzcash crate (plus orchard and shardtree/incrementalmerkletree) at git
+# revisions, because the consensus-layer crates existed only as `-pre` releases
+# and the wallet crates' crates.io builds still linked the older stable ones.
+# Upstream has now published all of it: zcash_primitives 0.30, zcash_proofs
+# 0.30, zcash_keys 0.16, zcash_transparent 0.10, zcash_address 0.13,
+# zcash_protocol 0.10.4, pczt 0.9, orchard 0.15, shardtree 0.7 (carrying the
+# checkpoint-retention APIs and the `clear_flags` checkpoint-pruning panic fix),
+# and the zcash_client_backend 0.24 / zcash_client_sqlite 0.22 wallet crates
+# that depend on them. Upstream librustzcash main no longer patches anything
+# either, so neither do we, and `deny.toml` no longer allow-lists any git
+# source.
+#
+# If a future pre-release cycle needs git pins again, they must live here: a
+# [patch] only takes effect from the workspace root.

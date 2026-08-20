@@ -58,8 +58,10 @@ ripemd = "0.1"
 nonempty = { version = "0.11", default-features = false }
 
 # Zcash
+# orchard 0.15 is released, so the exact `=0.15.0-pre.2` pin (which existed only
+# to match the git rev upstream librustzcash used to be patched to) is gone.
 orchard = { version = "0.15", default-features = false }
-pczt = "=0.8.0-rc.1"
+pczt = "0.9"
 sapling = { package = "sapling-crypto", version = "0.7" }
 transparent = { workspace = true }
 zcash_address = { workspace = true }
@@ -70,7 +72,7 @@ zcash_keys = { workspace = true }
 # tree transitively via sapling-crypto / orchard / zcash_client_backend).
 zcash_note_encryption = { workspace = true }
 zcash_primitives = { workspace = true }
-zcash_proofs = { version = "0.29", features = ["bundled-prover"] }
+zcash_proofs = { version = "0.30", features = ["bundled-prover"] }
 zcash_protocol = { workspace = true }
 zcash_script = "0.4"
 zip32 = { workspace = true }
