@@ -67,6 +67,16 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.value }}
     steps:
+      - uses: actions/checkout@v5
+
+      # A build's out-of-date banner fires FRESH_WINDOW_SECS after it was
+      # compiled, so it can't go stale by itself; what can is the window
+      # shrinking or the mainnet height anchor ageing out of usefulness. Fail
+      # the release here, before any artifact is built, rather than shipping a
+      # build that nags its own users (as rc5 and rc6 did).
+      - name: Check build-freshness settings
+        run: scripts/check-build-freshness.py
+
       - name: Compute build matrix
         id: matrix
         shell: bash

@@ -1,4 +1,5 @@
 use std::process::Command;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 // Generates the GUI's third-party license bundle into `$OUT_DIR/licenses.txt`
 // (see `src/gui/assets.rs`). Only needed, and only compiled, for the `gui`
@@ -29,6 +30,26 @@ fn main() {
     println!("cargo:rerun-if-env-changed=ZKV_GIT_SHA");
     println!("cargo:rerun-if-changed=../../.git/HEAD");
     println!("cargo:rerun-if-changed=../../.git/index");
+
+    // Stamp the build time (unix seconds) so `freshness` can derive this
+    // build's expiry from when it was compiled, instead of a hard-coded cutoff
+    // date that silently goes stale between releases. An explicit
+    // `ZKV_BUILD_UNIX` wins, then `SOURCE_DATE_EPOCH` (so a reproducible
+    // rebuild of a release pins that release's expiry rather than extending
+    // it), then the clock.
+    let build_unix = std::env::var("ZKV_BUILD_UNIX")
+        .ok()
+        .or_else(|| std::env::var("SOURCE_DATE_EPOCH").ok())
+        .and_then(|s| s.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
+    println!("cargo:rustc-env=ZKV_BUILD_UNIX={build_unix}");
+    println!("cargo:rerun-if-env-changed=ZKV_BUILD_UNIX");
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
 
     // Generate the third-party license bundle for the embedded GUI.
     #[cfg(feature = "gui")]
