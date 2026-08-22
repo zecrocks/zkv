@@ -984,6 +984,22 @@ async fn update_chain_tip<P: Parameters>(
 /// of large blocks can hit it, and those are safe to slow-read.
 const DOWNLOAD_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
+/// How many consecutive zero-progress reconnects [`download_blocks`] tolerates
+/// after a client-side h2 load-shed GOAWAY before giving up. Any attempt that
+/// writes at least one block resets the count, so a download that keeps making
+/// progress keeps resuming.
+const MAX_STALLED_STREAM_RESTARTS: u32 = 3;
+
+/// Whether an error is h2's own load-shed GOAWAY (`ENHANCE_YOUR_CALM` /
+/// `too_many_data_frames`): the *client* library killing a healthy connection
+/// because too many small DATA frames sat momentarily unpolled. Retryable by
+/// reconnecting and resuming; the reason only appears in the source chain, so
+/// match on the debug rendering.
+fn is_h2_load_shed(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:?}");
+    msg.contains("too_many_data_frames") || msg.contains("ENHANCE_YOUR_CALM")
+}
+
 async fn download_blocks(
     client: &mut CompactTxStreamerClient<Channel>,
     fsblockdb_root: &Path,
@@ -991,13 +1007,73 @@ async fn download_blocks(
     scan_range: &ScanRange,
 ) -> anyhow::Result<Vec<BlockMeta>> {
     info!("Fetching {}", scan_range);
-    let mut start = service::BlockId::default();
-    start.height = scan_range.block_range().start.into();
-    let mut end = service::BlockId::default();
-    end.height = (scan_range.block_range().end - 1).into();
+    let range_end: u64 = (scan_range.block_range().end - 1).into();
+    let mut next: u64 = scan_range.block_range().start.into();
+    let mut block_meta: Vec<BlockMeta> = vec![];
+    let mut stalled_restarts = 0u32;
+    loop {
+        let before = block_meta.len();
+        match download_range_once(client, fsblockdb_root, next, range_end, &mut block_meta).await {
+            Ok(()) => break,
+            // h2's client-side DoS protection (see `download_range_once`) can
+            // still fire on a large enough burst of tiny frames: the budget is
+            // charged as the connection task *parses* frames off the socket,
+            // so a datacenter-bandwidth burst can exhaust it before the
+            // consumer task gets scheduled at all, however fast it drains.
+            // The GOAWAY only kills the connection, not our progress: every
+            // block already written stays written, tonic's channel reconnects
+            // transparently on the next call, and a fresh connection starts
+            // with a full budget. Resume from the first block we don't have.
+            Err(e) if is_h2_load_shed(&e) => {
+                if block_meta.len() > before {
+                    stalled_restarts = 0;
+                } else {
+                    stalled_restarts += 1;
+                    if stalled_restarts > MAX_STALLED_STREAM_RESTARTS {
+                        return Err(e.context(
+                            "block download made no progress across repeated h2 load-shed \
+                             reconnects",
+                        ));
+                    }
+                }
+                if let Some(last) = block_meta.last() {
+                    next = u64::from(last.height) + 1;
+                }
+                tracing::warn!(
+                    "client-side h2 load shed killed the block stream; reconnecting and \
+                     resuming at {next}"
+                );
+            }
+            Err(e) => return Err(e),
+        }
+    }
+
+    db_cache
+        .write_block_metadata(&block_meta)
+        .map_err(error::Error::from)?;
+    Ok(block_meta)
+}
+
+/// One streaming attempt of [`download_blocks`]: fetch `[next, range_end]`,
+/// appending a [`BlockMeta`] to `block_meta` for every block whose cache file
+/// was written. On a stream error, everything already appended is on disk, so
+/// the caller can resume after the last entry.
+async fn download_range_once(
+    client: &mut CompactTxStreamerClient<Channel>,
+    fsblockdb_root: &Path,
+    next: u64,
+    range_end: u64,
+    block_meta: &mut Vec<BlockMeta>,
+) -> anyhow::Result<()> {
     let range = service::BlockRange {
-        start: Some(start),
-        end: Some(end),
+        start: Some(service::BlockId {
+            height: next,
+            ..Default::default()
+        }),
+        end: Some(service::BlockId {
+            height: range_end,
+            ..Default::default()
+        }),
         pool_types: Default::default(),
     };
     let mut stream = client.get_block_range(range).await?.into_inner();
@@ -1017,12 +1093,13 @@ async fn download_blocks(
     // first batch committed; the next sync cycle restarted from the same
     // position and died the same way, so the wallet never progressed and the
     // GUI showed a misleading "can't reach the server" banner. Draining
-    // eagerly keeps h2's receive buffer empty (its budget replenishes as
-    // frames are polled), so the connection survives regardless of disk
-    // speed. The buffer is bounded by bytes rather than messages: small
-    // blocks (the dangerous case) always fit far under the bound for a whole
-    // batch, while large blocks may backpressure the reader but replenish
-    // the h2 budget and are safe to read slowly.
+    // eagerly keeps h2's receive buffer close to empty (its budget
+    // replenishes as frames are polled), and the retry in `download_blocks`
+    // absorbs the burst case the drain cannot prevent. The buffer is bounded
+    // by bytes rather than messages: small blocks (the dangerous case)
+    // always fit far under the bound for a whole batch, while large blocks
+    // may backpressure the reader but replenish the h2 budget and are safe
+    // to read slowly.
     let permits = Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_BUFFER_BYTES));
     let reader_permits = permits.clone();
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1057,7 +1134,9 @@ async fn download_blocks(
         Ok::<(), tonic::Status>(())
     });
 
-    let mut block_meta = vec![];
+    // Blocks buffered before a stream error are still written (the channel
+    // drains fully before the error surfaces below), so partial progress
+    // survives for the resume path.
     while let Some((meta, encoded, _permit)) = rx.recv().await {
         let mut f = File::create(get_block_path(fsblockdb_root, &meta)).await?;
         f.write_all(&encoded).await?;
@@ -1066,11 +1145,7 @@ async fn download_blocks(
     // The channel closing cleanly still requires the reader to have ended
     // without a stream error; surface one if it did.
     reader.await??;
-
-    db_cache
-        .write_block_metadata(&block_meta)
-        .map_err(error::Error::from)?;
-    Ok(block_meta)
+    Ok(())
 }
 
 async fn download_chain_state(
@@ -1511,7 +1586,8 @@ async fn enhance<P: Parameters + Send + 'static>(
 #[cfg(test)]
 mod tests {
     use super::{
-        mined_with_memo_txids, read_tip_tolerance, tip_time_is_fresh, SyncProgress, TIP_MAX_AGE,
+        is_h2_load_shed, mined_with_memo_txids, read_tip_tolerance, tip_time_is_fresh,
+        SyncProgress, TIP_MAX_AGE,
     };
     use zcash_primitives::transaction::TxId;
 
@@ -1649,5 +1725,29 @@ mod tests {
     fn future_tip_is_treated_as_fresh() {
         // Clock skew: a future-dated block must not be rejected.
         assert!(tip_time_is_fresh(now_secs().saturating_add(120)));
+    }
+    // The retry in `download_blocks` hinges on recognizing h2's own load-shed
+    // GOAWAY, whose reason only shows up in the error's Debug chain. Pin that
+    // contract: a real error must match, and errors we must NOT silently retry
+    // (a genuine transport failure, a stale-tip refusal) must not.
+    #[test]
+    fn h2_load_shed_is_recognized_from_the_debug_chain() {
+        let shed = anyhow::anyhow!(
+            "status: ResourceExhausted, message: \"h2 protocol error: error reading a body \
+             from connection\", source: Some(hyper::Error(Body, Error {{ kind: \
+             GoAway(b\"too_many_data_frames\", ENHANCE_YOUR_CALM, Library) }}))"
+        );
+        assert!(is_h2_load_shed(&shed));
+
+        for other in [
+            "transport error",
+            "connection error detected: unexpected internal error encountered",
+            "can't confirm a current chain tip (latest block is over 300s old)",
+        ] {
+            assert!(
+                !is_h2_load_shed(&anyhow::anyhow!("{other}")),
+                "must not be treated as a load shed: {other}"
+            );
+        }
     }
 }
