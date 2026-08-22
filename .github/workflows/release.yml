@@ -7,33 +7,43 @@ name: release
 #                           (nothing is published), so the pipeline can be
 #                           exercised without cutting a tag.
 #
-# Artifacts (each with a matching `.sha256` published alongside it in the
-# release, never packed inside an archive). Filenames are STABLE across
-# releases (no version), so `releases/latest/download/<name>` is a permanent
-# link; the version lives inside instead (the CLI archives unpack to a
-# `zkv-cli-<ver>-<label>/` folder, the GUI bundles carry it in their .app
-# Info.plist / .deb / .exe metadata). Filenames use a short
-# `<platform>-<arch>` label; the build itself still uses the full Rust target
-# triple.
-#   * Linux, x86_64 (build `x86_64-unknown-linux-gnu`, label `linux-x86_64`)
-#     and aarch64 (build `aarch64-unknown-linux-gnu`, label `linux-aarch64`),
-#     each built on a native runner (no cross-compile):
-#       - zkv-cli-<label>.tgz          : the lean `zkv` CLI (versioned folder inside).
-#       - zkv-browser-<label>.AppImage : desktop GUI, the portable single-file
-#         app (bundles its own WebKitGTK-dependent runtime view).
-#       - zkv-browser-<label>.deb      : desktop GUI, a Debian package
-#         (declares its WebKitGTK dependency for apt).
-#   * macOS, Apple Silicon (build `aarch64-apple-darwin`, label `macos-arm`):
-#       - zkv-cli-macos-arm.tgz      : the lean `zkv` CLI (versioned folder inside).
-#       - zkv-browser-macos-arm.dmg  : the native desktop GUI, a
+# Every filename carries the version and one arch token per target, and the
+# release ships a single `SHA256SUMS` covering all of them rather than a
+# per-file `.sha256` sidecar (verify with `sha256sum -c SHA256SUMS`, or
+# `shasum -a 256 -c` on macOS/BSD). Arch tokens are the Debian/Go names
+# amd64/arm64 - the fixed point is the `.deb` convention, so one spelling
+# covers every artifact. The build still uses the full Rust target triple; the
+# triple never appears in a filename.
+#
+#   <product>-<version>-<platform>-<arch>.<ext>   everything except the .deb
+#   <product>_<version>_<arch>.deb                Debian's own convention
+#
+# So a v0.0.1 release lists:
+#   * Linux, amd64 (build `x86_64-unknown-linux-gnu`) and arm64 (build
+#     `aarch64-unknown-linux-gnu`), each on a native runner (no cross-compile):
+#       - zkv-cli-0.0.1-linux-{amd64,arm64}.tar.gz       : the lean `zkv` CLI.
+#       - zkv-browser-0.0.1-linux-{amd64,arm64}.AppImage : desktop GUI, the
+#         portable single-file app (bundles its own WebKitGTK-dependent
+#         runtime view).
+#       - zkv-browser_0.0.1_{amd64,arm64}.deb            : desktop GUI, a
+#         Debian package (declares its WebKitGTK dependency for apt).
+#   * macOS, Apple Silicon (build `aarch64-apple-darwin`):
+#       - zkv-cli-0.0.1-macos-arm64.tar.gz  : the lean `zkv` CLI.
+#       - zkv-browser-0.0.1-macos-arm64.dmg : the native desktop GUI, a
 #         Tauri-bundled `.app` packaged in a `.dmg`.
-#   * Windows, x64 (build `x86_64-pc-windows-msvc`, label `windows-x86_64`):
-#       - zkv-cli-windows-x86_64.zip              : the lean `zkv.exe` (versioned folder inside).
-#       - zkv-browser-windows-x86_64-portable.exe : desktop GUI, the
+#   * Windows, x64 (build `x86_64-pc-windows-msvc`):
+#       - zkv-cli-0.0.1-windows-amd64.zip              : the lean `zkv.exe`.
+#       - zkv-browser-0.0.1-windows-amd64-portable.exe : desktop GUI, the
 #         standalone single-file app (no installer; needs WebView2 present).
-#       - zkv-browser-windows-x86_64-setup.exe    : desktop GUI, NSIS
+#       - zkv-browser-0.0.1-windows-amd64-setup.exe    : desktop GUI, NSIS
 #         installer (provisions WebView2). Not code-signed yet, so SmartScreen
 #         will warn.
+#
+# The CLI archives unpack to a folder named exactly like the archive, so two
+# releases extracted side by side never collide. Versioned names mean there is
+# no `releases/latest/download/<name>` permalink any more; nothing linked that
+# way (the website and README point at the releases page).
+#
 # To add more targets, extend the matrix (and add the matching runners).
 on:
   push:
@@ -59,13 +69,14 @@ permissions:
   contents: read
 
 jobs:
-  # Compute the build matrix. On a tag push every platform is included; on a
-  # manual dispatch the `platform` input filters it down to one platform's
-  # jobs, saving CI minutes during testing.
+  # Resolve the version and compute the build matrix. On a tag push every
+  # platform is included; on a manual dispatch the `platform` input filters it
+  # down to one platform's jobs, saving CI minutes during testing.
   setup:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.matrix.outputs.value }}
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
 
@@ -77,6 +88,42 @@ jobs:
       - name: Check build-freshness settings
         run: scripts/check-build-freshness.py
 
+      # Resolve the version once, here, so every packaging step on every runner
+      # names its artifacts from one source of truth (and the Windows runner
+      # doesn't have to re-derive it in its own shell).
+      - name: Resolve version
+        id: version
+        shell: bash
+        run: |
+          # A tag *push* is a real release: name the artifacts after the tag,
+          # minus the leading `v` so the version in the filename is spelled the
+          # same as the one in Cargo.toml. Anything else (a manual
+          # workflow_dispatch, even one dispatched against a tag ref) is a dev
+          # build: use the short git sha so the artifacts are traceable to the
+          # exact commit instead of carrying a version number they don't
+          # correspond to.
+          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="dev-${GITHUB_SHA:0:7}"
+          fi
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Resolved version=${version}"
+
+      # The version is baked into every filename now, so a manifest that
+      # disagrees with the tag would ship artifacts whose names contradict the
+      # version *inside* them (`zkv --version`, the .app Info.plist, the .deb
+      # control file). Catch that here, not after nine builds.
+      - name: Check the manifest version matches the tag
+        if: ${{ github.ref_type == 'tag' }}
+        run: |
+          manifest=$(sed -n 's/^version = "\(.*\)"$/\1/p' crates/zkv/Cargo.toml)
+          echo "manifest=${manifest} tag=${{ steps.version.outputs.version }}"
+          if [ "${manifest}" != "${{ steps.version.outputs.version }}" ]; then
+            echo "::error::crates/zkv/Cargo.toml says ${manifest}, the tag says ${{ steps.version.outputs.version }}"
+            exit 1
+          fi
+
       - name: Compute build matrix
         id: matrix
         shell: bash
@@ -84,14 +131,14 @@ jobs:
           platform="${{ inputs.platform || 'all' }}"
           all=$(cat <<'JSON'
           [
-            {"name":"zkv-cli-linux-x86_64","kind":"cli","bin":"zkv","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","label":"linux-x86_64","platform":"linux"},
-            {"name":"zkv-cli-linux-aarch64","kind":"cli","bin":"zkv","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","label":"linux-aarch64","platform":"linux"},
-            {"name":"zkv-browser-linux-x86_64","kind":"browser","bin":"zkv-browser","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","label":"linux-x86_64","platform":"linux"},
-            {"name":"zkv-browser-linux-aarch64","kind":"browser","bin":"zkv-browser","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","label":"linux-aarch64","platform":"linux"},
-            {"name":"zkv-cli-macos-arm","kind":"cli","bin":"zkv","os":"macos-14","target":"aarch64-apple-darwin","label":"macos-arm","platform":"macos"},
-            {"name":"zkv-browser-macos-arm","kind":"browser","bin":"zkv-browser","os":"macos-14","target":"aarch64-apple-darwin","label":"macos-arm","platform":"macos"},
-            {"name":"zkv-cli-windows","kind":"cli","bin":"zkv","os":"windows-2025","target":"x86_64-pc-windows-msvc","label":"windows-x86_64","platform":"windows"},
-            {"name":"zkv-browser-windows","kind":"browser","bin":"zkv-browser","os":"windows-2025","target":"x86_64-pc-windows-msvc","label":"windows-x86_64","platform":"windows"}
+            {"name":"zkv-cli-linux-amd64","kind":"cli","bin":"zkv","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","label":"linux-amd64","arch":"amd64","platform":"linux"},
+            {"name":"zkv-cli-linux-arm64","kind":"cli","bin":"zkv","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","label":"linux-arm64","arch":"arm64","platform":"linux"},
+            {"name":"zkv-browser-linux-amd64","kind":"browser","bin":"zkv-browser","os":"ubuntu-22.04","target":"x86_64-unknown-linux-gnu","label":"linux-amd64","arch":"amd64","platform":"linux"},
+            {"name":"zkv-browser-linux-arm64","kind":"browser","bin":"zkv-browser","os":"ubuntu-22.04-arm","target":"aarch64-unknown-linux-gnu","label":"linux-arm64","arch":"arm64","platform":"linux"},
+            {"name":"zkv-cli-macos-arm64","kind":"cli","bin":"zkv","os":"macos-14","target":"aarch64-apple-darwin","label":"macos-arm64","arch":"arm64","platform":"macos"},
+            {"name":"zkv-browser-macos-arm64","kind":"browser","bin":"zkv-browser","os":"macos-14","target":"aarch64-apple-darwin","label":"macos-arm64","arch":"arm64","platform":"macos"},
+            {"name":"zkv-cli-windows-amd64","kind":"cli","bin":"zkv","os":"windows-2025","target":"x86_64-pc-windows-msvc","label":"windows-amd64","arch":"amd64","platform":"windows"},
+            {"name":"zkv-browser-windows-amd64","kind":"browser","bin":"zkv-browser","os":"windows-2025","target":"x86_64-pc-windows-msvc","label":"windows-amd64","arch":"amd64","platform":"windows"}
           ]
           JSON
           )
@@ -109,6 +156,8 @@ jobs:
       fail-fast: false
       matrix:
         include: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    env:
+      VERSION: ${{ needs.setup.outputs.version }}
     steps:
       - uses: actions/checkout@v5
 
@@ -120,26 +169,12 @@ jobs:
         with:
           key: release-${{ matrix.name }}
 
-      - name: Resolve version
-        id: version
-        # Force bash so this runs identically on the Windows runner (whose
-        # default shell is PowerShell). Git Bash is preinstalled there.
+      - name: Pin the embedded build SHA
         shell: bash
-        run: |
-          # A tag *push* is a real release: name the artifacts after the tag.
-          # Anything else (a manual workflow_dispatch, even one dispatched
-          # against a tag ref) is a dev build: use the short git sha so the
-          # artifacts are traceable to the exact commit instead of carrying a
-          # version number they don't correspond to.
-          if [ "$GITHUB_EVENT_NAME" = "push" ] && [ "$GITHUB_REF_TYPE" = "tag" ]; then
-            echo "version=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
-          else
-            echo "version=dev-${GITHUB_SHA:0:7}" >> "$GITHUB_OUTPUT"
-          fi
-          # Pin the embedded build SHA to this exact commit so `build.rs` never
-          # probes git (and so never emits a `-dirty` marker from untracked
-          # scratch a later build step might leave in the tree).
-          echo "ZKV_GIT_SHA=${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
+        # Pin the embedded build SHA to this exact commit so `build.rs` never
+        # probes git (and so never emits a `-dirty` marker from untracked
+        # scratch a later build step might leave in the tree).
+        run: echo "ZKV_GIT_SHA=${GITHUB_SHA:0:7}" >> "$GITHUB_ENV"
 
       # --- CLI: plain cargo build -> tarball -------------------------------
       - name: Build zkv (release, lean CLI)
@@ -179,7 +214,7 @@ jobs:
       # Sign the CLI binary and submit for notarization. Hardened runtime is
       # required by notarytool. The binary is zipped (via ditto, which
       # preserves extended attributes) for submission; bare Mach-O binaries
-      # and .tgz archives can't be submitted directly. The binary can't be
+      # and .tar.gz archives can't be submitted directly. The binary can't be
       # stapled either (stapling only works on .app/.dmg/.pkg), but macOS
       # verifies notarized binaries online on first run, which is enough to
       # clear the Gatekeeper quarantine warning.
@@ -207,58 +242,38 @@ jobs:
             --wait
           rm /tmp/zkv-notarize.zip
 
-      - name: Package tarball (macOS CLI)
-        if: ${{ matrix.kind == 'cli' && runner.os == 'macOS' }}
+      # macOS and Linux share one packaging step: with checksums generated
+      # centrally in `publish`, nothing here differs per-OS any more (it used
+      # to, only because macOS spells `sha256sum` as `shasum -a 256`).
+      - name: Package tarball (Unix CLI)
+        if: ${{ matrix.kind == 'cli' && runner.os != 'Windows' }}
         run: |
           set -euo pipefail
-          # Stable archive name (no version) for a permanent download permalink;
-          # the inner folder keeps the version so extracting two releases never
-          # clobbers and you can tell them apart.
-          inner="zkv-cli-${{ steps.version.outputs.version }}-${{ matrix.label }}"
-          archive="zkv-cli-${{ matrix.label }}"
-          mkdir -p "dist/$inner"
-          cp "target/${{ matrix.target }}/release/zkv" "dist/$inner/"
-          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$inner/"
-          tar -C dist -czf "dist/$archive.tgz" "$inner"
-          rm -rf "dist/$inner"
-          ( cd dist && shasum -a 256 "$archive.tgz" > "$archive.tgz.sha256" )
-          ls -l dist
-
-      # Linux is the same tarball flow as macOS; only the checksum tool
-      # differs (`sha256sum` ships in coreutils, vs macOS's `shasum`).
-      - name: Package tarball (Linux CLI)
-        if: ${{ matrix.kind == 'cli' && runner.os == 'Linux' }}
-        run: |
-          set -euo pipefail
-          # Stable archive name, versioned inner folder (see the macOS step).
-          inner="zkv-cli-${{ steps.version.outputs.version }}-${{ matrix.label }}"
-          archive="zkv-cli-${{ matrix.label }}"
-          mkdir -p "dist/$inner"
-          cp "target/${{ matrix.target }}/release/zkv" "dist/$inner/"
-          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$inner/"
-          tar -C dist -czf "dist/$archive.tgz" "$inner"
-          rm -rf "dist/$inner"
-          ( cd dist && sha256sum "$archive.tgz" > "$archive.tgz.sha256" )
+          # The archive and the folder inside it share one name, so extracting
+          # two releases side by side can never clobber.
+          base="zkv-cli-${VERSION}-${{ matrix.label }}"
+          mkdir -p "dist/$base"
+          cp "target/${{ matrix.target }}/release/zkv" "dist/$base/"
+          cp LICENSE-MIT LICENSE-APACHE README.md "dist/$base/"
+          tar -C dist -czf "dist/$base.tar.gz" "$base"
+          rm -rf "dist/$base"
           ls -l dist
 
       # Windows ships a `.zip` of `zkv.exe`. Use PowerShell so the runner needs
-      # no extra UNIX tooling; `Compress-Archive` + `Get-FileHash` are built in.
+      # no extra UNIX tooling; `Compress-Archive` is built in.
       - name: Package zip (Windows CLI)
         if: ${{ matrix.kind == 'cli' && runner.os == 'Windows' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $inner = "zkv-cli-${{ steps.version.outputs.version }}-${{ matrix.label }}"
-          $archive = "zkv-cli-${{ matrix.label }}"
-          New-Item -ItemType Directory -Force -Path "dist/$inner" | Out-Null
-          Copy-Item "target/${{ matrix.target }}/release/zkv.exe" "dist/$inner/"
-          Copy-Item LICENSE-MIT, LICENSE-APACHE, README.md "dist/$inner/"
-          # Archive the folder itself (not its contents) so the versioned
-          # directory survives inside the zip.
-          Compress-Archive -Path "dist/$inner" -DestinationPath "dist/$archive.zip" -Force
-          Remove-Item -Recurse -Force "dist/$inner"
-          $hash = (Get-FileHash "dist/$archive.zip" -Algorithm SHA256).Hash.ToLower()
-          "$hash  $archive.zip" | Out-File -Encoding ascii "dist/$archive.zip.sha256"
+          $base = "zkv-cli-$env:VERSION-${{ matrix.label }}"
+          New-Item -ItemType Directory -Force -Path "dist/$base" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/zkv.exe" "dist/$base/"
+          Copy-Item LICENSE-MIT, LICENSE-APACHE, README.md "dist/$base/"
+          # Archive the folder itself (not its contents) so the named directory
+          # survives inside the zip.
+          Compress-Archive -Path "dist/$base" -DestinationPath "dist/$base.zip" -Force
+          Remove-Item -Recurse -Force "dist/$base"
           Get-ChildItem dist
 
       # --- Browser: Tauri bundle (.app/.dmg on macOS, portable exe + NSIS on Windows) --
@@ -345,36 +360,29 @@ jobs:
             find target -name '*.dmg' -o -name '*.app' || true
             exit 1
           fi
-          out="zkv-browser-${{ matrix.label }}.dmg"
           mkdir -p dist
-          cp "$dmg" "dist/$out"
-          ( cd dist && shasum -a 256 "$out" > "$out.sha256" )
+          cp "$dmg" "dist/zkv-browser-${VERSION}-${{ matrix.label }}.dmg"
           ls -l dist
 
       # Ship two things from the desktop build: the standalone single-file app
       # (portable, needs WebView2 already present) and the NSIS installer
-      # (which provisions WebView2 itself). Named with the friendly `label`;
-      # build output still lives under the real `target` triple.
+      # (which provisions WebView2). The Tauri bundler picks its own names;
+      # these are renamed on the way into dist/ so every artifact in the
+      # release follows one convention.
       - name: Package GUI artifacts (Windows)
         if: ${{ matrix.kind == 'browser' && runner.os == 'Windows' }}
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          $label = "${{ matrix.label }}"
+          $stem = "zkv-browser-$env:VERSION-${{ matrix.label }}"
           $rel = "target/${{ matrix.target }}/release"
           New-Item -ItemType Directory -Force -Path dist | Out-Null
-
-          function Publish-Artifact($src, $out) {
-            Copy-Item $src "dist/$out"
-            $hash = (Get-FileHash "dist/$out" -Algorithm SHA256).Hash.ToLower()
-            "$hash  $out" | Out-File -Encoding ascii "dist/$out.sha256"
-          }
 
           # Standalone single-file app: no installer, runs as-is on a host that
           # already has the WebView2 runtime.
           $exe = "$rel/zkv-browser.exe"
           if (-not (Test-Path $exe)) { Write-Error "expected $exe was not produced" }
-          Publish-Artifact $exe "zkv-browser-$label-portable.exe"
+          Copy-Item $exe "dist/$stem-portable.exe"
 
           # NSIS installer (`-setup.exe`).
           $nsis = Get-ChildItem "$rel/bundle/nsis/*-setup.exe" -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -382,24 +390,20 @@ jobs:
             Get-ChildItem -Recurse "$rel/bundle" -ErrorAction SilentlyContinue | Select-Object FullName
             Write-Error "no NSIS installer produced by the Tauri bundler"
           }
-          Publish-Artifact $nsis.FullName "zkv-browser-$label-setup.exe"
+          Copy-Item $nsis.FullName "dist/$stem-setup.exe"
           Get-ChildItem dist
 
-      # Ship the portable AppImage and the Debian package. Named with the
-      # friendly `label`; build output still lives under the real `target`
-      # triple's bundle dir.
+      # Ship the portable AppImage and the Debian package. The AppImage takes
+      # the usual `-<platform>-<arch>` stem; the .deb takes Debian's own
+      # `<name>_<version>_<arch>.deb` (which is why amd64/arm64 are the arch
+      # spelling everywhere else too). Build output still lives under the real
+      # target triple's bundle dir.
       - name: Package GUI artifacts (Linux)
         if: ${{ matrix.kind == 'browser' && runner.os == 'Linux' }}
         run: |
           set -euo pipefail
-          label="${{ matrix.label }}"
           rel="target/${{ matrix.target }}/release"
           mkdir -p dist
-
-          publish() {
-            cp "$1" "dist/$2"
-            ( cd dist && sha256sum "$2" > "$2.sha256" )
-          }
 
           # Portable single-file app: the AppImage.
           appimage="$(find "$rel/bundle/appimage" -name '*.AppImage' -print -quit)"
@@ -408,7 +412,7 @@ jobs:
             find "$rel/bundle" -type f || true
             exit 1
           fi
-          publish "$appimage" "zkv-browser-$label.AppImage"
+          cp "$appimage" "dist/zkv-browser-${VERSION}-${{ matrix.label }}.AppImage"
 
           # Debian package.
           deb="$(find "$rel/bundle/deb" -name '*.deb' -print -quit)"
@@ -417,13 +421,13 @@ jobs:
             find "$rel/bundle" -type f || true
             exit 1
           fi
-          publish "$deb" "zkv-browser-$label.deb"
+          cp "$deb" "dist/zkv-browser_${VERSION}_${{ matrix.arch }}.deb"
           ls -l dist
 
       # --- upload: one artifact per distributable -------------------------
-      # CLI legs, macOS browser, and Linux CLI each produce one distributable
-      # and upload as one artifact. Windows browser uploads two (portable exe
-      # + NSIS installer). Linux browser uploads two (AppImage + deb) for the
+      # CLI legs and the macOS browser each produce one distributable and
+      # upload as one artifact. Windows browser uploads two (portable exe +
+      # NSIS installer). Linux browser uploads two (AppImage + deb) for the
       # same reason: they are separate install options and the combined zip
       # would be huge (AppImage bundles the full WebKitGTK runtime).
       - uses: actions/upload-artifact@v6
@@ -431,11 +435,9 @@ jobs:
         with:
           name: ${{ matrix.name }}
           path: |
-            dist/*.tgz
+            dist/*.tar.gz
             dist/*.dmg
             dist/*.zip
-            dist/*.exe
-            dist/*.sha256
           if-no-files-found: error
 
       - name: Upload AppImage (Linux browser)
@@ -443,9 +445,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.name }}-appimage
-          path: |
-            dist/*.AppImage
-            dist/*.AppImage.sha256
+          path: dist/*.AppImage
           if-no-files-found: error
 
       - name: Upload deb (Linux browser)
@@ -453,9 +453,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: ${{ matrix.name }}-deb
-          path: |
-            dist/*.deb
-            dist/*.deb.sha256
+          path: dist/*.deb
           if-no-files-found: error
 
       - name: Upload portable (Windows browser)
@@ -463,9 +461,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: zkv-browser-windows-portable
-          path: |
-            dist/*-portable.exe
-            dist/*-portable.exe.sha256
+          path: dist/*-portable.exe
           if-no-files-found: error
 
       - name: Upload installer (Windows browser)
@@ -473,17 +469,15 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: zkv-browser-windows-setup
-          path: |
-            dist/*-setup.exe
-            dist/*-setup.exe.sha256
+          path: dist/*-setup.exe
           if-no-files-found: error
 
+  # Gather every platform's artifacts, checksum them as a set, and (on a tag)
+  # publish. This job runs on a manual dispatch too, so a dry run still gets a
+  # SHA256SUMS attached to the run; only the release step is tag-gated.
   publish:
-    name: publish release
+    name: checksum and publish
     needs: [setup, build]
-    # Only publish when a tag triggered the run; manual dispatches just leave
-    # the artifacts attached to the workflow run.
-    if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -495,16 +489,40 @@ jobs:
 
       - run: ls -lR dist
 
+      # One SHA256SUMS covering every artifact, in the standard `sha256sum`
+      # format (verify with `sha256sum -c SHA256SUMS`, or `shasum -a 256 -c` on
+      # macOS/BSD). Generated here, once every platform is gathered, rather
+      # than per-runner: one file covers the whole release, and the packaging
+      # steps no longer each need their OS's checksum tool. Filenames are bare
+      # (`cd dist`) so it verifies against downloads sitting in one directory,
+      # and the list is sorted by filename so SHA256SUMS is itself byte-stable.
+      - name: Generate SHA256SUMS
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum -- * > "$RUNNER_TEMP/sums"
+          sort -k2 "$RUNNER_TEMP/sums" > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: SHA256SUMS
+          path: dist/SHA256SUMS
+          if-no-files-found: error
+
+      # Only publish when a tag triggered the run; manual dispatches leave the
+      # artifacts attached to the workflow run.
       - name: Create / update GitHub Release
+        if: ${{ github.ref_type == 'tag' }}
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            dist/*.tgz
+            dist/*.tar.gz
             dist/*.dmg
             dist/*.zip
             dist/*.exe
             dist/*.deb
             dist/*.AppImage
-            dist/*.sha256
+            dist/SHA256SUMS
           fail_on_unmatched_files: true
           generate_release_notes: true
