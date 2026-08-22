@@ -1953,7 +1953,13 @@ fn is_benign_sync_error(raw: &str) -> bool {
 /// Map a raw background-sync error string to a short, user-facing sentence for
 /// the GUI's per-database error surface. Unknown errors pass through verbatim
 /// (a raw message beats a silent failure), but the common transient cases get
-/// friendlier copy than their internal `Debug`/`Display` form.
+/// friendlier copy than their internal `Debug`/`Display` form. The
+/// network-flavored rewrite keeps the raw error appended in parentheses: the
+/// banner ellipsizes but tooltips the full string, and the raw text is the
+/// only diagnostic that survives on a release Windows build (the GUI links
+/// the windows subsystem, so stderr and its tracing output are discarded).
+/// That gap is how an h2 `too_many_data_frames` connection kill masqueraded
+/// as "can't reach the server" for weeks with nothing to go on.
 fn friendly_sync_error(raw: &str) -> String {
     let low = raw.to_ascii_lowercase();
     if low.contains("another zkv process") {
@@ -1968,7 +1974,7 @@ fn friendly_sync_error(raw: &str) -> String {
         || low.contains("unavailable")
         || low.contains("dns")
     {
-        "Can't reach the lightwalletd server right now; retrying automatically.".to_owned()
+        format!("Can't reach the lightwalletd server right now; retrying automatically. ({raw})")
     } else {
         raw.to_owned()
     }
@@ -2491,6 +2497,11 @@ mod tests {
     #[test]
     fn friendly_sync_error_rewrites_known_cases_and_passes_others_through() {
         assert!(friendly_sync_error("transport error").contains("Can't reach"));
+        // The network rewrite must keep the raw error visible (banner tooltip):
+        // on a release Windows GUI it is the only surviving diagnostic.
+        let net = friendly_sync_error("h2 protocol error: error reading a body from connection");
+        assert!(net.contains("Can't reach"), "{net}");
+        assert!(net.contains("h2 protocol error"), "{net}");
         assert!(
             friendly_sync_error("another zkv process is using this database")
                 .contains("Another zkv process")

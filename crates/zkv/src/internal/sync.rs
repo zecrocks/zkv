@@ -977,6 +977,13 @@ async fn update_chain_tip<P: Parameters>(
     Ok(tip_height)
 }
 
+/// Upper bound on compact-block bytes buffered in memory between the gRPC
+/// stream reader and the block-file writer in [`download_blocks`]. A whole
+/// [`BATCH_SIZE`] range of small (mostly empty) blocks fits far under this, so
+/// the reader never stalls in the case that matters (see below); only ranges
+/// of large blocks can hit it, and those are safe to slow-read.
+const DOWNLOAD_BUFFER_BYTES: usize = 32 * 1024 * 1024;
+
 async fn download_blocks(
     client: &mut CompactTxStreamerClient<Channel>,
     fsblockdb_root: &Path,
@@ -993,11 +1000,34 @@ async fn download_blocks(
         end: Some(end),
         pool_types: Default::default(),
     };
-    let stream = client
-        .get_block_range(range)
-        .await?
-        .into_inner()
-        .and_then(|block| async move {
+    let mut stream = client.get_block_range(range).await?.into_inner();
+
+    // Drain the gRPC stream on a dedicated task, decoupled from the per-block
+    // file writes by a byte-bounded in-memory buffer.
+    //
+    // Writing each block to disk between stream polls (the previous shape)
+    // let received-but-unpolled DATA frames pile up inside h2 whenever the
+    // disk was slower than the network. h2 (0.4.13+) budgets the framing
+    // overhead of buffered sub-256-byte DATA frames as a DoS protection
+    // (`too_many_data_frames`), and a mostly empty compact block, the norm on
+    // testnet, is one tiny frame well under that threshold. A fast server
+    // plus slow file creation (Windows Defender scanning every new block
+    // file, CI runners on datacenter bandwidth) therefore killed the
+    // connection deterministically with GOAWAY ENHANCE_YOUR_CALM before the
+    // first batch committed; the next sync cycle restarted from the same
+    // position and died the same way, so the wallet never progressed and the
+    // GUI showed a misleading "can't reach the server" banner. Draining
+    // eagerly keeps h2's receive buffer empty (its budget replenishes as
+    // frames are polled), so the connection survives regardless of disk
+    // speed. The buffer is bounded by bytes rather than messages: small
+    // blocks (the dangerous case) always fit far under the bound for a whole
+    // batch, while large blocks may backpressure the reader but replenish
+    // the h2 budget and are safe to read slowly.
+    let permits = Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_BUFFER_BYTES));
+    let reader_permits = permits.clone();
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let reader = tokio::spawn(async move {
+        while let Some(block) = stream.message().await? {
             let (sapling_outputs_count, orchard_actions_count) = block
                 .vtx
                 .iter()
@@ -1011,16 +1041,32 @@ async fn download_blocks(
                 orchard_actions_count,
             };
             let encoded = block.encode_to_vec();
-            let mut f = File::create(get_block_path(fsblockdb_root, &meta)).await?;
-            f.write_all(&encoded).await?;
-            Ok(meta)
-        });
-    tokio::pin!(stream);
+            let cost = encoded.len().clamp(1, DOWNLOAD_BUFFER_BYTES) as u32;
+            let permit = reader_permits
+                .clone()
+                .acquire_many_owned(cost)
+                .await
+                .expect("buffer semaphore is never closed");
+            // The permit rides along and is released when the writer is done
+            // with this block. A send failure means the writer bailed on a
+            // file error; stop draining and let the task end.
+            if tx.send((meta, encoded, permit)).is_err() {
+                break;
+            }
+        }
+        Ok::<(), tonic::Status>(())
+    });
 
     let mut block_meta = vec![];
-    while let Some(block) = stream.try_next().await? {
-        block_meta.push(block);
+    while let Some((meta, encoded, _permit)) = rx.recv().await {
+        let mut f = File::create(get_block_path(fsblockdb_root, &meta)).await?;
+        f.write_all(&encoded).await?;
+        block_meta.push(meta);
     }
+    // The channel closing cleanly still requires the reader to have ended
+    // without a stream error; surface one if it did.
+    reader.await??;
+
     db_cache
         .write_block_metadata(&block_meta)
         .map_err(error::Error::from)?;
