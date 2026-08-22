@@ -8125,7 +8125,7 @@ dependencies = [
 
 [[package]]
 name = "zkv"
-version = "0.0.1-rc6"
+version = "0.0.1-rc7"
 dependencies = [
  "age",
  "anyhow",

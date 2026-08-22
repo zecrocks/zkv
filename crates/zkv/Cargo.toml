@@ -1,6 +1,6 @@
 [package]
 name = "zkv"
-version = "0.0.1-rc6"
+version = "0.0.1-rc7"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
