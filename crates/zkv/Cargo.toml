@@ -1,17 +1,27 @@
 [package]
-name = "zkv"
-version = "0.1.0"
+name = "zcash_zkv"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 description = "A Redis-style key-value store backed by Zcash Orchard memos."
-publish = false
+repository = "https://github.com/zecrocks/zkv"
+homepage = "https://zec.rocks/zkv"
+readme = "README.md"
+keywords = ["zcash", "key-value", "orchard", "shielded", "memo"]
+categories = ["database", "cryptography::cryptocurrencies", "command-line-utilities"]
 # This crate ships two binaries: the `zkv` CLI and the `zkv-browser` desktop
 # GUI launcher. Name the GUI launcher as the default so `tauri build` bundles
 # it (matching `mainBinaryName` in tauri.conf.json) rather than the CLI. Without
 # this, a newer unpinned tauri-cli resolves the app binary to the package-named
 # `zkv` bin and the desktop .app just prints CLI help and exits on launch.
 default-run = "zkv-browser"
+
+# The package is `zcash_zkv` on crates.io (the bare `zkv` name was taken by an
+# unrelated project), but the library target keeps the short name: dependents
+# and this crate's own modules go on saying `zkv::`.
+[lib]
+name = "zkv"
 
 [[bin]]
 name = "zkv"

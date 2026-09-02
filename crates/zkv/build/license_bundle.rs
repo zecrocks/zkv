@@ -53,7 +53,7 @@ pub fn generate() {
     let packages = read_lock_packages(&lock_path);
     for (name, version) in packages {
         // Skip our own workspace crates; covered by the project license above.
-        if name == "zkv" || name == "zkv-faucet" {
+        if name == "zcash_zkv" || name == "zkv-faucet" {
             continue;
         }
         let dir = match registry_index.get(&format!("{name}-{version}")) {

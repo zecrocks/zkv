@@ -26,10 +26,10 @@ upcoming release. Do not use the zkv alpha for anything important.
 
 ```
 # CLI only (default features)
-cargo install --git https://github.com/zecrocks/zkv zkv
+cargo install zcash_zkv
 
 # CLI + native desktop GUI (the `zkv gui` subcommand and `zkv-browser` binary)
-cargo install --git https://github.com/zecrocks/zkv --features desktop zkv
+cargo install zcash_zkv --features desktop
 
 # GUI
 zkv gui                  # native desktop window (needs --features desktop)
@@ -44,6 +44,19 @@ zkv get zec_usd
 `init` generates a seed, prints a 24-word phrase, and waits for you to fund the
 printed UA before broadcasting INIT. `--non-interactive` skips the ceremony and
 the funding poll. `--offline` skips sync for most commands.
+
+The crate is published as `zcash_zkv` (the bare `zkv` name on crates.io belongs
+to an unrelated project); the library target and the CLI binary are both `zkv`.
+To depend on the database without the CLI and web UI:
+
+```toml
+[dependencies]
+zcash_zkv = { version = "0.2", default-features = false, features = ["transparent-inputs"] }
+```
+
+```rust
+use zkv::db::Database;
+```
 
 State lives in `~/.zkv` on Linux (`~/Library/Application Support/zkv` on macOS,
 `%APPDATA%\zkv` on Windows); override with `--data-dir` or `$ZKV_DATA`.
