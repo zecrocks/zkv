@@ -119,7 +119,7 @@ jobs:
       # per transaction; release keeps the harness snappy. The lean CLI build
       # skips the GUI asset/licensing build steps.
       - name: Build zkv (release, lean CLI)
-        run: cargo build --release -p zkv --bin zkv --no-default-features --features cli,transparent-inputs
+        run: cargo build --release -p zcash_zkv --bin zkv --no-default-features --features cli,transparent-inputs
 
       # Pick the zebra image. The matrix names it outright on the weekly
       # schedule (pinned + latest legs); otherwise ("event") it comes from the

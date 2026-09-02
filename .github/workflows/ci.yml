@@ -133,4 +133,4 @@ jobs:
       - name: cargo doc
         env:
           RUSTDOCFLAGS: "-D warnings"
-        run: cargo doc --no-deps -p zkv --no-default-features --features transparent-inputs,default-subscriber,cli
+        run: cargo doc --no-deps -p zcash_zkv --no-default-features --features transparent-inputs,default-subscriber,cli

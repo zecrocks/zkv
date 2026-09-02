@@ -181,7 +181,7 @@ jobs:
         if: ${{ matrix.kind == 'cli' }}
         run: >-
           cargo build --release --locked
-          -p zkv --bin zkv
+          -p zcash_zkv --bin zkv
           --target ${{ matrix.target }}
           --no-default-features --features cli,transparent-inputs
 
