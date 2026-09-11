@@ -8330,7 +8330,7 @@ dependencies = [
 
 [[package]]
 name = "zcash_zkv"
-version = "0.2.0"
+version = "0.2.0-rc1"
 dependencies = [
  "age 0.11.3",
  "anyhow",
