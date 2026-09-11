@@ -5,7 +5,7 @@
 //! roundtrip you can use to sanity-check a `zkv` build:
 //!
 //! ```text
-//! cargo run -p zkv --example verify_signature
+//! cargo run -p zcash_zkv --example verify_signature
 //! ```
 
 use rand::rand_core::UnwrapErr;

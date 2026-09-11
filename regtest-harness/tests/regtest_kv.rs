@@ -397,7 +397,7 @@ async fn regtest_kv_lifecycle() {
     } else {
         eprintln!(
             "SKIP the batch-write phase: set ZKV_BATCH_BIN to the built \
-             `cargo build -p zkv --example batch_write` binary."
+             `cargo build -p zcash_zkv --example batch_write` binary."
         );
     }
 

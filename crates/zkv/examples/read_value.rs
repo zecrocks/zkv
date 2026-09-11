@@ -16,9 +16,9 @@
 //! actually falls behind.
 //!
 //! ```text
-//! ZKV_DB=mydb ZKV_KEY=hello cargo run -p zkv --example read_value
+//! ZKV_DB=mydb ZKV_KEY=hello cargo run -p zcash_zkv --example read_value
 //! # tolerate up to 10 blocks of staleness before forcing a sync:
-//! ZKV_MAX_LAG=10 ZKV_DB=mydb ZKV_KEY=hello cargo run -p zkv --example read_value
+//! ZKV_MAX_LAG=10 ZKV_DB=mydb ZKV_KEY=hello cargo run -p zcash_zkv --example read_value
 //! ```
 
 use std::env;

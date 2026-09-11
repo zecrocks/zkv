@@ -19,11 +19,11 @@
 //! prefix, so it runs out of the box:
 //!
 //! ```text
-//! cargo run -p zkv --example shallow_read
+//! cargo run -p zcash_zkv --example shallow_read
 //! # any other database / prefix:
-//! ZKV_ADDRESS=zkv1… ZKV_PREFIX=prices/ cargo run -p zkv --example shallow_read
+//! ZKV_ADDRESS=zkv1… ZKV_PREFIX=prices/ cargo run -p zcash_zkv --example shallow_read
 //! # also verify the INIT anchor (slower first call, stronger):
-//! ZKV_VERIFY_INIT=1 cargo run -p zkv --example shallow_read
+//! ZKV_VERIFY_INIT=1 cargo run -p zcash_zkv --example shallow_read
 //! ```
 
 use std::env;

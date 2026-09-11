@@ -22,6 +22,6 @@ string in the bundle; Lucide in its `@license` comment).
 
 Replace the file with the matching minified production build from the upstream
 release for the desired version, then update the version in the table above and
-verify the embedded license bundle still builds (`cargo build -p zkv
+verify the embedded license bundle still builds (`cargo build -p zcash_zkv
 --features gui`). For Lucide, use the UMD build (`lucide.min.js`) so the global
 `lucide` factory the SPA calls is present.

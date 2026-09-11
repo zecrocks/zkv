@@ -302,8 +302,8 @@ the network; reads are pure-local. Errors are structured (`InsufficientFunds`,
 encode, `replay_with_seed`). Worked examples in `crates/zkv/examples/`:
 `quickstart`, `verify_signature`, `read_value`, `set_value`, `oracle`,
 `shallow_read` (db-less oracle reads via `zkv::shallow`). Run with
-`cargo run -p zkv --example <name>`. Browse the full API docs locally with
-`cargo doc -p zkv --no-deps --open`.
+`cargo run -p zcash_zkv --example <name>`. Browse the full API docs locally with
+`cargo doc -p zcash_zkv --no-deps --open`.
 
 ## Test
 

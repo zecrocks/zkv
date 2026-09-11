@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! ZKV_DB=mydb ZKV_KEY=hello ZKV_VALUE=world \
-//!   cargo run -p zkv --example set_value
+//!   cargo run -p zcash_zkv --example set_value
 //! ```
 
 use std::env;

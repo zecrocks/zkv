@@ -129,9 +129,9 @@ compiles and links.
 # proving is >20s per write).
 # `gui` is needed by regtest_gui.rs (it drives `zkv gui-browser`); drop it and
 # that one test skips itself.
-cargo build --release -p zkv --bin zkv --no-default-features --features cli,gui,transparent-inputs
+cargo build --release -p zcash_zkv --bin zkv --no-default-features --features cli,gui,transparent-inputs
 # The batch-write phase runs this example as a subprocess.
-cargo build --release -p zkv --example batch_write --no-default-features --features cli,gui,transparent-inputs
+cargo build --release -p zcash_zkv --example batch_write --no-default-features --features cli,gui,transparent-inputs
 
 # Compile + link; skips the live run unless the binaries are provided:
 cargo test --locked --manifest-path regtest-harness/Cargo.toml -- --nocapture --test-threads=1

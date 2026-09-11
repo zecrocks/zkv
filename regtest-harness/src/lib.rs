@@ -718,7 +718,7 @@ impl Zkv {
     pub fn with_bin(bin: PathBuf, lwd_grpc_port: u16) -> Result<Zkv> {
         if !bin.is_file() {
             bail!(
-                "zkv binary not found at {} - build it first (cargo build --release -p zkv \
+                "zkv binary not found at {} - build it first (cargo build --release -p zcash_zkv \
                  --bin zkv) or set $ZKV_BIN",
                 bin.display()
             );

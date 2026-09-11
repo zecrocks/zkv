@@ -11,7 +11,7 @@
 //! 3. Third run: writes `hello = world`, syncs, reads it back.
 //!
 //! ```text
-//! cargo run -p zkv --example quickstart
+//! cargo run -p zcash_zkv --example quickstart
 //! ```
 
 use zkv::{

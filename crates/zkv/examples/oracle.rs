@@ -11,13 +11,13 @@
 //!
 //! ```text
 //! # one-shot (no loop):
-//! ZKV_DB=oracle-admin cargo run -p zkv --example oracle -- --once
+//! ZKV_DB=oracle-admin cargo run -p zcash_zkv --example oracle -- --once
 //!
 //! # default: update every 15 minutes
-//! ZKV_DB=oracle-admin cargo run -p zkv --example oracle
+//! ZKV_DB=oracle-admin cargo run -p zcash_zkv --example oracle
 //!
 //! # custom cadence (seconds)
-//! ZKV_DB=oracle-admin cargo run -p zkv --example oracle -- --interval 60
+//! ZKV_DB=oracle-admin cargo run -p zcash_zkv --example oracle -- --interval 60
 //! ```
 //!
 //! # Redundant fleets (`--stale-after`)
@@ -31,9 +31,9 @@
 //! all the posting; the others stand by and fill gaps when it goes down:
 //!
 //! ```text
-//! node-a$ ZKV_DB=oracle cargo run -p zkv --example oracle -- --stale-after 15
-//! node-b$ ZKV_DB=oracle cargo run -p zkv --example oracle -- --stale-after 30
-//! node-c$ ZKV_DB=oracle cargo run -p zkv --example oracle -- --stale-after 50
+//! node-a$ ZKV_DB=oracle cargo run -p zcash_zkv --example oracle -- --stale-after 15
+//! node-b$ ZKV_DB=oracle cargo run -p zcash_zkv --example oracle -- --stale-after 30
+//! node-c$ ZKV_DB=oracle cargo run -p zcash_zkv --example oracle -- --stale-after 50
 //! ```
 //!
 //! With node-a alive the feed updates every ~15 minutes; if it dies, node-b

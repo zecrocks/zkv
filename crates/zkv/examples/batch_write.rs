@@ -17,7 +17,7 @@
 //!
 //! ```text
 //! ZKV_DB=mydb ZKV_BATCH='a=1;b=2;a=3;old' \
-//!   cargo run -p zkv --example batch_write
+//!   cargo run -p zcash_zkv --example batch_write
 //! ```
 //!
 //! Prints the single txid to stdout.
