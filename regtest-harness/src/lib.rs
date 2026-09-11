@@ -694,7 +694,11 @@ pub struct ZkvOutput {
 /// a user runs the tool; nothing shortcuts through the library.
 pub struct Zkv {
     bin: PathBuf,
-    data_dir: tempfile::TempDir,
+    /// Shared so two handles can drive *different binaries* against the same
+    /// data directory, which is what an upgrade test needs: one zkv version
+    /// lays down a database, another opens it. The directory is deleted once
+    /// the last handle drops.
+    data_dir: std::sync::Arc<tempfile::TempDir>,
     /// `host:port` of the regtest lightwalletd, passed as `--server` to every
     /// chain-touching command.
     server: String,
@@ -706,7 +710,12 @@ impl Zkv {
     /// one-time demo auto-provision (which would dial the public testnet on
     /// every command until it succeeds) never fires in the sandboxed run.
     pub fn new(lwd_grpc_port: u16) -> Result<Zkv> {
-        let bin = zkv_bin();
+        Zkv::with_bin(zkv_bin(), lwd_grpc_port)
+    }
+
+    /// [`Zkv::new`] with an explicit binary, for driving a specific build (an
+    /// older release, say) rather than the one under test.
+    pub fn with_bin(bin: PathBuf, lwd_grpc_port: u16) -> Result<Zkv> {
         if !bin.is_file() {
             bail!(
                 "zkv binary not found at {} - build it first (cargo build --release -p zkv \
@@ -719,8 +728,24 @@ impl Zkv {
             .context("write demo marker")?;
         Ok(Zkv {
             bin,
-            data_dir,
+            data_dir: std::sync::Arc::new(data_dir),
             server: format!("127.0.0.1:{lwd_grpc_port}"),
+        })
+    }
+
+    /// Another handle onto *this* data directory, running a different binary.
+    ///
+    /// The point of an upgrade test: whatever the first handle created, the
+    /// second one opens in place, exactly as a user who replaced their
+    /// installed binary would.
+    pub fn with_other_bin(&self, bin: PathBuf) -> Result<Zkv> {
+        if !bin.is_file() {
+            bail!("zkv binary not found at {}", bin.display());
+        }
+        Ok(Zkv {
+            bin,
+            data_dir: std::sync::Arc::clone(&self.data_dir),
+            server: self.server.clone(),
         })
     }
 
@@ -754,6 +779,78 @@ impl Zkv {
         let mut full: Vec<&str> = args.to_vec();
         full.extend_from_slice(&["--server", &self.server]);
         self.run_local(db, &full)
+    }
+
+    /// Spawn a chain-touching `zkv` command **without waiting for it**, with
+    /// both streams piped for later capture.
+    ///
+    /// Every other runner blocks until the child exits, which is exactly wrong
+    /// for testing what two zkv processes do to each other: the interesting
+    /// behaviour happens while the first one is still running.
+    ///
+    /// Only for children that stay under the pipe buffer (~64 KiB) before
+    /// exiting: nothing drains the pipes until [`ZkvChild::wait_with_output`],
+    /// so a chattier command would deadlock against a full one. Use
+    /// [`Zkv::spawn_online_quiet`] for a long-lived child whose output is
+    /// never read.
+    pub fn spawn_online(&self, db: Option<&str>, args: &[&str]) -> Result<ZkvChild> {
+        self.spawn_with(db, args, Stdio::piped(), Stdio::piped())
+    }
+
+    /// [`Zkv::spawn_online`] with stdout discarded and stderr inherited, so the
+    /// child's logs show up under `--nocapture` and nothing can fill a pipe.
+    pub fn spawn_online_quiet(&self, db: Option<&str>, args: &[&str]) -> Result<ZkvChild> {
+        self.spawn_with(db, args, Stdio::null(), Stdio::inherit())
+    }
+
+    fn spawn_with(
+        &self,
+        db: Option<&str>,
+        args: &[&str],
+        stdout: Stdio,
+        stderr: Stdio,
+    ) -> Result<ZkvChild> {
+        let mut full: Vec<&str> = args.to_vec();
+        full.extend_from_slice(&["--server", &self.server]);
+        let child = self
+            .command(db, &full)
+            .stdout(stdout)
+            .stderr(stderr)
+            .spawn()
+            .with_context(|| format!("spawn zkv {args:?}"))?;
+        Ok(ZkvChild {
+            child: Some(child),
+            label: format!("zkv {}", args.join(" ")),
+        })
+    }
+
+    /// Run the `batch_write` example against this home, returning its txid.
+    ///
+    /// `Database::write_many` has no CLI surface, and this harness has no zkv
+    /// dependency, so a compiled example is the only way to reach it as a
+    /// subprocess. `ops` is the `;`-separated `key=value` form the example
+    /// parses, where a bare segment is a DEL.
+    ///
+    /// The example resolves its data directory from `$ZKV_DATA` and its server
+    /// from `$ZKV_SERVER`, rather than the `--data-dir`/`--server` flags the
+    /// CLI takes.
+    pub fn batch_write(&self, bin: &Path, db: &str, ops: &str) -> Result<String> {
+        let out = Command::new(bin)
+            .env("ZKV_DATA", self.data_dir.path())
+            .env("ZKV_SERVER", &self.server)
+            .env("ZKV_DB", db)
+            .env("ZKV_BATCH", ops)
+            .output()
+            .with_context(|| format!("spawn {}", bin.display()))?;
+        let out = capture(out);
+        ensure_ok(&out, &["batch_write", ops])?;
+        Ok(out.stdout.trim().to_owned())
+    }
+
+    /// This database's directory, which is also the wallet engine's datadir
+    /// (and so the directory whose `.lock` the node takes).
+    pub fn db_dir(&self, name: &str) -> PathBuf {
+        self.data_dir.path().join(name)
     }
 
     /// Like [`Zkv::run_online`] but errors (with both streams attached)
@@ -994,6 +1091,410 @@ fn ensure_ok(out: &ZkvOutput, args: &[&str]) -> Result<()> {
     )
 }
 
+// =============================== funded stack ===============================
+
+/// Coinbase blocks mined to the funder up front. zebra finalizes blocks deeper
+/// than `MAX_BLOCK_REORG_HEIGHT` (= coinbase maturity - 1 = 99) below the tip;
+/// only finalized blocks are persisted and survive the miner-swap restart, so
+/// mining 120 finalizes the funder's coinbases at heights ~1..21 (the
+/// non-finalized rest are dropped on restart, which is what keeps the funder
+/// from ever holding an immature coinbase).
+const FUNDER_COINBASES: u32 = 120;
+
+/// After restarting mining to a throwaway address, mine this many blocks: the
+/// restart resets the tip to the finalized height (~21) and this tail re-grows
+/// the chain so the surviving funder coinbases are well past the 100-block
+/// maturity.
+const MATURITY_TAIL: u32 = 130;
+
+/// A throwaway P2SH address that mines the maturity tail (the funder does not
+/// control it).
+const TAIL_MINER_ADDRESS: &str = "t27eWDgjFYJGVXmzrXeVjnb5J3uXDM9xH9v";
+
+/// Blocks mined to confirm the shielding transaction. The shielded note must
+/// reach the trusted confirmation depth (3) before the funder can spend it;
+/// the extra cover tip skew between zebrad and lightwalletd.
+const SHIELD_CONFIRMATIONS: u32 = 6;
+
+/// External (untrusted) receives are spendable at 10 confirmations under the
+/// default ZIP-315 policy; a couple extra cover tip skew.
+pub const FUNDING_CONFIRMATIONS: u32 = 12;
+
+/// A regtest chain with a funded `zcash-devtool` wallet in front of it, ready
+/// to pay a zkv database.
+///
+/// This is the expensive part of any funded test (mine, mature, shield, sync:
+/// a few minutes and ~250 blocks), so it lives here rather than in one test
+/// file: a second funded test that copied it would pay the whole cost again to
+/// reach the same starting point.
+pub struct FundedStack {
+    pub zebrad: Zebrad,
+    pub lwd: Lightwalletd,
+    pub funder: Funder,
+}
+
+impl FundedStack {
+    /// Bring up zebrad + lightwalletd and fund the devtool wallet.
+    pub async fn up(zebrad_bin: &Path, lwd_bin: &Path, devtool_bin: &Path) -> Result<FundedStack> {
+        let funder_taddr = Funder::derive_transparent_address(devtool_bin)
+            .context("derive funder transparent address")?;
+        let mut zebrad = Zebrad::start_with_miner(zebrad_bin, &funder_taddr)
+            .await
+            .context("start zebrad mining to the funder")?;
+        zebrad
+            .generate_blocks(FUNDER_COINBASES)
+            .await
+            .context("mine the funder's coinbases")?;
+        // Mine the maturity tail somewhere else, so the funder's balance is
+        // exactly what the coinbases above gave it.
+        zebrad
+            .restart_with_miner(TAIL_MINER_ADDRESS)
+            .await
+            .context("restart zebrad mining to the throwaway address")?;
+        zebrad
+            .generate_blocks(MATURITY_TAIL)
+            .await
+            .context("mine the maturity tail")?;
+
+        let lwd = Lightwalletd::start(lwd_bin, zebrad.rpc_port)
+            .await
+            .context("start lightwalletd")?;
+
+        let funder = Funder::init(devtool_bin, lwd.grpc_port).context("initialise funder")?;
+        funder
+            .sync(lwd.grpc_port)
+            .context("funder sync (coinbase)")?;
+        funder
+            .shield(lwd.grpc_port)
+            .context("shield transparent coinbase into Orchard")?;
+        zebrad
+            .generate_blocks(SHIELD_CONFIRMATIONS)
+            .await
+            .context("confirm shield")?;
+        funder
+            .sync(lwd.grpc_port)
+            .context("funder sync (shielded)")?;
+
+        Ok(FundedStack {
+            zebrad,
+            lwd,
+            funder,
+        })
+    }
+
+    /// Send `zats` to a zkv database's funding address and mine it to
+    /// spendability.
+    pub async fn fund(&self, funding_ua: &str, zats: u64) -> Result<()> {
+        self.funder
+            .send(self.lwd.grpc_port, funding_ua, zats)
+            .context("fund the zkv wallet")?;
+        self.zebrad
+            .generate_blocks(FUNDING_CONFIRMATIONS)
+            .await
+            .context("confirm the funding send to spendability")
+    }
+}
+
+// =============================== process + lock helpers ===============================
+
+/// A `zkv` process running detached from the caller.
+///
+/// Killed on drop, so a test that panics mid-way cannot leave a node behind
+/// holding a datadir lock: the next test's stack would then fail in a way that
+/// looks nothing like the actual failure.
+pub struct ZkvChild {
+    child: Option<Child>,
+    label: String,
+}
+
+impl ZkvChild {
+    /// Whether the child is still running. Reaps it if it has exited, so a
+    /// polling caller does not leave a zombie.
+    pub fn is_running(&mut self) -> Result<bool> {
+        let Some(child) = self.child.as_mut() else {
+            return Ok(false);
+        };
+        match child.try_wait().context("try_wait on zkv child")? {
+            Some(_) => Ok(false),
+            None => Ok(true),
+        }
+    }
+
+    /// Kill the child and reap it. Idempotent, and also run on drop.
+    pub fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+
+    /// Wait for the child to exit, then collect both streams.
+    ///
+    /// Polls rather than blocking on `wait_with_output`, so the tokio runtime
+    /// keeps turning and other tasks in the test still make progress. Kills the
+    /// child and errors if it outlives `timeout`.
+    pub async fn wait_with_output(mut self, timeout: Duration) -> Result<ZkvOutput> {
+        let deadline = Instant::now() + timeout;
+        loop {
+            if !self.is_running()? {
+                break;
+            }
+            if Instant::now() >= deadline {
+                self.kill();
+                bail!("`{}` did not exit within {timeout:?}", self.label);
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        let child = self
+            .child
+            .take()
+            .ok_or_else(|| anyhow!("`{}` was already reaped", self.label))?;
+        let out = child
+            .wait_with_output()
+            .with_context(|| format!("collect output of `{}`", self.label))?;
+        Ok(capture(out))
+    }
+}
+
+impl Drop for ZkvChild {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Whether *another process* holds the wallet engine's advisory lock on
+/// `<db_dir>/.lock`.
+///
+/// The same `flock(2)` zecd's node takes, reached through std's file locks, so
+/// this needs no new dependency and no `flock(1)` binary. `false` when the file
+/// does not exist yet, which is the state before any node has ever run.
+///
+/// Winning the lock here holds it for microseconds before releasing, which
+/// cannot disturb a zkv process that retries for a minute.
+pub fn datadir_lock_held(db_dir: &Path) -> Result<bool> {
+    let path = db_dir.join(".lock");
+    let file = match std::fs::File::open(&path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("open {}", path.display())),
+    };
+    match file.try_lock() {
+        Ok(()) => {
+            let _ = file.unlock();
+            Ok(false)
+        }
+        Err(std::fs::TryLockError::WouldBlock) => Ok(true),
+        Err(e) => Err(anyhow!("probing {}: {e}", path.display())),
+    }
+}
+
+/// Wait until [`datadir_lock_held`] reports true on `probes` consecutive polls
+/// a second apart.
+///
+/// Consecutive, deliberately. `zkv init`'s resume path opens and drops one
+/// engine for its pre-check sync before `poll_for_init` takes the lock again,
+/// so there is a brief window where the lock is free even though the process
+/// is about to hold it for minutes. A single sighting is not the steady state,
+/// and a test that raced that window would be flaky in a way that looks like a
+/// locking bug.
+pub async fn wait_for_datadir_lock(db_dir: &Path, probes: u32, timeout: Duration) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    let mut streak = 0;
+    loop {
+        streak = if datadir_lock_held(db_dir)? {
+            streak + 1
+        } else {
+            0
+        };
+        if streak >= probes {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!(
+                "no process held {}/.lock for {probes} consecutive probes within {timeout:?}",
+                db_dir.display()
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+}
+
+/// Poll `check` every two seconds until it returns true.
+///
+/// Errors from `check` are tolerated until the deadline: a command run against
+/// a chain that has not caught up yet fails before it succeeds, and that is the
+/// condition being waited on rather than a fault.
+pub async fn wait_until(
+    mut check: impl FnMut() -> Result<bool>,
+    what: &str,
+    timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if matches!(check(), Ok(true)) {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            bail!("timed out after {timeout:?} waiting for {what}");
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+}
+
+// =============================== the GUI server ===============================
+
+/// A running `zkv gui-browser`, with its session token, driven over HTTP.
+///
+/// The GUI is the surface with no live-chain coverage at all, and the one
+/// where a regression already reached CI green during the zecd port (its
+/// auto-sync loop deadlocking against its own node's datadir lock). Driving
+/// the real server over its real API is the only way to catch that shape of
+/// bug from outside.
+pub struct GuiServer {
+    child: ZkvChild,
+    base: String,
+    token: String,
+    http: reqwest::Client,
+}
+
+impl GuiServer {
+    /// Spawn the server against `zkv`'s data directory and lightwalletd, wait
+    /// for it to answer, and scrape the session token it injects into
+    /// `index.html`.
+    ///
+    /// Sharing the data directory is not incidental: the CLI and the GUI must
+    /// see the same databases for any of this to mean anything, and it is also
+    /// what stops the auto-sync loop's first statement (`demo::ensure`) from
+    /// dialing a public testnet server, since [`Zkv::with_bin`] has already
+    /// written the `.demo-oracles-provisioned` marker there.
+    pub async fn start(zkv: &Zkv, timeout: Duration) -> Result<GuiServer> {
+        let port = pick_port().context("pick a port for the GUI")?;
+        let port_arg = port.to_string();
+        // Stderr inherited so the server's logs are visible under --nocapture;
+        // nothing here ever reads them, so a pipe could only fill up.
+        let mut child =
+            zkv.spawn_online_quiet(None, &["gui-browser", "--port", &port_arg, "--no-open"])?;
+
+        let base = format!("http://127.0.0.1:{port}");
+        // `.no_proxy()`: the URL is loopback, but a machine with $HTTP_PROXY
+        // set would otherwise try to tunnel it, and fail in a way that looks
+        // nothing like the real problem.
+        let http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(120))
+            .build()
+            .context("build the GUI http client")?;
+
+        let deadline = Instant::now() + timeout;
+        let index = loop {
+            // Check liveness first: a server that died on startup should fail
+            // with its own exit rather than burn the whole timeout.
+            if !child.is_running()? {
+                bail!("`zkv gui-browser` exited before it served anything");
+            }
+            if let Ok(resp) = http.get(&base).send().await {
+                if resp.status().is_success() {
+                    break resp.text().await.context("read index.html")?;
+                }
+            }
+            if Instant::now() >= deadline {
+                bail!("`zkv gui-browser` did not answer on {base} within {timeout:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+
+        let token = scrape_token(&index)?;
+        Ok(GuiServer {
+            child,
+            base,
+            token,
+            http,
+        })
+    }
+
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
+    /// `GET <path>`, with the session token. Returns the status and the parsed
+    /// body (`Value::Null` when the body is not JSON).
+    pub async fn get(&self, path: &str) -> Result<(u16, Value)> {
+        self.send(
+            self.http.get(format!("{}{path}", self.base)),
+            Some(&self.token),
+        )
+        .await
+    }
+
+    /// `POST <path>` with a JSON body and the session token.
+    pub async fn post(&self, path: &str, body: Value) -> Result<(u16, Value)> {
+        self.send(
+            self.http.post(format!("{}{path}", self.base)).json(&body),
+            Some(&self.token),
+        )
+        .await
+    }
+
+    /// `GET <path>` with a deliberately wrong or absent token and/or `Host`,
+    /// for exercising the security guard.
+    pub async fn get_raw(
+        &self,
+        path: &str,
+        token: Option<&str>,
+        host: Option<&str>,
+    ) -> Result<(u16, Value)> {
+        let mut req = self.http.get(format!("{}{path}", self.base));
+        if let Some(host) = host {
+            req = req.header("host", host);
+        }
+        self.send(req, token).await
+    }
+
+    async fn send(
+        &self,
+        req: reqwest::RequestBuilder,
+        token: Option<&str>,
+    ) -> Result<(u16, Value)> {
+        let req = match token {
+            Some(t) => req.header("x-zkv-token", t),
+            None => req,
+        };
+        let resp = req.send().await.context("GUI request")?;
+        let status = resp.status().as_u16();
+        let text = resp.text().await.context("read GUI response body")?;
+        Ok((status, serde_json::from_str(&text).unwrap_or(Value::Null)))
+    }
+
+    /// Kill the server and reap it.
+    ///
+    /// `serve` only shuts down gracefully on Ctrl-C, which a plain `Child`
+    /// cannot send, so this is a SIGKILL. That is also worth exercising: the
+    /// kernel releases the datadir lock on process death, so the next CLI
+    /// command should find nothing to clean up.
+    pub fn shutdown(mut self) {
+        self.child.kill();
+    }
+}
+
+/// Pull the session token out of the served `index.html`.
+///
+/// The server substitutes it into `window.ZKV_TOKEN = "__ZKV_TOKEN__";`, which
+/// is exactly how the real frontend gets it. Failing on the un-substituted
+/// placeholder matters: that is the shape of breakage this would otherwise
+/// sail past, handing every later request a token the server never minted.
+fn scrape_token(index: &str) -> Result<String> {
+    const NEEDLE: &str = "window.ZKV_TOKEN = \"";
+    let token = index
+        .split_once(NEEDLE)
+        .and_then(|(_, rest)| rest.split_once('"'))
+        .map(|(token, _)| token.to_owned())
+        .ok_or_else(|| anyhow!("no `{NEEDLE}...` in the served index.html"))?;
+    if token.is_empty() || token.contains("__ZKV_TOKEN__") {
+        bail!("index.html served an unsubstituted session token: {token:?}");
+    }
+    Ok(token)
+}
+
 // =============================== helpers ===============================
 
 /// JSON-RPC 2.0 call to zebrad; returns the `result` or an error carrying the
@@ -1016,4 +1517,80 @@ async fn zebra_rpc_call(url: &str, method: &str, params: Value) -> Result<Value>
 fn tail(s: &str, lines: usize) -> String {
     let all: Vec<&str> = s.lines().collect();
     all[all.len().saturating_sub(lines)..].join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The token scrape, against the exact markup the server serves.
+    ///
+    /// The placeholder case is the one worth pinning: a build that shipped
+    /// `index.html` without substituting the token would otherwise hand every
+    /// later request a string the server never minted, and the failure would
+    /// surface as a pile of confusing 401s rather than as the real problem.
+    #[test]
+    fn the_token_scrape_reads_a_real_token_and_rejects_a_placeholder() {
+        let page = |script: &str| format!("<html><head>{script}</head><body></body></html>");
+
+        let token = scrape_token(&page(
+            r#"<script nonce="abc">window.ZKV_TOKEN = "s3cret";</script>"#,
+        ))
+        .expect("scrape a substituted token");
+        assert_eq!(token, "s3cret");
+
+        for bad in [
+            r#"<script>window.ZKV_TOKEN = "__ZKV_TOKEN__";</script>"#,
+            r#"<script>window.ZKV_TOKEN = "";</script>"#,
+        ] {
+            assert!(
+                scrape_token(&page(bad)).is_err(),
+                "an unsubstituted or empty token must be refused: {bad}",
+            );
+        }
+        assert!(
+            scrape_token(&page("<script>nothing here</script>")).is_err(),
+            "a page with no token at all must be refused",
+        );
+    }
+
+    /// The lock probe the contention test rests on, exercised against a real
+    /// `flock` rather than a mock.
+    ///
+    /// It works in one process because `flock` is per open file description,
+    /// not per process: two separate `open`s conflict with each other. That is
+    /// the same non-reentrancy that means no zkv code may hold this lock
+    /// across a call that starts a node, and it is what lets this test run
+    /// with no chain and no second binary.
+    #[test]
+    fn the_lock_probe_sees_a_held_datadir_and_a_free_one() {
+        let dir = tempfile::tempdir().expect("temp dir");
+
+        // No `.lock` yet: the state before any node has ever run.
+        assert!(
+            !datadir_lock_held(dir.path()).expect("probe a lockless dir"),
+            "a directory with no .lock cannot be held",
+        );
+
+        std::fs::write(dir.path().join(".lock"), b"").expect("create .lock");
+        assert!(
+            !datadir_lock_held(dir.path()).expect("probe an unheld lock"),
+            "an existing but unlocked .lock must read as free",
+        );
+
+        let held = std::fs::File::open(dir.path().join(".lock")).expect("open .lock");
+        held.try_lock().expect("take the lock");
+        assert!(
+            datadir_lock_held(dir.path()).expect("probe a held lock"),
+            "a held .lock must read as held",
+        );
+
+        // Releasing makes it free again, so a probe that won the lock earlier
+        // cannot have left it stuck.
+        held.unlock().expect("release");
+        assert!(
+            !datadir_lock_held(dir.path()).expect("probe after release"),
+            "the lock must read as free once released",
+        );
+    }
 }

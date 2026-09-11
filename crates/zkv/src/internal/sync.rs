@@ -1,72 +1,36 @@
-//! Wallet sync: scan compact blocks, then enhance (fetch full txs so memos appear).
+//! What is left of zkv's own wallet-sync surface now that the scan itself runs
+//! in the wallet engine.
 //!
-//! Callable from any command via `run_sync()`. Stripped of TUI/defrag features
-//! from the upstream zcash-devtool.
+//! The compact-block download, the scan, the reorg rewind and the enhancement
+//! pass all live in the node ([`crate::engine`]). What stays here is the part
+//! that is either about *memos* rather than blocks, or that has to run when no
+//! node exists yet:
+//!
+//! - [`read_sync`] and friends: the read-side sequence (decide whether a scan
+//!   can be skipped, otherwise ask the node to catch up, then prune
+//!   `pending.toml`). The pruning is zkv's, not the node's.
+//! - Birthday pinning ([`near_tip_birthday`], [`pinned_birthday`]): a wallet's
+//!   birthday has to be chosen *before* the wallet it belongs to exists, so
+//!   there is no node to ask. These keep zkv's own lightwalletd transport.
+//! - [`wallet_synced_to_tip`], the INIT re-broadcast gate.
 
-use std::collections::BTreeSet;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
 
 use anyhow::anyhow;
-use futures_util::{StreamExt, TryStreamExt};
-use orchard::tree::MerkleHashOrchard;
-use prost::Message;
-use rand::rngs::OsRng;
-use tokio::{fs::File, io::AsyncWriteExt, task::JoinHandle};
-use tonic::{transport::Channel, Code};
-use tracing::{debug, error, info};
 
 use zcash_client_backend::{
-    data_api::{
-        chain::{
-            error::Error as ChainError, scan_cached_blocks, BlockSource, ChainState,
-            CommitmentTreeRoot,
-        },
-        scanning::{ScanPriority, ScanRange},
-        wallet::decrypt_and_store_transaction,
-        AccountBirthday, TransactionDataRequest, TransactionStatus, WalletCommitmentTrees,
-        WalletRead, WalletWrite,
-    },
-    proto::service::{
-        self, compact_tx_streamer_client::CompactTxStreamerClient, BlockId, BlockRange,
-        RawTransaction,
-    },
+    data_api::{AccountBirthday, WalletRead},
+    proto::service,
 };
-use zcash_client_sqlite::{
-    chain::{init::init_blockmeta_db, BlockMeta},
-    error::SqliteClientError,
-    util::SystemClock,
-    FsBlockDb, FsBlockDbError, WalletDb,
-};
-use zcash_keys::encoding::AddressCodec;
-use zcash_primitives::{
-    merkle_tree::HashSer,
-    transaction::{Transaction, TxId},
-};
-use zcash_protocol::consensus::{BlockHeight, BranchId, Parameters};
-
-#[cfg(feature = "transparent-inputs")]
-use {
-    ::transparent::{
-        address::Script,
-        bundle::{OutPoint, TxOut},
-    },
-    zcash_client_backend::wallet::WalletTransparentOutput,
-    zcash_client_sqlite::AccountUuid,
-    zcash_protocol::value::Zatoshis,
-    zcash_script::script,
-};
+use zcash_primitives::transaction::TxId;
 
 use crate::{
-    config::{Role, WalletConfig},
-    data::{get_block_path, get_db_paths, open_wallet_db},
-    error,
+    data::{get_db_paths, open_wallet_db},
     internal::pending,
     remote::ConnectionArgs,
 };
-
-const BATCH_SIZE: u32 = 10_000;
 
 /// How many blocks behind the live tip a *read* sync may be and still skip the
 /// whole download/scan/enhance pipeline. Reads default to `--confirmations 3`,
@@ -100,6 +64,18 @@ pub const NEAR_TIP_TOLERANCE: u32 = 1;
 /// tip, so 0 is right there too.
 pub fn read_tip_tolerance(min_confs: u32) -> u32 {
     min_confs.saturating_sub(1)
+}
+
+/// The tolerance a read at `min_confs` should pass to [`read_sync`].
+///
+/// `None` at zero confirmations: such a read is asking for unconfirmed state,
+/// which only a running node can supply, so it must never skip.
+pub fn read_sync_tolerance(min_confs: u32) -> Option<u32> {
+    if min_confs == 0 {
+        None
+    } else {
+        Some(read_tip_tolerance(min_confs))
+    }
 }
 
 /// Maximum age of the chain tip we'll accept before pinning a new wallet
@@ -174,69 +150,27 @@ impl From<anyhow::Error> for TipError {
     }
 }
 
-/// Fetch the chain tip height on an existing client. One `GetLatestBlock`, with
-/// no freshness check (see [`fresh_chain_tip`] for the guarded variant).
-async fn chain_tip_height(client: &mut CompactTxStreamerClient<Channel>) -> Result<u32, TipError> {
-    client
-        .get_latest_block(service::ChainSpec::default())
-        .await
-        .map_err(|e| TipError::Other(anyhow!("{e}")))?
-        .into_inner()
-        .height
-        .try_into()
-        .map_err(|_| TipError::Other(anyhow!("chain tip height out of range")))
-}
-
 /// Fetch the chain tip height and reject it if its block timestamp is older
-/// than [`TIP_MAX_AGE`]. Cheap: one `GetLatestBlock` plus one `GetTreeState`
-/// (for the timestamp), with no compact-block download or scan. This is the "is
-/// the server's view of the chain current?" guard the database-creation/import
-/// paths share; it does **not** require the local wallet to have caught up to
-/// the tip (that is a full sync, a separate thing).
+/// than [`TIP_MAX_AGE`]. Cheap: no compact-block download, no scan. This is the
+/// "is the server's view of the chain current?" guard the database-creation and
+/// import paths share; it does **not** require the local wallet to have caught
+/// up to the tip (that is a full sync, a separate thing).
 async fn fresh_chain_tip(
-    client: &mut CompactTxStreamerClient<Channel>,
+    conn: &ConnectionArgs,
     network: crate::network::Network,
 ) -> Result<u32, TipError> {
-    let height = chain_tip_height(client).await?;
+    let tip = crate::engine::probe::tip_status(conn, network).await?;
     // Regtest block timestamps are synthetic (zebra's regtest genesis is
     // dated 2011 and `generate`d blocks advance one second per block), so the
     // wall-clock freshness gate can never pass and means nothing there: the
     // harness controls mining, so the tip is current by construction.
     if network == crate::network::Network::Regtest {
-        return Ok(height);
+        return Ok(tip.height);
     }
-    let treestate = client
-        .get_tree_state(BlockId {
-            height: u64::from(height),
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| TipError::Other(anyhow!("{e}")))?
-        .into_inner();
-    if !tip_time_is_fresh(treestate.time) {
+    if !tip_time_is_fresh(tip.time) {
         return Err(TipError::StaleTip);
     }
-    Ok(height)
-}
-
-/// Build an [`AccountBirthday`] at `birthday_height`, anchored to an
-/// already-validated fresh `chain_tip`. Shared tail of [`near_tip_birthday`]
-/// and [`pinned_birthday`].
-async fn account_birthday_at(
-    client: &mut CompactTxStreamerClient<Channel>,
-    birthday_height: u32,
-    chain_tip: u32,
-) -> Result<AccountBirthday, TipError> {
-    let treestate = client
-        .get_tree_state(BlockId {
-            height: u64::from(birthday_height).saturating_sub(1),
-            ..Default::default()
-        })
-        .await
-        .map_err(|e| TipError::Other(anyhow!("{e}")))?
-        .into_inner();
-    AccountBirthday::from_treestate(treestate, Some(chain_tip.into()))
-        .map_err(|e| TipError::Other(anyhow::Error::new(error::Error::from(e))))
+    Ok(tip.height)
 }
 
 /// Pin the birthday for a wallet whose birthday is **not known**, defaulting to
@@ -246,12 +180,12 @@ async fn account_birthday_at(
 /// ([`TipError::StaleTip`] otherwise; regtest tips are always accepted, see
 /// `fresh_chain_tip`).
 pub async fn near_tip_birthday(
-    client: &mut CompactTxStreamerClient<Channel>,
+    conn: &ConnectionArgs,
     network: crate::network::Network,
 ) -> Result<AccountBirthday, TipError> {
-    let chain_tip = fresh_chain_tip(client, network).await?;
+    let chain_tip = fresh_chain_tip(conn, network).await?;
     let birthday_height = chain_tip.saturating_sub(BIRTHDAY_SAFETY_BUFFER);
-    account_birthday_at(client, birthday_height, chain_tip).await
+    account_birthday_at(conn, network, birthday_height, chain_tip).await
 }
 
 /// Pin a birthday at an **already-known** height: importing or watching a zkv
@@ -260,26 +194,41 @@ pub async fn near_tip_birthday(
 /// buffer). Still requires a fresh tip ([`TipError::StaleTip`] otherwise;
 /// regtest tips are always accepted, see `fresh_chain_tip`).
 pub async fn pinned_birthday(
-    client: &mut CompactTxStreamerClient<Channel>,
+    conn: &ConnectionArgs,
     network: crate::network::Network,
     birthday_height: u32,
 ) -> Result<AccountBirthday, TipError> {
-    let chain_tip = fresh_chain_tip(client, network).await?;
-    account_birthday_at(client, birthday_height, chain_tip).await
+    let chain_tip = fresh_chain_tip(conn, network).await?;
+    account_birthday_at(conn, network, birthday_height, chain_tip).await
 }
 
 /// Like [`pinned_birthday`] but **without** the fresh-tip guard. For the
-/// mid-sync wipe-and-rebootstrap recovery, which runs on an already-connected
-/// client and must rebuild the wallet from the fixed `keys.toml` birthday even
-/// if the tip momentarily looks stale: a hard bail there would abort an
-/// in-progress auto-recovery. The tip height is still fetched, but only as the
-/// `from_treestate` anchor, not as a freshness gate.
+/// wipe-and-rebootstrap recovery, which must rebuild the wallet from the fixed
+/// `keys.toml` birthday even if the tip momentarily looks stale: a hard bail
+/// there would abort a rebuild the user explicitly asked for. The tip is still
+/// fetched, but only as the `recover_until` anchor, not as a freshness gate.
 pub async fn pinned_birthday_unchecked(
-    client: &mut CompactTxStreamerClient<Channel>,
+    conn: &ConnectionArgs,
+    network: crate::network::Network,
     birthday_height: u32,
 ) -> Result<AccountBirthday, TipError> {
-    let chain_tip = chain_tip_height(client).await?;
-    account_birthday_at(client, birthday_height, chain_tip).await
+    let chain_tip = crate::engine::probe::tip_status(conn, network)
+        .await?
+        .height;
+    account_birthday_at(conn, network, birthday_height, chain_tip).await
+}
+
+/// Build an [`AccountBirthday`] at `birthday_height`, anchored to an
+/// already-read `chain_tip`. Shared tail of the three pinning entry points.
+async fn account_birthday_at(
+    conn: &ConnectionArgs,
+    network: crate::network::Network,
+    birthday_height: u32,
+    chain_tip: u32,
+) -> Result<AccountBirthday, TipError> {
+    crate::engine::probe::account_birthday(conn, network, birthday_height, Some(chain_tip))
+        .await
+        .map_err(TipError::Other)
 }
 
 /// Whether the local wallet has scanned up to the current lightwalletd tip:
@@ -315,45 +264,172 @@ pub async fn wallet_synced_to_tip(
     Ok(within_tolerance && !pending_scan)
 }
 
-/// Shareable scan-progress counters fed by the scan loop and read by the
-/// status spinner. Cheap to clone (`Arc`-backed) and lock-free.
-#[derive(Clone, Default)]
-pub struct SyncProgress(Arc<SyncProgressInner>);
+/// Whether a read may skip syncing at the given tip `tolerance`, and if so the
+/// wallet height it should report.
+///
+/// `Some(height)` means a scan would be wasted work: the confirmed state a
+/// reader sees is provably identical with or without it, by the argument on
+/// [`read_tip_tolerance`]. `None` means the wallet has to catch up first.
+///
+/// This lives here, beside the tolerance it applies, rather than in the caller.
+/// The rule is subtle and its failure mode is quiet, a read that silently
+/// misses a confirmed write, so there should be exactly one statement of it.
+///
+/// Cheap by design: one local height read and one `GetLatestBlock`. It
+/// deliberately does not need a wallet-engine node, because the common case is
+/// that no sync is required and starting a node to discover that would cost
+/// far more than the answer is worth.
+pub async fn read_sync_skippable(
+    db_name: &str,
+    conn: &ConnectionArgs,
+    network: crate::network::Network,
+    tolerance: u32,
+) -> anyhow::Result<Option<u32>> {
+    // A member the shared scan has not imported yet has no local files to
+    // measure, so the honest answer is "nothing to skip on", not a failure. It
+    // matters that this is not an error: the caller's next step is the sync
+    // that *causes* the import, so erroring here strands a freshly-watched
+    // database in the state it is trying to leave. That is exactly what
+    // `zkv watch` did on its first sync.
+    let (_, db_data_path) = match get_db_paths(db_name) {
+        Ok(paths) => paths,
+        Err(e) if crate::data::is_import_pending(&e) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let db_data = open_wallet_db(&db_data_path, network)?;
+    let Some(wallet_tip) = db_data.chain_height()?.map(u32::from) else {
+        // Never scanned: there is no height to report and nothing to compare.
+        return Ok(None);
+    };
+    // A gap anywhere in the scanned range can hide a confirmed write at any
+    // depth, so tolerance says nothing about it.
+    if !db_data.suggest_scan_ranges()?.is_empty() {
+        return Ok(None);
+    }
+    drop(db_data);
 
-#[derive(Default)]
-struct SyncProgressInner {
-    /// Highest block height scanned so far (0 = unknown / not started).
-    scanned: AtomicU32,
-    /// Chain tip height we're scanning toward (0 = unknown yet).
-    tip: AtomicU32,
+    let mut client = conn.connect(network).await?;
+    let rpc_tip: u32 = client
+        .get_latest_block(service::ChainSpec::default())
+        .await?
+        .into_inner()
+        .height
+        .try_into()
+        .map_err(|_| anyhow!("chain tip height out of range"))?;
+
+    let behind = rpc_tip.saturating_sub(wallet_tip);
+    if behind <= tolerance {
+        tracing::debug!(
+            wallet_tip,
+            rpc_tip,
+            behind,
+            tolerance,
+            "wallet is near enough the tip that a read at this depth cannot change",
+        );
+        return Ok(Some(wallet_tip));
+    }
+    Ok(None)
 }
 
-impl SyncProgress {
-    fn set_tip(&self, tip: u32) {
-        self.0.tip.store(tip, Ordering::Relaxed);
-    }
-
-    /// Advance the scanned watermark, never moving it backward (ranges can be
-    /// processed out of order, e.g. a verify range before the main sweep).
-    fn observe_scanned(&self, height: u32) {
-        self.0.scanned.fetch_max(height, Ordering::Relaxed);
-    }
-
-    /// The spinner label: `Syncing… <scanned> / <tip> (<pct>%)` once both are
-    /// known, otherwise a bare `Syncing…` while we're still probing the tip.
-    ///
-    /// The percentage is capped at 99: 100% would only show for the instant
-    /// before the spinner is torn down (the sync is done), so it's never worth
-    /// rendering; completion is signalled by the spinner disappearing.
-    fn label(&self) -> String {
-        let tip = self.0.tip.load(Ordering::Relaxed);
-        let scanned = self.0.scanned.load(Ordering::Relaxed).min(tip);
-        if tip == 0 || scanned == 0 {
-            return "Syncing…".to_owned();
+/// Bring the wallet up to date for a read, through the wallet engine.
+///
+/// The one place the read-sync sequence lives: decide whether a scan can be
+/// skipped ([`read_sync_skippable`]), and only otherwise ask the node to catch
+/// up. Both the `db::Database` facade and the one-shot CLI commands call this,
+/// so the ordering, and the decision not to start a node when the answer is
+/// already known, are stated once.
+///
+/// Takes the engine rather than building one, because a long-lived caller
+/// keeps a node across operations while a CLI command wants a fresh one.
+pub async fn read_sync(
+    engine: &crate::engine::Engine,
+    db_name: &str,
+    conn: &ConnectionArgs,
+    network: crate::network::Network,
+    tolerance: Option<u32>,
+    cancel: Option<CancelFlag>,
+) -> anyhow::Result<u32> {
+    // `None` means never skip. That is what a read wanting unconfirmed writes
+    // asks for: the node keeps a live mempool subscription while it is caught
+    // up, so bringing it up is what makes the mempool visible at all, and
+    // skipping would leave a cold caller with no view of it.
+    if let Some(tolerance) = tolerance {
+        if let Some(height) = read_sync_skippable(db_name, conn, network, tolerance).await? {
+            // Prune here too, not only after a scan. A skip means the wallet is
+            // already near the tip, which is exactly when a broadcast written
+            // moments ago has confirmed and its `pending.toml` row is ready to
+            // drop. A caller whose reads always skip (a warm wallet on a quiet
+            // chain) would otherwise never prune at all.
+            prune_pending(db_name);
+            return Ok(height);
         }
-        let pct = (scanned as u64 * 100 / tip as u64).min(99) as u32;
-        format!("Syncing… {scanned} / {tip} ({pct}%)")
     }
+    // The wallet name is the database name on a shared-scan node, which serves
+    // many, and zecd's `default` on a node of this database's own.
+    let height = engine
+        .sync_wallet(engine_wallet_name(engine, db_name), cancel)
+        .await?
+        .scanned_height;
+    prune_pending(db_name);
+    Ok(height)
+}
+
+/// The zecd wallet name a database is addressed by on a given engine.
+pub(crate) fn engine_wallet_name<'a>(engine: &crate::engine::Engine, db_name: &'a str) -> &'a str {
+    match engine.kind() {
+        crate::engine::EngineKind::Own => crate::engine::WALLET,
+        crate::engine::EngineKind::Fleet { .. } => db_name,
+    }
+}
+
+/// Drop `pending.toml` rows whose transaction has now mined with its memo
+/// readable.
+///
+/// The node knows nothing about that file: it is zkv's own record of what it
+/// has broadcast but not yet seen on chain, so the pruning that used to ride
+/// along with zkv's scan has to be driven from the paths that replaced it.
+/// Left undone the file grows without bound, every read keeps merging writes
+/// the chain confirmed long ago, and the write path's version picker keeps
+/// counting them as still in flight.
+///
+/// Best effort by design: an unreadable wallet database is the caller's
+/// problem to report, not a reason to fail a sync that otherwise succeeded.
+pub(crate) fn prune_pending(db_name: &str) {
+    if let Ok((_, db_data_path)) = get_db_paths(db_name) {
+        gc_pending(db_name, &db_data_path);
+    }
+}
+
+/// [`read_sync`] with the transient status line the CLI shows.
+///
+/// The spinner only paints if the sync outlasts a short grace period, so a read
+/// that skips, or one that catches up in a few hundred milliseconds, stays
+/// silent. Status goes to stderr, leaving stdout clean for the value.
+///
+/// The label is recomputed per frame from the engine's live progress, so a long
+/// catch-up shows how far along it is rather than only that it is working. It
+/// stays a bare "Syncing..." until the node has reported a tip to measure
+/// against, which is the first slice and any node too far behind to say.
+pub async fn read_sync_with_status(
+    engine: &crate::engine::Engine,
+    db_name: &str,
+    conn: &ConnectionArgs,
+    network: crate::network::Network,
+    tolerance: Option<u32>,
+) -> anyhow::Result<u32> {
+    let progress = engine.progress();
+    let spinner = crate::ui::Spinner::start_with(
+        move || match progress.read() {
+            (scanned, Some(tip)) if scanned > 0 && tip > 0 => {
+                format!("Syncing... (block {scanned} of {tip})")
+            }
+            _ => "Syncing...".to_string(),
+        },
+        SPINNER_GRACE,
+    );
+    let out = read_sync(engine, db_name, conn, network, tolerance, None).await;
+    spinner.stop().await;
+    out
 }
 
 /// Delay before the spinner's first frame. Zero: a sync always does at least
@@ -370,1088 +446,6 @@ const SPINNER_GRACE: std::time::Duration = std::time::Duration::ZERO;
 /// halts in-flight scans promptly instead of only at the next cycle. `None`
 /// means never cancel (every CLI/manual sync path passes `None`).
 pub type CancelFlag = Arc<AtomicBool>;
-
-/// Whether a cooperative cancellation has been requested.
-fn cancelled(cancel: &Option<CancelFlag>) -> bool {
-    cancel.as_ref().is_some_and(|c| c.load(Ordering::Relaxed))
-}
-
-/// Back-compat alias for [`run_sync`]. The animated status spinner now lives in
-/// `run_sync` itself, so every sync path (the CLI commands, the `db::Database`
-/// facade, and the write path's pre-broadcast sync) shows it uniformly.
-pub async fn run_sync_with_status(
-    db_name: &str,
-    conn: &ConnectionArgs,
-    fetch_mempool_too: bool,
-) -> anyhow::Result<u32> {
-    run_sync(db_name, conn, fetch_mempool_too).await
-}
-
-/// Sync the named database to chain tip, then fetch full transactions so memos
-/// are decrypted. Returns the synced chain height.
-///
-/// When `fetch_mempool_too` is set, additionally pull all current mempool
-/// transactions from lightwalletd and decrypt them against this wallet's
-/// keys. Callers gate this on `--confirmations 0` so safety-conscious reads
-/// don't surface arbitrary unconfirmed state from the wire.
-///
-/// Strict tip tolerance (0): the pipeline is skipped only when the wallet is
-/// exactly at the live tip. Use this for writes (a spend needs an accurate
-/// tree) and for an explicit `zkv sync`. Reads should prefer [`run_sync_read`].
-pub async fn run_sync(
-    db_name: &str,
-    conn: &ConnectionArgs,
-    fetch_mempool_too: bool,
-) -> anyhow::Result<u32> {
-    run_sync_tol(db_name, conn, fetch_mempool_too, 0, None).await
-}
-
-/// Read-oriented sync: identical to [`run_sync`], but tolerates being up to
-/// [`NEAR_TIP_TOLERANCE`] blocks behind the live tip before deciding it must
-/// re-scan. Lets a tight read loop skip the whole download/scan/enhance
-/// pipeline for the newest block or two (which confirmed reads at
-/// `--confirmations >= 1` ignore anyway), while a fresh mempool pull (when
-/// `fetch_mempool_too`) still happens on the skip path.
-pub async fn run_sync_read(
-    db_name: &str,
-    conn: &ConnectionArgs,
-    fetch_mempool_too: bool,
-) -> anyhow::Result<u32> {
-    run_sync_tol(db_name, conn, fetch_mempool_too, NEAR_TIP_TOLERANCE, None).await
-}
-
-/// Read sync that a caller can cancel cooperatively (see [`CancelFlag`]). Used
-/// by the GUI's background auto-sync loop so pausing a database (or pausing all
-/// syncing) aborts an in-flight scan promptly instead of letting it run to the
-/// end of the cycle. Behaves exactly like [`run_sync_read`] when `cancel` is
-/// never set.
-pub async fn run_sync_read_cancellable(
-    db_name: &str,
-    conn: &ConnectionArgs,
-    fetch_mempool_too: bool,
-    cancel: Option<CancelFlag>,
-) -> anyhow::Result<u32> {
-    run_sync_tol(db_name, conn, fetch_mempool_too, NEAR_TIP_TOLERANCE, cancel).await
-}
-
-/// Read sync whose fast-path skip tolerance comes from the request's
-/// confirmation depth ([`read_tip_tolerance`]) instead of the fixed
-/// [`NEAR_TIP_TOLERANCE`]. Used by the confirmation-aware read commands
-/// (`zkv get`/`history`): a default `-c 3` read skips a re-scan when up to 2
-/// blocks behind the tip (those blocks can't yet hold a 3-confirmation write),
-/// while `-c 1`/`-c 0` tighten to an exact-tip skip so a just-confirmed write is
-/// never missed.
-pub async fn run_sync_read_confs(
-    db_name: &str,
-    conn: &ConnectionArgs,
-    min_confs: u32,
-    fetch_mempool_too: bool,
-) -> anyhow::Result<u32> {
-    run_sync_tol(
-        db_name,
-        conn,
-        fetch_mempool_too,
-        read_tip_tolerance(min_confs),
-        None,
-    )
-    .await
-}
-
-/// Shared sync driver: the per-attempt spinner + reorg/corruption recovery
-/// loop, parameterized by how many blocks behind the live tip the fast-path
-/// skip will accept (`tip_tolerance`). See [`run_sync`] / [`run_sync_read`].
-async fn run_sync_tol(
-    db_name: &str,
-    conn: &ConnectionArgs,
-    fetch_mempool_too: bool,
-    tip_tolerance: u32,
-    cancel: Option<CancelFlag>,
-) -> anyhow::Result<u32> {
-    // Serialize against any other zkv process touching this database: a chain
-    // scan mutates the wallet DB and the block cache, and two concurrent scans
-    // (or a scan racing a spend) would corrupt them. Held for the whole sync;
-    // reentrant with the write path's own lock (see `internal::lock`).
-    let _lock = crate::internal::lock::DbLock::acquire(db_name)?;
-    let mut tried_recovery = false;
-    loop {
-        // A fresh spinner per attempt, started around the scan only: it is torn
-        // down (line erased) *before* any recovery prompt (which reads stdin
-        // and writes stderr), so the two never fight over the terminal. The
-        // spinner self-suppresses when stderr isn't a TTY, so the facade / GUI /
-        // piped callers stay silent; the `progress` atomics it reads are cheap
-        // no-ops in that case.
-        let progress = SyncProgress::default();
-        let label_src = progress.clone();
-        let spinner = crate::ui::Spinner::start_with(move || label_src.label(), SPINNER_GRACE);
-        let result = run_sync_inner(
-            db_name,
-            conn,
-            fetch_mempool_too,
-            tip_tolerance,
-            Some(&progress),
-            &cancel,
-        )
-        .await;
-        spinner.stop().await;
-
-        match result {
-            Ok(h) => return Ok(h),
-            Err(e) => {
-                if !tried_recovery && needs_recovery(&e) && prompt_for_wipe(db_name, &e)? {
-                    let cfg = WalletConfig::read(db_name)?;
-                    let mut client = conn.connect(cfg.network).await?;
-                    crate::internal::recover::wipe_sidecars(db_name)?;
-                    crate::internal::recover::rebootstrap(db_name, &mut client).await?;
-                    crate::ui::success(
-                        "Wallet rebuilt from keys.toml; resuming sync from birthday.",
-                    );
-                    tried_recovery = true;
-                    continue;
-                }
-                return Err(e);
-            }
-        }
-    }
-}
-
-/// Errors that warrant offering a wipe-and-rebootstrap recovery:
-///
-/// - an unrecoverable reorg ([`UnrecoverableRewind`]);
-/// - an uninitialized/corrupt wallet schema (e.g. `no such table: scan_queue`
-///   from a half-deleted data.sqlite);
-/// - a commitment-tree write failure during scan (`PutBlocksCommitmentTree`,
-///   e.g. a shardtree `Insert(Conflict(..))`): the on-disk Sapling/Orchard
-///   note-commitment tree is structurally inconsistent with the blocks being
-///   scanned. Normal reorgs are caught earlier as continuity errors and rewound
-///   (see `scan_blocks`), so a conflict that reaches here is genuine tree
-///   corruption — a DB left inconsistent by an earlier bug or built against a
-///   different shardtree revision — that only a rebuild-from-chain fixes. The
-///   wiped sidecars are all re-derivable from the seed/UFVK, so this is safe,
-///   and both callers bound it to a single wipe (CLI `tried_recovery`, GUI
-///   `auto_wipe_first_time`) so a reproducible failure can't loop.
-///
-/// The scan error reaches us as an opaque `anyhow!("{:?}", e)` string (see
-/// `scan_blocks`), so the schema/commitment-tree cases are matched on the
-/// error's text rather than by downcast, mirroring the existing `scan_queue`
-/// check.
-fn needs_recovery(e: &anyhow::Error) -> bool {
-    if e.downcast_ref::<UnrecoverableRewind>().is_some() {
-        return true;
-    }
-    let msg = format!("{e:#}");
-    msg.contains("no such table: scan_queue") || msg.contains("PutBlocksCommitmentTree")
-}
-
-/// Whether the reorg/corruption recovery path may block on an interactive
-/// stdin `[y/N]` prompt. On (the default) for the `zkv` CLI, where a foreground
-/// command owns the terminal. The GUI turns it OFF (`Engine::new` calls
-/// [`set_interactive_prompts_enabled`]`(false)`): a GUI process can inherit the
-/// launching shell's TTY (e.g. `zkv gui` run from a terminal), so an
-/// `is_terminal()` check alone would let a background auto-sync steal stdin and
-/// hang the app behind a prompt nobody can answer.
-static INTERACTIVE_PROMPTS: AtomicBool = AtomicBool::new(true);
-
-/// Enable or disable interactive recovery prompts process-wide. See the
-/// `INTERACTIVE_PROMPTS` static. The GUI disables them at startup.
-pub fn set_interactive_prompts_enabled(enabled: bool) {
-    INTERACTIVE_PROMPTS.store(enabled, Ordering::Relaxed);
-}
-
-/// Databases already auto-wiped this process (GUI self-heal). Bounds the
-/// non-interactive recovery to one wipe per database so a persistent reorg
-/// can't drive an endless wipe/rescan loop.
-static AUTO_WIPED: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
-
-/// Record an auto-wipe for `db_name`; returns true the first time this process
-/// wipes it (wipe allowed), false on every subsequent unrecoverable failure.
-fn auto_wipe_first_time(db_name: &str) -> bool {
-    AUTO_WIPED
-        .lock()
-        .map(|mut wiped| wiped.insert(db_name.to_owned()))
-        .unwrap_or(false)
-}
-
-fn prompt_for_wipe(db_name: &str, err: &anyhow::Error) -> anyhow::Result<bool> {
-    use std::io::{stderr, stdin, BufRead, IsTerminal, Write};
-    eprintln!();
-    if let Some(rewind) = err.downcast_ref::<UnrecoverableRewind>() {
-        eprintln!(
-            "Chain reorg at height {} cannot be recovered: no valid checkpoint with a scanned \
-             block exists at or below the conflict point (requested rewind to {}).",
-            rewind.at_height, rewind.requested
-        );
-    } else {
-        eprintln!("Wallet sidecar appears uninitialized or corrupt: {err:#}");
-    }
-    let cfg = WalletConfig::read(db_name)?;
-    if cfg.role == Role::Watch && cfg.zkv_address.is_none() {
-        eprintln!(
-            "This watch-only database was created before zkv stored its address in keys.toml. \
-             Re-run `zkv watch <zkv_addr>` with the original address and birthday to rebuild."
-        );
-        return Ok(false);
-    }
-    // GUI mode disables interactive prompts (a background auto-sync must never
-    // block on a `[y/N]` stdin read; the GUI can also inherit the launching
-    // shell's TTY, so `is_terminal()` alone wouldn't stop it). There the
-    // recovery self-heals: the wiped sidecars (data.sqlite, block cache,
-    // snapshot) are all re-derivable from the seed/UFVK and the chain, so a
-    // wipe+resync is safe and the app recovers on its own. Bound it to ONE
-    // auto-wipe per database per process, though: if a reorg keeps recurring, a
-    // second wipe would just loop on a full rescan, so surface the error and let
-    // the user intervene instead.
-    if !INTERACTIVE_PROMPTS.load(Ordering::Relaxed) {
-        if auto_wipe_first_time(db_name) {
-            tracing::warn!(
-                db = db_name,
-                "unrecoverable reorg / corrupt sidecar: auto-wiping and resyncing from the chain \
-                 (one-time self-heal)"
-            );
-            return Ok(true);
-        }
-        tracing::warn!(
-            db = db_name,
-            "unrecoverable reorg / corrupt sidecar persists after a one-time auto-wipe; not wiping \
-             again to avoid a rescan loop. Resync manually by deleting data.sqlite, \
-             blockmeta.sqlite, blocks/, and zkv_state.sqlite under the database directory."
-        );
-        return Ok(false);
-    }
-    // CLI with a non-TTY stdin (piped): can't confirm, and the user didn't opt
-    // into auto-wipe, so refuse rather than destroy local state unprompted.
-    if !stdin().is_terminal() {
-        eprintln!(
-            "Refusing to auto-wipe without an interactive confirmation. Re-run the affected \
-             database from an interactive `zkv` CLI to confirm, or manually delete the sidecar \
-             files (data.sqlite, blockmeta.sqlite, blocks/, zkv_state.sqlite) under the database \
-             directory to force a fresh resync."
-        );
-        return Ok(false);
-    }
-    eprint!("Delete local cache and resync the {db_name:?} database from the blockchain? [y/N] ");
-    let _ = stderr().flush();
-    let mut line = String::new();
-    stdin().lock().read_line(&mut line)?;
-    Ok(matches!(line.trim(), "y" | "Y" | "yes" | "YES"))
-}
-
-async fn run_sync_inner(
-    db_name: &str,
-    conn: &ConnectionArgs,
-    fetch_mempool_too: bool,
-    tip_tolerance: u32,
-    progress: Option<&SyncProgress>,
-    cancel: &Option<CancelFlag>,
-) -> anyhow::Result<u32> {
-    let config = WalletConfig::read(db_name)?;
-    let params = config.network;
-
-    let (fsblockdb_root, db_data_path) = get_db_paths(db_name)?;
-    let fsblockdb_root = fsblockdb_root.as_path();
-    let mut db_cache = FsBlockDb::for_path(fsblockdb_root).map_err(error::Error::from)?;
-    // `for_path` opens (creating an empty file if absent) but does not create the
-    // `compactblocks_meta` schema; only `data::init_dbs` does, at database
-    // creation. So a block cache that was pruned or deleted from an existing
-    // database (documented as safe: it rebuilds on next sync) would otherwise
-    // fail here with "no such table: compactblocks_meta". The migrator is
-    // idempotent, so running it every sync is cheap and makes the cache
-    // self-healing.
-    init_blockmeta_db(&mut db_cache).map_err(|e| anyhow!("init block cache schema: {e:?}"))?;
-    let mut db_data = open_wallet_db(&db_data_path, params)?;
-    let mut client = conn.connect(params).await?;
-
-    // Self-heal a wallet whose account is missing: the wallet DB opens but holds
-    // zero accounts because its local data was reset/wiped without the key being
-    // restored (e.g. a watch-only import whose UFVK didn't survive a data reset).
-    // Every scan below would otherwise fail with `no_account_error`. If
-    // `keys.toml` still has recoverable material — an admin seed, or a watch db's
-    // stored `zkv_address` — rebuild the account from it before syncing; the
-    // chain is the source of truth, so the wiped sidecars re-derive on the
-    // rescan that follows. Watch dbs predating the stored `zkv_address` aren't
-    // recoverable this way, so we leave those for the read path to report.
-    if WalletRead::get_account_ids(&db_data)?.is_empty() {
-        let recoverable = match config.role {
-            Role::Admin => true,
-            Role::Watch => config.zkv_address.is_some(),
-        };
-        if recoverable {
-            tracing::warn!(
-                db = db_name,
-                "wallet has no account; rebuilding it from keys.toml before syncing (self-heal)"
-            );
-            // Release the handles to the files we're about to delete.
-            drop(db_data);
-            drop(db_cache);
-            crate::internal::recover::wipe_sidecars(db_name)?;
-            crate::internal::recover::rebootstrap(db_name, &mut client).await?;
-            // Re-open the freshly rebuilt sidecars for the rest of the sync.
-            db_cache = FsBlockDb::for_path(fsblockdb_root).map_err(error::Error::from)?;
-            init_blockmeta_db(&mut db_cache)
-                .map_err(|e| anyhow!("init block cache schema: {e:?}"))?;
-            db_data = open_wallet_db(&db_data_path, params)?;
-        }
-    }
-
-    // Fast path: if the wallet's last-known chain height matches the live tip
-    // and there's no pending scan or enhance work, skip the whole pipeline.
-    // One cheap `GetLatestBlock` saves a `GetSubtreeRoots` stream plus the
-    // scan-range bookkeeping that runs even when nothing has changed.
-    let rpc_tip: u32 = client
-        .get_latest_block(service::ChainSpec::default())
-        .await?
-        .get_ref()
-        .height
-        .try_into()
-        .map_err(|_| error::Error::InvalidAmount)?;
-    // Surface the tip to the progress spinner as early as possible, so the
-    // first frame can show `scanned / tip` instead of a bare "Syncing…". Seed
-    // the scanned watermark from the wallet's already-scanned height (best
-    // effort) so the percentage is meaningful immediately rather than starting
-    // at 0% until the first batch lands.
-    if let Some(p) = progress {
-        p.set_tip(rpc_tip);
-        if let Ok(Some(summary)) = db_data.get_wallet_summary(
-            zcash_client_backend::data_api::wallet::ConfirmationsPolicy::default(),
-        ) {
-            p.observe_scanned(u32::from(summary.fully_scanned_height()));
-        }
-    }
-    // If the chain has advanced no more than `tip_tolerance` blocks since our
-    // last sync and there are no pending scan ranges, skip the whole pipeline.
-    // For reads (`tip_tolerance` from the request's confirmation depth, see
-    // `read_tip_tolerance`, or `NEAR_TIP_TOLERANCE` when there is none) this lets
-    // a tight loop avoid a full download/scan/enhance pass just to pick up the
-    // newest block or two, which confirmed reads ignore anyway; writes pass 0 so a spend
-    // always builds on the exact tip. Note: we intentionally ignore
-    // `transaction_data_requests()` here; `TransactionsInvolvingAddress` for
-    // transparent receivers gets re-emitted every sync, but with no new blocks
-    // there is by definition no new data for it to find.
-    let wallet_tip = db_data.chain_height()?.map(u32::from);
-    let pending_scan = !db_data.suggest_scan_ranges()?.is_empty();
-    let behind = rpc_tip.saturating_sub(wallet_tip.unwrap_or(0));
-    let within_tolerance = wallet_tip.is_some() && behind <= tip_tolerance;
-    info!(
-        "Tip check: rpc={rpc_tip} wallet={wallet_tip:?} behind={behind} \
-         tolerance={tip_tolerance} pending_scan={pending_scan}"
-    );
-    if within_tolerance && !pending_scan {
-        info!("already synced to within {tip_tolerance} of {rpc_tip} (wallet at {wallet_tip:?})");
-        if fetch_mempool_too {
-            let chain_tip = BlockHeight::from_u32(rpc_tip);
-            if let Err(e) = fetch_mempool(&mut client, &params, chain_tip, &mut db_data).await {
-                tracing::debug!("mempool fetch failed: {e:#}");
-            }
-        }
-        gc_pending(db_name, &db_data_path);
-        // Report the height we actually have scanned, not the live tip; within
-        // tolerance these differ by at most `tip_tolerance` blocks.
-        return Ok(wallet_tip.unwrap_or(rpc_tip));
-    }
-
-    update_subtree_roots(&mut client, &mut db_data).await?;
-
-    loop {
-        // Cooperative cancellation: a paused GUI aborts the scan between passes
-        // (and `sync_pass` checks again per block-batch). Partial progress is
-        // safe and resumes on the next sync.
-        if cancelled(cancel) {
-            info!("sync cancelled; stopping scan early");
-            return Ok(db_data.chain_height()?.map(u32::from).unwrap_or(0));
-        }
-        if !sync_pass(
-            &mut client,
-            &params,
-            fsblockdb_root,
-            &mut db_cache,
-            &mut db_data,
-            &db_data_path,
-            progress,
-            cancel,
-        )
-        .await?
-        {
-            break;
-        }
-    }
-
-    // If cancellation landed during the last pass, skip the (potentially heavy)
-    // enhance + mempool work and return what we have.
-    if cancelled(cancel) {
-        info!("sync cancelled; skipping enhance");
-        return Ok(db_data.chain_height()?.map(u32::from).unwrap_or(0));
-    }
-
-    // Enhance: fetch full transactions so memos are decrypted into the wallet DB.
-    info!("fetching full transactions to decrypt memos");
-    enhance(&mut client, &params, &mut db_data).await?;
-
-    if fetch_mempool_too {
-        let chain_tip = db_data
-            .chain_height()?
-            .unwrap_or(BlockHeight::from_u32(rpc_tip));
-        if let Err(e) = fetch_mempool(&mut client, &params, chain_tip, &mut db_data).await {
-            tracing::warn!("mempool fetch failed: {e:#}");
-        }
-    }
-
-    let tip = db_data.chain_height()?.map(u32::from).unwrap_or(0);
-    gc_pending(db_name, &db_data_path);
-    Ok(tip)
-}
-
-/// One pass: download blocks, scan, repeat as suggested. Returns `true` if a
-/// retriggering condition (chain tip moved or reorg) suggests we should loop again.
-// One more argument than clippy's default cap: this is the download/scan
-// pass's full working set (clients, params, both DB handles, progress, cancel),
-// threaded rather than bundled to keep the call site self-documenting.
-#[allow(clippy::too_many_arguments)]
-async fn sync_pass<P: Parameters + Send + 'static>(
-    client: &mut CompactTxStreamerClient<Channel>,
-    params: &P,
-    fsblockdb_root: &Path,
-    db_cache: &mut FsBlockDb,
-    db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
-    db_data_path: &Path,
-    progress: Option<&SyncProgress>,
-    cancel: &Option<CancelFlag>,
-) -> anyhow::Result<bool> {
-    let chain_tip = update_chain_tip(client, db_data).await?;
-    if let Some(p) = progress {
-        p.set_tip(u32::from(chain_tip));
-    }
-
-    #[cfg(feature = "transparent-inputs")]
-    for account_id in db_data.get_account_ids()? {
-        refresh_utxos(params, client, db_data, account_id, BlockHeight::from(0)).await?;
-    }
-
-    let mut scan_ranges = db_data.suggest_scan_ranges()?;
-    info!("fetched {} scan ranges", scan_ranges.len());
-
-    let mut block_deletions = vec![];
-
-    // Verify any pending range first.
-    loop {
-        match scan_ranges.first() {
-            Some(scan_range) if scan_range.priority() == ScanPriority::Verify => {
-                let block_meta =
-                    download_blocks(client, fsblockdb_root, db_cache, scan_range).await?;
-                let chain_state =
-                    download_chain_state(client, scan_range.block_range().start - 1).await?;
-                let updated = scan_blocks(
-                    params,
-                    fsblockdb_root,
-                    db_cache,
-                    db_data,
-                    db_data_path,
-                    &chain_state,
-                    scan_range,
-                )?;
-                block_deletions.push(delete_cached_blocks(fsblockdb_root, block_meta));
-                if let Some(p) = progress {
-                    p.observe_scanned(u32::from(scan_range.block_range().end).saturating_sub(1));
-                }
-                if updated {
-                    scan_ranges = db_data.suggest_scan_ranges()?;
-                } else {
-                    break;
-                }
-            }
-            _ => break,
-        }
-    }
-
-    let scan_ranges = db_data.suggest_scan_ranges()?;
-    debug!("Suggested ranges: {:?}", scan_ranges);
-
-    for scan_range in scan_ranges.into_iter().flat_map(|r| {
-        (0..).scan(r, |acc, _| {
-            if acc.is_empty() {
-                None
-            } else if let Some((cur, next)) = acc.split_at(acc.block_range().start + BATCH_SIZE) {
-                *acc = next;
-                Some(cur)
-            } else {
-                let cur = acc.clone();
-                let end = acc.block_range().end;
-                *acc = ScanRange::from_parts(end..end, acc.priority());
-                Some(cur)
-            }
-        })
-    }) {
-        // Stop before starting the next batch if a cancellation is pending, so a
-        // paused GUI stops burning CPU within one batch instead of at the end of
-        // the full range. Flush the deferred block-cache deletions first.
-        if cancelled(cancel) {
-            for deletion in block_deletions {
-                deletion.await?;
-            }
-            return Ok(false);
-        }
-        let block_meta = download_blocks(client, fsblockdb_root, db_cache, &scan_range).await?;
-        let chain_state = download_chain_state(client, scan_range.block_range().start - 1).await?;
-        let updated = scan_blocks(
-            params,
-            fsblockdb_root,
-            db_cache,
-            db_data,
-            db_data_path,
-            &chain_state,
-            &scan_range,
-        )?;
-        block_deletions.push(delete_cached_blocks(fsblockdb_root, block_meta));
-        if let Some(p) = progress {
-            p.observe_scanned(u32::from(scan_range.block_range().end).saturating_sub(1));
-        }
-
-        if updated {
-            for deletion in block_deletions {
-                deletion.await?;
-            }
-            return Ok(true);
-        }
-    }
-
-    for deletion in block_deletions {
-        deletion.await?;
-    }
-    Ok(false)
-}
-
-async fn update_subtree_roots<P: Parameters>(
-    client: &mut CompactTxStreamerClient<Channel>,
-    db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
-) -> anyhow::Result<()> {
-    let mut request = service::GetSubtreeRootsArg::default();
-    request.set_shielded_protocol(service::ShieldedProtocol::Sapling);
-    let sapling_roots: Vec<CommitmentTreeRoot<sapling::Node>> = client
-        .get_subtree_roots(request)
-        .await?
-        .into_inner()
-        .and_then(|root| async move {
-            let root_hash = sapling::Node::read(&root.root_hash[..])?;
-            Ok(CommitmentTreeRoot::from_parts(
-                BlockHeight::from_u32(root.completing_block_height as u32),
-                root_hash,
-            ))
-        })
-        .try_collect()
-        .await?;
-    info!("Sapling tree: {} subtrees", sapling_roots.len());
-    db_data.put_sapling_subtree_roots(0, &sapling_roots)?;
-
-    let mut request = service::GetSubtreeRootsArg::default();
-    request.set_shielded_protocol(service::ShieldedProtocol::Orchard);
-    let orchard_roots: Vec<CommitmentTreeRoot<MerkleHashOrchard>> = client
-        .get_subtree_roots(request)
-        .await?
-        .into_inner()
-        .and_then(|root| async move {
-            let root_hash = MerkleHashOrchard::read(&root.root_hash[..])?;
-            Ok(CommitmentTreeRoot::from_parts(
-                BlockHeight::from_u32(root.completing_block_height as u32),
-                root_hash,
-            ))
-        })
-        .try_collect()
-        .await?;
-    info!("Orchard tree: {} subtrees", orchard_roots.len());
-    db_data.put_orchard_subtree_roots(0, &orchard_roots)?;
-
-    Ok(())
-}
-
-async fn update_chain_tip<P: Parameters>(
-    client: &mut CompactTxStreamerClient<Channel>,
-    db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
-) -> anyhow::Result<BlockHeight> {
-    let tip_height: BlockHeight = client
-        .get_latest_block(service::ChainSpec::default())
-        .await?
-        .get_ref()
-        .height
-        .try_into()
-        .map_err(|_| error::Error::InvalidAmount)?;
-    info!("Chain tip: {}", tip_height);
-    db_data.update_chain_tip(tip_height)?;
-    Ok(tip_height)
-}
-
-/// Upper bound on compact-block bytes buffered in memory between the gRPC
-/// stream reader and the block-file writer in [`download_blocks`]. A whole
-/// [`BATCH_SIZE`] range of small (mostly empty) blocks fits far under this, so
-/// the reader never stalls in the case that matters (see below); only ranges
-/// of large blocks can hit it, and those are safe to slow-read.
-const DOWNLOAD_BUFFER_BYTES: usize = 32 * 1024 * 1024;
-
-/// How many consecutive zero-progress reconnects [`download_blocks`] tolerates
-/// after a client-side h2 load-shed GOAWAY before giving up. Any attempt that
-/// writes at least one block resets the count, so a download that keeps making
-/// progress keeps resuming.
-const MAX_STALLED_STREAM_RESTARTS: u32 = 3;
-
-/// Whether an error is h2's own load-shed GOAWAY (`ENHANCE_YOUR_CALM` /
-/// `too_many_data_frames`): the *client* library killing a healthy connection
-/// because too many small DATA frames sat momentarily unpolled. Retryable by
-/// reconnecting and resuming; the reason only appears in the source chain, so
-/// match on the debug rendering.
-fn is_h2_load_shed(e: &anyhow::Error) -> bool {
-    let msg = format!("{e:?}");
-    msg.contains("too_many_data_frames") || msg.contains("ENHANCE_YOUR_CALM")
-}
-
-async fn download_blocks(
-    client: &mut CompactTxStreamerClient<Channel>,
-    fsblockdb_root: &Path,
-    db_cache: &FsBlockDb,
-    scan_range: &ScanRange,
-) -> anyhow::Result<Vec<BlockMeta>> {
-    info!("Fetching {}", scan_range);
-    let range_end: u64 = (scan_range.block_range().end - 1).into();
-    let mut next: u64 = scan_range.block_range().start.into();
-    let mut block_meta: Vec<BlockMeta> = vec![];
-    let mut stalled_restarts = 0u32;
-    loop {
-        let before = block_meta.len();
-        match download_range_once(client, fsblockdb_root, next, range_end, &mut block_meta).await {
-            Ok(()) => break,
-            // h2's client-side DoS protection (see `download_range_once`) can
-            // still fire on a large enough burst of tiny frames: the budget is
-            // charged as the connection task *parses* frames off the socket,
-            // so a datacenter-bandwidth burst can exhaust it before the
-            // consumer task gets scheduled at all, however fast it drains.
-            // The GOAWAY only kills the connection, not our progress: every
-            // block already written stays written, tonic's channel reconnects
-            // transparently on the next call, and a fresh connection starts
-            // with a full budget. Resume from the first block we don't have.
-            Err(e) if is_h2_load_shed(&e) => {
-                if block_meta.len() > before {
-                    stalled_restarts = 0;
-                } else {
-                    stalled_restarts += 1;
-                    if stalled_restarts > MAX_STALLED_STREAM_RESTARTS {
-                        return Err(e.context(
-                            "block download made no progress across repeated h2 load-shed \
-                             reconnects",
-                        ));
-                    }
-                }
-                if let Some(last) = block_meta.last() {
-                    next = u64::from(last.height) + 1;
-                }
-                tracing::warn!(
-                    "client-side h2 load shed killed the block stream; reconnecting and \
-                     resuming at {next}"
-                );
-            }
-            Err(e) => return Err(e),
-        }
-    }
-
-    db_cache
-        .write_block_metadata(&block_meta)
-        .map_err(error::Error::from)?;
-    Ok(block_meta)
-}
-
-/// One streaming attempt of [`download_blocks`]: fetch `[next, range_end]`,
-/// appending a [`BlockMeta`] to `block_meta` for every block whose cache file
-/// was written. On a stream error, everything already appended is on disk, so
-/// the caller can resume after the last entry.
-async fn download_range_once(
-    client: &mut CompactTxStreamerClient<Channel>,
-    fsblockdb_root: &Path,
-    next: u64,
-    range_end: u64,
-    block_meta: &mut Vec<BlockMeta>,
-) -> anyhow::Result<()> {
-    let range = service::BlockRange {
-        start: Some(service::BlockId {
-            height: next,
-            ..Default::default()
-        }),
-        end: Some(service::BlockId {
-            height: range_end,
-            ..Default::default()
-        }),
-        pool_types: Default::default(),
-    };
-    let mut stream = client.get_block_range(range).await?.into_inner();
-
-    // Drain the gRPC stream on a dedicated task, decoupled from the per-block
-    // file writes by a byte-bounded in-memory buffer.
-    //
-    // Writing each block to disk between stream polls (the previous shape)
-    // let received-but-unpolled DATA frames pile up inside h2 whenever the
-    // disk was slower than the network. h2 (0.4.13+) budgets the framing
-    // overhead of buffered sub-256-byte DATA frames as a DoS protection
-    // (`too_many_data_frames`), and a mostly empty compact block, the norm on
-    // testnet, is one tiny frame well under that threshold. A fast server
-    // plus slow file creation (Windows Defender scanning every new block
-    // file, CI runners on datacenter bandwidth) therefore killed the
-    // connection deterministically with GOAWAY ENHANCE_YOUR_CALM before the
-    // first batch committed; the next sync cycle restarted from the same
-    // position and died the same way, so the wallet never progressed and the
-    // GUI showed a misleading "can't reach the server" banner. Draining
-    // eagerly keeps h2's receive buffer close to empty (its budget
-    // replenishes as frames are polled), and the retry in `download_blocks`
-    // absorbs the burst case the drain cannot prevent. The buffer is bounded
-    // by bytes rather than messages: small blocks (the dangerous case)
-    // always fit far under the bound for a whole batch, while large blocks
-    // may backpressure the reader but replenish the h2 budget and are safe
-    // to read slowly.
-    let permits = Arc::new(tokio::sync::Semaphore::new(DOWNLOAD_BUFFER_BYTES));
-    let reader_permits = permits.clone();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-    let reader = tokio::spawn(async move {
-        while let Some(block) = stream.message().await? {
-            let (sapling_outputs_count, orchard_actions_count) = block
-                .vtx
-                .iter()
-                .map(|tx| (tx.outputs.len() as u32, tx.actions.len() as u32))
-                .fold((0, 0), |(s, o), (sn, on)| (s + sn, o + on));
-            let meta = BlockMeta {
-                height: block.height(),
-                block_hash: block.hash(),
-                block_time: block.time,
-                sapling_outputs_count,
-                orchard_actions_count,
-            };
-            let encoded = block.encode_to_vec();
-            let cost = encoded.len().clamp(1, DOWNLOAD_BUFFER_BYTES) as u32;
-            let permit = reader_permits
-                .clone()
-                .acquire_many_owned(cost)
-                .await
-                .expect("buffer semaphore is never closed");
-            // The permit rides along and is released when the writer is done
-            // with this block. A send failure means the writer bailed on a
-            // file error; stop draining and let the task end.
-            if tx.send((meta, encoded, permit)).is_err() {
-                break;
-            }
-        }
-        Ok::<(), tonic::Status>(())
-    });
-
-    // Blocks buffered before a stream error are still written (the channel
-    // drains fully before the error surfaces below), so partial progress
-    // survives for the resume path.
-    while let Some((meta, encoded, _permit)) = rx.recv().await {
-        let mut f = File::create(get_block_path(fsblockdb_root, &meta)).await?;
-        f.write_all(&encoded).await?;
-        block_meta.push(meta);
-    }
-    // The channel closing cleanly still requires the reader to have ended
-    // without a stream error; surface one if it did.
-    reader.await??;
-    Ok(())
-}
-
-async fn download_chain_state(
-    client: &mut CompactTxStreamerClient<Channel>,
-    block_height: BlockHeight,
-) -> anyhow::Result<ChainState> {
-    let tree_state = client
-        .get_tree_state(BlockId {
-            height: block_height.into(),
-            hash: vec![],
-        })
-        .await?;
-    Ok(tree_state.into_inner().to_chain_state()?)
-}
-
-fn delete_cached_blocks(fsblockdb_root: &Path, block_meta: Vec<BlockMeta>) -> JoinHandle<()> {
-    let fsblockdb_root = fsblockdb_root.to_owned();
-    tokio::spawn(async move {
-        for meta in block_meta {
-            if let Err(e) = tokio::fs::remove_file(get_block_path(&fsblockdb_root, &meta)).await {
-                error!("Failed to remove {:?}: {}", meta, e);
-            }
-        }
-    })
-}
-
-/// Reorg recovery exhausted: no valid rewind target exists for the conflict point.
-/// `run_sync` downcasts to this to drive the wipe-and-rebootstrap prompt.
-#[derive(Debug)]
-pub struct UnrecoverableRewind {
-    pub at_height: BlockHeight,
-    pub requested: BlockHeight,
-}
-
-impl std::fmt::Display for UnrecoverableRewind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "Chain reorg at height {} could not be recovered (requested rewind to {}); \
-             no valid checkpoint with a scanned block exists at or below the conflict.",
-            self.at_height, self.requested
-        )
-    }
-}
-
-impl std::error::Error for UnrecoverableRewind {}
-
-/// Find the highest height that is in the `blocks` table AND has shared
-/// sapling+orchard checkpoints, bounded by `max_height`. Used as a shallow-rewind
-/// fallback when the requested deep rewind has no valid target below it.
-fn find_shallow_rewind_target(
-    db_data_path: &Path,
-    max_height: BlockHeight,
-) -> anyhow::Result<Option<BlockHeight>> {
-    use rusqlite::OptionalExtension;
-    let conn = rusqlite::Connection::open_with_flags(
-        db_data_path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
-    // Read-only, so we can't set the journal mode (the file is already WAL from
-    // the read/write opens); just wait rather than fail if a writer holds the
-    // lock momentarily.
-    conn.busy_timeout(std::time::Duration::from_secs(30))?;
-    let h: Option<u32> = conn
-        .query_row(
-            "SELECT MAX(blocks.height) FROM blocks
-             JOIN sapling_tree_checkpoints sc ON sc.checkpoint_id = blocks.height
-             JOIN orchard_tree_checkpoints oc ON oc.checkpoint_id = blocks.height
-             WHERE blocks.height <= ?1",
-            [u32::from(max_height)],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    Ok(h.map(BlockHeight::from))
-}
-
-fn perform_rewind<P: Parameters>(
-    db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
-    db_data_path: &Path,
-    at_height: BlockHeight,
-    requested: BlockHeight,
-) -> anyhow::Result<BlockHeight> {
-    match db_data.truncate_to_height(requested) {
-        Ok(h) => Ok(h),
-        Err(SqliteClientError::RequestedRewindInvalid {
-            safe_rewind_height, ..
-        }) => {
-            // First try the safe (deeper) rewind reported by the wallet, if any.
-            if let Some(safe) = safe_rewind_height.filter(|&s| s < requested) {
-                info!("No checkpoint at {requested}; trying safe rewind to {safe}");
-                if let Ok(h) = db_data.truncate_to_height(safe) {
-                    return Ok(h);
-                }
-            }
-            // Fall back: find the highest valid (blocks ∩ shared checkpoints) at or below
-            // the actual conflict height. This handles young wallets whose lowest
-            // shared checkpoint (the birthday anchor) has no `blocks` row.
-            if let Some(target) = find_shallow_rewind_target(db_data_path, at_height)? {
-                info!(
-                    "Shallow rewind to {target} (no valid target at-or-below requested {requested})"
-                );
-                return db_data
-                    .truncate_to_height(target)
-                    .map_err(|e| anyhow!("{:?}", e));
-            }
-            Err(UnrecoverableRewind {
-                at_height,
-                requested,
-            }
-            .into())
-        }
-        Err(e) => Err(anyhow!("{:?}", e)),
-    }
-}
-
-fn scan_blocks<P: Parameters + Send + 'static>(
-    params: &P,
-    fsblockdb_root: &Path,
-    db_cache: &mut FsBlockDb,
-    db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
-    db_data_path: &Path,
-    initial_chain_state: &ChainState,
-    scan_range: &ScanRange,
-) -> anyhow::Result<bool> {
-    info!("Scanning {}", scan_range);
-    let scan_result = scan_cached_blocks(
-        params,
-        db_cache,
-        db_data,
-        scan_range.block_range().start,
-        initial_chain_state,
-        scan_range.len(),
-    );
-
-    match scan_result {
-        Err(ChainError::Scan(err)) if err.is_continuity_error() => {
-            let requested = err.at_height().saturating_sub(10);
-            info!(
-                "Chain reorg detected at {}, rewinding to {}",
-                err.at_height(),
-                requested
-            );
-            let rewind_height = perform_rewind(db_data, db_data_path, err.at_height(), requested)?;
-            db_cache
-                .with_blocks(Some(rewind_height + 1), None, |block| {
-                    let meta = BlockMeta {
-                        height: block.height(),
-                        block_hash: block.hash(),
-                        block_time: block.time,
-                        sapling_outputs_count: 0,
-                        orchard_actions_count: 0,
-                    };
-                    std::fs::remove_file(get_block_path(fsblockdb_root, &meta))
-                        .map_err(|e| ChainError::<(), _>::BlockSource(FsBlockDbError::Fs(e)))
-                })
-                .map_err(|e| anyhow!("{:?}", e))?;
-            db_cache
-                .truncate_to_height(rewind_height)
-                .map_err(|e| anyhow!("{:?}", e))?;
-            Ok(true)
-        }
-        Ok(_) => {
-            let latest_ranges = db_data.suggest_scan_ranges()?;
-            Ok(if let Some(range) = latest_ranges.first() {
-                range.priority() > scan_range.priority()
-            } else {
-                false
-            })
-        }
-        Err(e) => Err(anyhow!("{:?}", e)),
-    }
-}
-
-#[cfg(feature = "transparent-inputs")]
-async fn refresh_utxos<P: Parameters>(
-    params: &P,
-    client: &mut CompactTxStreamerClient<Channel>,
-    db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
-    account_id: AccountUuid,
-    start_height: BlockHeight,
-) -> anyhow::Result<()> {
-    let addresses = db_data
-        .get_transparent_receivers(account_id, true, true)?
-        .into_keys()
-        .map(|addr| addr.encode(params))
-        .collect::<Vec<_>>();
-    if addresses.is_empty() {
-        return Ok(());
-    }
-    let request = service::GetAddressUtxosArg {
-        addresses,
-        start_height: start_height.into(),
-        max_entries: 0,
-    };
-    client
-        .get_address_utxos_stream(request)
-        .await?
-        .into_inner()
-        .map_err(anyhow::Error::from)
-        .and_then(|reply| async move {
-            WalletTransparentOutput::from_parts(
-                OutPoint::new(reply.txid[..].try_into()?, reply.index.try_into()?),
-                TxOut::new(
-                    Zatoshis::from_nonnegative_i64(reply.value_zat)?,
-                    Script(script::Code(reply.script)),
-                ),
-                Some(BlockHeight::from(u32::try_from(reply.height)?)),
-                // recipient_account / recipient_key_scope / funding_account (added in
-                // the Ironwood RC): account-attribution metadata we don't have for a
-                // UTXO discovered via lightwalletd's GetAddressUtxos. The sqlite layer
-                // resolves the owning account by looking the recipient address up in
-                // the `addresses` table (put_transparent_output), so None here
-                // preserves the prior behavior.
-                None,
-                None,
-                None,
-            )
-            .ok_or(anyhow!("non-standard UTXO"))
-        })
-        .try_for_each(|output| {
-            let res = db_data.put_received_transparent_utxo(&output).map(|_| ());
-            async move { res.map_err(anyhow::Error::from) }
-        })
-        .await?;
-    Ok(())
-}
-
-// ---- Enhance pass ----
-
-pub(crate) fn parse_raw_transaction<P: Parameters>(
-    params: &P,
-    chain_tip: BlockHeight,
-    tx: RawTransaction,
-) -> anyhow::Result<(Transaction, Option<BlockHeight>)> {
-    let mined_height = (tx.height > 0 && tx.height <= u64::from(u32::MAX))
-        .then(|| BlockHeight::from_u32(u32::try_from(tx.height).unwrap()));
-    let tx = Transaction::read(
-        &tx.data[..],
-        BranchId::for_height(params, mined_height.unwrap_or(chain_tip)),
-    )?;
-    Ok((tx, mined_height))
-}
-
-pub(crate) async fn fetch_transaction<P: Parameters>(
-    client: &mut CompactTxStreamerClient<Channel>,
-    params: &P,
-    chain_tip: BlockHeight,
-    txid: TxId,
-) -> anyhow::Result<Option<(Transaction, Option<BlockHeight>)>> {
-    let request = service::TxFilter {
-        hash: txid.as_ref().to_vec(),
-        ..Default::default()
-    };
-    let raw_tx = match client.get_transaction(request).await {
-        Ok(response) => Ok(Some(response.into_inner())),
-        Err(status) => {
-            if status.code() == Code::NotFound {
-                Ok(None)
-            } else {
-                Err(status)
-            }
-        }
-    }?;
-    raw_tx
-        .map(|raw_tx| parse_raw_transaction(params, chain_tip, raw_tx))
-        .transpose()
-}
-
-/// Pull every current mempool tx from lightwalletd and decrypt against the
-/// wallet's keys. Matching txs end up in `data.sqlite` as unmined rows; the
-/// existing read path then surfaces them with `mined_height IS NULL`.
-///
-/// Best-effort: any per-tx parse/decrypt failure is logged and skipped, and
-/// stream-level errors are surfaced to the caller (which logs + ignores).
-async fn fetch_mempool<P: Parameters>(
-    client: &mut CompactTxStreamerClient<Channel>,
-    params: &P,
-    chain_tip: BlockHeight,
-    db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
-) -> anyhow::Result<()> {
-    use zcash_client_backend::proto::service::Empty;
-
-    let mut stream = client.get_mempool_stream(Empty {}).await?.into_inner();
-    let mut scanned = 0usize;
-    while let Some(raw) = stream.message().await? {
-        scanned += 1;
-        let (tx, mined_height) = match parse_raw_transaction(params, chain_tip, raw) {
-            Ok(parsed) => parsed,
-            Err(e) => {
-                tracing::debug!("skipping unparseable mempool tx: {e:#}");
-                continue;
-            }
-        };
-        // decrypt_and_store_transaction silently no-ops on txs whose outputs
-        // don't decrypt to any of our viewing keys, so we don't need to
-        // pre-filter.
-        if let Err(e) = decrypt_and_store_transaction(params, db_data, &tx, mined_height) {
-            tracing::debug!("skipping mempool tx: {e:#}");
-        }
-    }
-    if scanned > 0 {
-        info!("mempool: scanned {scanned} tx(s)");
-    }
-    Ok(())
-}
 
 /// After a sync pass, prune `pending.toml` entries whose tx the wallet has now
 /// indexed **with its memo decrypted**. The local cache bridges the gap between
@@ -1490,19 +484,51 @@ fn gc_pending(db_name: &str, db_data_path: &Path) {
     }
 }
 
-/// Txids the wallet has indexed **with a decrypted memo**: mined and present in
-/// `v_tx_outputs` with a non-NULL memo. This is exactly the set the read path
-/// can see (it sources memos from `v_tx_outputs WHERE memo IS NOT NULL`), so a
-/// pending entry whose txid is in this set can be dropped without the state
-/// flapping. A tx that is merely mined (compact-scanned) but not yet enhanced
-/// has a NULL memo and is deliberately excluded.
-fn mined_with_memo_txids(
+/// Txids the wallet has indexed **with a decrypted memo**: mined, with a
+/// received note carrying a non-NULL memo. This is exactly the set the read
+/// path can see (it selects memos the same way), so a pending entry whose txid
+/// is in this set can be dropped without the state flapping. A tx that is
+/// merely mined (compact-scanned) but not yet enhanced has a NULL memo and is
+/// deliberately excluded.
+///
+/// Reads the base note tables rather than `v_tx_outputs` joined to
+/// `v_transactions`, for the reason
+/// [`crate::internal::state::received_outputs_sql`] gives: those views are
+/// whole-wallet aggregates, and this runs after every sync.
+///
+/// The memo may sit on the received note or, for an output the wallet itself
+/// created, on the matching `sent_notes` row: the view this replaced took the
+/// larger of the two and so does the read path, so a self-send whose received
+/// memo has not been backfilled still counts as visible. Missing that would
+/// keep a confirmed write pending forever.
+///
+/// Every pool is scanned, not just the database's own, and no account predicate
+/// is applied. Both match the query this replaces, and both are harmless here:
+/// the set is only ever used to *drop* a pending entry whose txid we broadcast
+/// ourselves, so a wider set cannot strand one. A fleet member sharing a shard
+/// file with other accounts would want the account predicate.
+///
+/// One deliberate narrowing against the old query: an output the wallet *sent*
+/// to somebody else, with no received note of its own, is not counted. The read
+/// path cannot see such an output either (it reads received notes), so counting
+/// it could only drop a pending entry the read path was still blind to.
+pub(crate) fn mined_with_memo_txids(
     conn: &rusqlite::Connection,
 ) -> rusqlite::Result<std::collections::HashSet<String>> {
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT v.txid FROM v_tx_outputs v \
-         JOIN v_transactions t ON t.txid = v.txid \
-         WHERE t.mined_height IS NOT NULL AND v.memo IS NOT NULL",
+        "SELECT DISTINCT t.txid FROM (
+             SELECT transaction_id, output_index AS output_index, memo, 2 AS pool
+                 FROM sapling_received_notes
+             UNION ALL SELECT transaction_id, action_index, memo, 3 FROM orchard_received_notes
+             UNION ALL SELECT transaction_id, action_index, memo, 4 FROM ironwood_received_notes
+         ) n \
+         JOIN transactions t ON t.id_tx = n.transaction_id \
+         LEFT JOIN sent_notes sn \
+                ON sn.transaction_id = n.transaction_id \
+               AND sn.output_pool = n.pool \
+               AND sn.output_index = n.output_index \
+         WHERE t.mined_height IS NOT NULL \
+           AND (n.memo IS NOT NULL OR sn.memo IS NOT NULL)",
     )?;
     let mut seen = std::collections::HashSet::new();
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
@@ -1514,107 +540,53 @@ fn mined_with_memo_txids(
     Ok(seen)
 }
 
-async fn enhance<P: Parameters + Send + 'static>(
-    client: &mut CompactTxStreamerClient<Channel>,
-    params: &P,
-    db_data: &mut WalletDb<rusqlite::Connection, P, SystemClock, OsRng>,
-) -> anyhow::Result<()> {
-    let chain_tip = match db_data.chain_height()? {
-        Some(h) => h,
-        None => return Ok(()),
-    };
-
-    let mut satisfied = BTreeSet::new();
-    loop {
-        let mut any_new = false;
-        for req in db_data.transaction_data_requests()? {
-            if satisfied.contains(&req) {
-                continue;
-            }
-            any_new = true;
-            match &req {
-                TransactionDataRequest::GetStatus(txid) => {
-                    let status = fetch_transaction(client, params, chain_tip, *txid)
-                        .await?
-                        .map_or(TransactionStatus::TxidNotRecognized, |(_, mined)| {
-                            mined
-                                .map_or(TransactionStatus::NotInMainChain, TransactionStatus::Mined)
-                        });
-                    db_data.set_transaction_status(*txid, status)?;
-                }
-                TransactionDataRequest::Enhancement(txid) => {
-                    match fetch_transaction(client, params, chain_tip, *txid).await? {
-                        None => db_data
-                            .set_transaction_status(*txid, TransactionStatus::TxidNotRecognized)?,
-                        Some((tx, mined)) => {
-                            decrypt_and_store_transaction(params, db_data, &tx, mined)?
-                        }
-                    }
-                }
-                TransactionDataRequest::TransactionsInvolvingAddress(tia) => {
-                    let address = tia.address().encode(params);
-                    let request = service::TransparentAddressBlockFilter {
-                        address: address.clone(),
-                        range: Some(BlockRange {
-                            start: Some(service::BlockId {
-                                height: u64::from(tia.block_range_start()),
-                                ..Default::default()
-                            }),
-                            end: tia.block_range_end().map(|h| service::BlockId {
-                                height: u64::from(h - 1),
-                                ..Default::default()
-                            }),
-                            pool_types: Default::default(),
-                        }),
-                    };
-                    let mut stream = client.get_taddress_txids(request).await?.into_inner();
-                    while let Some(raw_tx) = stream.next().await {
-                        let (tx, mined) = parse_raw_transaction(params, chain_tip, raw_tx?)?;
-                        decrypt_and_store_transaction(params, db_data, &tx, mined)?;
-                    }
-                }
-            }
-            satisfied.insert(req);
-        }
-        if !any_new {
-            break;
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        is_h2_load_shed, mined_with_memo_txids, read_tip_tolerance, tip_time_is_fresh,
-        SyncProgress, TIP_MAX_AGE,
-    };
+    use super::{mined_with_memo_txids, read_tip_tolerance, tip_time_is_fresh, TIP_MAX_AGE};
     use zcash_primitives::transaction::TxId;
 
     // One stub row: (txid, mined_height, decrypted memo bytes).
     type StubRow<'a> = (TxId, Option<i64>, Option<&'a [u8]>);
 
-    // Minimal stand-ins for the wallet's `v_transactions` / `v_tx_outputs`
-    // views: only the columns `mined_with_memo_txids` reads. Lets us exercise
-    // the pending-GC selection (mined AND memo decrypted) without the full
-    // zcash_client_sqlite schema.
+    // Minimal stand-ins for the base tables `mined_with_memo_txids` reads: only
+    // the columns it touches. Lets us exercise the pending-GC selection (mined
+    // AND memo decrypted) without the full zcash_client_sqlite schema. The
+    // query's agreement with the real one is covered by
+    // `internal::state::tests::the_base_table_scan_matches_the_view_it_replaces`,
+    // which runs against a populated real wallet database.
+    //
+    // The notes go in the Orchard table; the query unions all three pools and
+    // this exercises one of them.
     fn stub_wallet_db(rows: &[StubRow]) -> rusqlite::Connection {
         let conn = rusqlite::Connection::open_in_memory().unwrap();
         conn.execute_batch(
-            "CREATE TABLE v_transactions (txid BLOB, mined_height INTEGER);
-             CREATE TABLE v_tx_outputs (txid BLOB, memo BLOB);",
+            "CREATE TABLE transactions (id_tx INTEGER PRIMARY KEY, txid BLOB, mined_height INTEGER);
+             CREATE TABLE sapling_received_notes (
+                 transaction_id INTEGER, output_index INTEGER, memo BLOB
+             );
+             CREATE TABLE orchard_received_notes (
+                 transaction_id INTEGER, action_index INTEGER, memo BLOB
+             );
+             CREATE TABLE ironwood_received_notes (
+                 transaction_id INTEGER, action_index INTEGER, memo BLOB
+             );
+             CREATE TABLE sent_notes (
+                 transaction_id INTEGER, output_pool INTEGER, output_index INTEGER, memo BLOB
+             );",
         )
         .unwrap();
-        for (txid, mined, memo) in rows {
+        for (i, (txid, mined, memo)) in rows.iter().enumerate() {
+            let id_tx = i as i64 + 1;
             let bytes = txid.as_ref().to_vec();
             conn.execute(
-                "INSERT INTO v_transactions (txid, mined_height) VALUES (?1, ?2)",
-                rusqlite::params![bytes, mined],
+                "INSERT INTO transactions (id_tx, txid, mined_height) VALUES (?1, ?2, ?3)",
+                rusqlite::params![id_tx, bytes, mined],
             )
             .unwrap();
             conn.execute(
-                "INSERT INTO v_tx_outputs (txid, memo) VALUES (?1, ?2)",
-                rusqlite::params![bytes, memo],
+                "INSERT INTO orchard_received_notes (transaction_id, action_index, memo)
+                 VALUES (?1, 0, ?2)",
+                rusqlite::params![id_tx, memo],
             )
             .unwrap();
         }
@@ -1658,49 +630,6 @@ mod tests {
         assert_eq!(read_tip_tolerance(10), 9);
     }
 
-    #[test]
-    fn progress_label_is_bare_until_tip_and_scan_known() {
-        let p = SyncProgress::default();
-        assert_eq!(p.label(), "Syncing…");
-        // Tip known but nothing scanned yet → still bare (avoids "x / tip (0%)").
-        p.set_tip(100);
-        assert_eq!(p.label(), "Syncing…");
-    }
-
-    #[test]
-    fn progress_label_shows_scanned_tip_and_percent() {
-        let p = SyncProgress::default();
-        p.set_tip(3_366_250);
-        p.observe_scanned(3_366_176);
-        assert_eq!(p.label(), "Syncing… 3366176 / 3366250 (99%)");
-    }
-
-    #[test]
-    fn progress_scanned_watermark_never_regresses() {
-        let p = SyncProgress::default();
-        p.set_tip(100);
-        p.observe_scanned(50);
-        p.observe_scanned(20); // out-of-order range must not move it backward
-        assert_eq!(p.label(), "Syncing… 50 / 100 (50%)");
-    }
-
-    #[test]
-    fn progress_scanned_is_clamped_to_tip() {
-        let p = SyncProgress::default();
-        p.set_tip(100);
-        p.observe_scanned(150); // a range end past the tip shouldn't show >100%
-                                // Capped at 99%; 100% is never rendered (the spinner just disappears).
-        assert_eq!(p.label(), "Syncing… 100 / 100 (99%)");
-    }
-
-    #[test]
-    fn progress_percent_never_reaches_100() {
-        let p = SyncProgress::default();
-        p.set_tip(3_366_250);
-        p.observe_scanned(3_366_250); // fully caught up
-        assert_eq!(p.label(), "Syncing… 3366250 / 3366250 (99%)");
-    }
-
     fn now_secs() -> u32 {
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1725,29 +654,5 @@ mod tests {
     fn future_tip_is_treated_as_fresh() {
         // Clock skew: a future-dated block must not be rejected.
         assert!(tip_time_is_fresh(now_secs().saturating_add(120)));
-    }
-    // The retry in `download_blocks` hinges on recognizing h2's own load-shed
-    // GOAWAY, whose reason only shows up in the error's Debug chain. Pin that
-    // contract: a real error must match, and errors we must NOT silently retry
-    // (a genuine transport failure, a stale-tip refusal) must not.
-    #[test]
-    fn h2_load_shed_is_recognized_from_the_debug_chain() {
-        let shed = anyhow::anyhow!(
-            "status: ResourceExhausted, message: \"h2 protocol error: error reading a body \
-             from connection\", source: Some(hyper::Error(Body, Error {{ kind: \
-             GoAway(b\"too_many_data_frames\", ENHANCE_YOUR_CALM, Library) }}))"
-        );
-        assert!(is_h2_load_shed(&shed));
-
-        for other in [
-            "transport error",
-            "connection error detected: unexpected internal error encountered",
-            "can't confirm a current chain tip (latest block is over 300s old)",
-        ] {
-            assert!(
-                !is_h2_load_shed(&anyhow::anyhow!("{other}")),
-                "must not be treated as a load shed: {other}"
-            );
-        }
     }
 }

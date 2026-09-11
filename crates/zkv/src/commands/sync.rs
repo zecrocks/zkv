@@ -6,7 +6,7 @@ use crate::{
     data::resolve_db,
     internal::{
         state::{load_state, INIT_CONFIRMATIONS},
-        sync::run_sync_with_status,
+        sync::read_sync_with_status,
     },
     remote::ConnectionMode,
     ui,
@@ -16,6 +16,15 @@ use crate::{
 pub(crate) struct Command {
     #[command(flatten)]
     connection: ConnectionCliArgs,
+
+    /// Delete the local wallet cache and re-scan from the birthday.
+    ///
+    /// The chain is the source of truth, so nothing is lost: every byte
+    /// deleted is re-derived by the scan that follows. Reach for this when a
+    /// database will not sync (a wallet cache left unmigratable by an upgrade,
+    /// or corrupted by an interrupted write). It costs a full re-scan.
+    #[arg(long)]
+    rebuild: bool,
 }
 
 impl Command {
@@ -28,7 +37,42 @@ impl Command {
             return Ok(());
         }
         let cfg = WalletConfig::read(&name)?;
-        let height = run_sync_with_status(&name, &connection, false).await?;
+
+        // A rebuild has to happen with no node running: it deletes the very
+        // files the node holds open, and re-creates the account the node then
+        // checks its viewing-key pin against. Take the datadir lock to enforce
+        // that rather than merely assume it: on Unix an unlinked file keeps
+        // being written, so a GUI or second zkv syncing through this would
+        // flush a second wallet into the directory after the wipe.
+        //
+        // The guard is scoped tightly and dropped before the engine opens
+        // below: `flock` is not reentrant across handles, so the node could not
+        // take a lock this process still held.
+        if self.rebuild {
+            // A member of the shared scan has no wallet files of its own to
+            // wipe, and the shard it reads is shared with other databases, so
+            // deleting it here would rescan everybody. `zkv fleet rebuild` is
+            // the operation that means this for a fleet.
+            if cfg.engine.is_fleet_member() {
+                anyhow::bail!(
+                    "{name:?} is served by the shared scan, so it has no wallet cache of its \
+                     own to rebuild. Use `zkv fleet rebuild` to re-import the whole shared \
+                     scan, or `zkv fleet leave {name}` to give this database files of its own."
+                );
+            }
+            {
+                let _lock = crate::engine::lock_datadir(&crate::data::db_dir(&name)?, &name)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+                ui::warn("Deleting the local wallet cache and re-scanning from the birthday.");
+                crate::internal::recover::wipe_sidecars(&name)?;
+                crate::internal::recover::rebootstrap(&name, &connection).await?;
+            }
+        }
+
+        // No tolerance: this command exists to catch up, so it does the work
+        // even when a read at the same moment would have been entitled to skip.
+        let engine = crate::engine::EngineRef::open(&name, &connection)?;
+        let height = read_sync_with_status(&engine, &name, &connection, cfg.network, None).await?;
 
         // Report where we synced from: network, the server we picked, and the
         // transport. `pick` can't fail here (the sync above already connected

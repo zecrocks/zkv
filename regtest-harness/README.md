@@ -17,6 +17,13 @@ harness is a pure black-box driver: it works unmodified against any zebrad
 release and drives `zkv` strictly as subprocesses of the built binary, so the
 real sync/sign/broadcast pipeline is exercised, not library shortcuts.
 
+## Rust version
+
+This crate needs **Rust 1.89** or newer (std file locks, used by the datadir
+lock probe). That is above the workspace's 1.88 MSRV, which is fine because
+the root workspace excludes this crate: `cargo check --workspace` and the
+`msrv (1.88)` CI job never build it.
+
 ## Why a separate crate
 
 The harness lives in its **own workspace** (note the empty `[workspace]` in
@@ -49,10 +56,50 @@ sees it. It commits its **own `Cargo.lock`**; build with `--locked`.
      address converges on the same state; a duplicate import is refused.
   7. A shallow (db-less) `zkv shallow get` against the bare address agrees
      with the full replay.
+  8. A batch write through the `batch_write` example: several ops in ONE
+     transaction (one txid, one fee), with two writes to the same key taking
+     consecutive replay versions. `write_many` has no CLI surface, and this
+     harness has no `zkv` dependency, so a compiled example is how it is
+     reached. Needs `$ZKV_BATCH_BIN`; skipped without it.
+  9. `sync --rebuild`, admin and watch-only. A canary planted in the block
+     cache proves the wipe happened (afterwards a rebuilt `data.sqlite` is
+     indistinguishable from an untouched one), the root → `zec/lrz/`
+     relocation is asserted on disk, and every read is compared through a
+     projection that leaves out tip-relative confirmation counts.
+- `tests/regtest_lock.rs`: two zkv processes on one database. zkv holds no
+  lock of its own any more, so this is the node's datadir lock doing the
+  serializing, and a node start *retries* for 60s rather than blocking
+  forever. One process waits its turn and succeeds; one whose turn never
+  comes gives up inside a two-sided time bound saying the database is in
+  use; the database survives a SIGKILLed holder. Unfunded (the lock holder
+  is `zkv init` on an unfunded database, whose poll loop holds one engine
+  for its whole timeout), so it needs no `$DEVTOOL_BIN`.
+- `tests/regtest_gui.rs`: the GUI browser transport against a live chain.
+  Spawns the real `zkv gui-browser`, scrapes its session token out of
+  `index.html` exactly as the frontend does, and drives `/api/*`. Covers the
+  token and `Host` guards, that the demo database is not auto-provisioned
+  (which would mean CI dialed a public server), the auto-sync loop advancing
+  with no CLI involvement, a write through the GUI read back via the CLI,
+  the `ZkvError`→HTTP contract, and a GUI sync waiting out a CLI that holds
+  the lock. Needs a `zkv` built with `--features gui`; skips otherwise.
+- `tests/regtest_migration.rs`: a database laid down by a pre-engine binary
+  (`$ZKV_OLD_BIN`), adopted in place, with every read asserted identical.
 
-Together these cover the paths with no offline tests at all (`sync.rs`,
-`write.rs`, `send.rs`, the command modules) plus the on-chain halves of the
-protocol invariants the unit tests can only simulate.
+`src/lib.rs` also carries the harness's own unit tests, which need no chain
+and run under `--lib`: the datadir-lock probe against a real `flock`, and
+the token scrape including its refusal of an unsubstituted placeholder.
+
+Together these cover the paths with no offline tests at all (the command
+modules) plus the on-chain halves of the protocol invariants the unit tests
+can only simulate.
+
+**Adding a test:** prefer a new phase on `regtest_kv.rs` when the work needs
+a funded, INITed database - that stack is already up, so the marginal cost
+is the mining your writes need rather than another three-minute funding
+dance. `FundedStack::up` is there for when a genuinely separate binary is
+warranted. Either way, a new binary **must** be added to the `tests` list in
+`.github/workflows/regtest.yml`: it enumerates `--test` targets explicitly,
+so one that is not listed silently never runs.
 
 ## Funding Orchard on regtest
 
@@ -80,13 +127,18 @@ compiles and links.
 ```sh
 # From the repo root: the harness drives the release binary (debug Orchard
 # proving is >20s per write).
-cargo build --release -p zkv --bin zkv --no-default-features --features cli,transparent-inputs
+# `gui` is needed by regtest_gui.rs (it drives `zkv gui-browser`); drop it and
+# that one test skips itself.
+cargo build --release -p zkv --bin zkv --no-default-features --features cli,gui,transparent-inputs
+# The batch-write phase runs this example as a subprocess.
+cargo build --release -p zkv --example batch_write --no-default-features --features cli,gui,transparent-inputs
 
 # Compile + link; skips the live run unless the binaries are provided:
 cargo test --locked --manifest-path regtest-harness/Cargo.toml -- --nocapture --test-threads=1
 
 # Full live run:
 ZKV_BIN=$PWD/target/release/zkv \
+ZKV_BATCH_BIN=$PWD/target/release/examples/batch_write \
 ZEBRAD_BIN=/path/to/zebrad LIGHTWALLETD_BIN=/path/to/lightwalletd \
 DEVTOOL_BIN=/path/to/zcash-devtool \
   cargo test --locked --manifest-path regtest-harness/Cargo.toml -- --nocapture --test-threads=1

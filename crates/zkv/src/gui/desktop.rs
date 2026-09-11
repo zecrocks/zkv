@@ -448,8 +448,9 @@ mod ipc {
     pub async fn set_settings(
         engine: E<'_>,
         sync_workers: usize,
+        fleet_watch: Option<bool>,
     ) -> Result<SettingsResp, CmdError> {
-        Ok(engine.set_settings(sync_workers))
+        Ok(engine.set_settings(sync_workers, fleet_watch))
     }
 
     #[tauri::command(rename_all = "snake_case")]
@@ -532,7 +533,18 @@ pub fn run(runtime: tokio::runtime::Runtime, conn: ConnectionArgs) -> anyhow::Re
             .build()?;
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .map_err(|e| anyhow::anyhow!("tauri error: {e}"))?;
+        .build(tauri::generate_context!())
+        .map_err(|e| anyhow::anyhow!("tauri error: {e}"))?
+        .run(|_app, event| {
+            // Stop the shared scan on the way out, so its datadir lock is
+            // released rather than left for the next zkv process to wait out.
+            // `ExitRequested` fires before the process goes, which is the only
+            // window there is: a `Drop` would not get to await the node's
+            // actors. Per-database nodes belong to the handles that opened them
+            // and go with those.
+            if matches!(event, tauri::RunEvent::ExitRequested { .. }) {
+                tauri::async_runtime::block_on(crate::engine::shutdown_all());
+            }
+        });
     Ok(())
 }

@@ -120,6 +120,9 @@ fn write_config_and_init() -> anyhow::Result<()> {
         network,
         DEMO_ZKV_ADDRESS,
         parsed.pool,
+        // The demo database is provisioned before any engine choice is made;
+        // it converts like any other watch database on its next open.
+        crate::config::WalletEngine::Unset,
     )?;
     // Create the (empty) wallet DBs so `Database::open` succeeds during the
     // gap before the account import lands (the detail view reads gracefully as
@@ -146,9 +149,7 @@ async fn import_account(conn: &ConnectionArgs) -> anyhow::Result<()> {
 
     // Birthday is carried by the demo address, so pin it verbatim (no buffer).
     // Refuses a stale/unreachable tip before importing the account.
-    let mut client = conn.connect(network).await?;
-    let birthday =
-        crate::internal::sync::pinned_birthday(&mut client, network, parsed.birthday).await?;
+    let birthday = crate::internal::sync::pinned_birthday(conn, network, parsed.birthday).await?;
 
     let mut db = data::open_wallet_db(&data_path, network)?;
     db.import_account_ufvk(

@@ -12,6 +12,7 @@ mod commands;
 // `zkv-faucet` binary (a separate crate) can reach it. Re-bind it at the
 // binary's crate root so existing `crate::config::*`, `crate::internal::*`
 // etc. references in `commands/*` continue to compile.
+use zkv::engine;
 use zkv::{config, data, db, demo, internal, remote, shallow, ui};
 
 /// `<pkg-version> (<git-sha>)`, e.g. `0.0.1 (eda2d7f)`. The SHA is captured at
@@ -108,6 +109,12 @@ enum Command {
 
     /// Force a sync (commands that need fresh chain state auto-sync by default).
     Sync(commands::sync::Command),
+
+    /// Adopt a database into the wallet engine, or report whether it has been.
+    Migrate(commands::migrate::Command),
+
+    /// Report and manage the shared scan that watch-only databases share.
+    Fleet(commands::fleet::Command),
 
     /// Show the current balance (zatoshi to stdout, formatted to stderr).
     Balance(commands::balance::Command),
@@ -210,6 +217,8 @@ fn main() -> Result<(), anyhow::Error> {
             Command::Admin(c) => c.run(db).await,
             Command::Shallow(c) => c.run(db, verbose).await,
             Command::Sync(c) => c.run(db).await,
+            Command::Migrate(c) => c.run(db),
+            Command::Fleet(c) => c.run(db).await,
             Command::Balance(c) => c.run(db).await,
             #[cfg(feature = "gui")]
             Command::Gui(c) => c.run(db).await,

@@ -56,6 +56,7 @@
 //! to delete.
 
 mod decrypt;
+pub(crate) mod fetch;
 mod source;
 #[cfg(test)]
 pub(crate) mod testutil;

@@ -12,7 +12,7 @@ use crate::{
             MAX_DB_VERSION,
         },
         state::{load_state, INIT_CONFIRMATIONS},
-        sync::run_sync_read,
+        sync::{read_sync_with_status, NEAR_TIP_TOLERANCE},
     },
     ui,
 };
@@ -42,7 +42,15 @@ impl Command {
             .map(|r| matches!(r.init, InitState::Initialized))
             .unwrap_or(false);
         if !self.offline && !cached_initialized && !crate::commands::blocksync_skip(&name)? {
-            run_sync_read(&name, &connection, false).await?;
+            let engine = crate::engine::EngineRef::open(&name, &connection)?;
+            read_sync_with_status(
+                &engine,
+                &name,
+                &connection,
+                cfg.network,
+                Some(NEAR_TIP_TOLERANCE),
+            )
+            .await?;
         }
 
         let (_, db_data_path) = get_db_paths(&name)?;

@@ -18,21 +18,46 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use rand::rngs::OsRng;
+// The OS RNG is fallible in `rand_core 0.10` (`SysRng: TryRng`) while `WalletDb`
+// wants an infallible `Rng`; `UnwrapErr` is the adapter the wallet stack itself
+// uses for that (it is the RNG in zecd's own `WriteDb` alias).
+use rand::rand_core::UnwrapErr;
+use rand::rngs::SysRng;
 use tracing::error;
 use zcash_client_sqlite::{
-    chain::{init::init_blockmeta_db, BlockMeta},
-    util::SystemClock,
-    wallet::init::init_wallet_db,
-    FsBlockDb, WalletDb,
+    chain::init::init_blockmeta_db, util::SystemClock, wallet::init::init_wallet_db, FsBlockDb,
+    WalletDb,
 };
 use zcash_protocol::consensus::Parameters;
 
 use crate::error;
 
-const BLOCKS_FOLDER: &str = "blocks";
-const DATA_DB: &str = "data.sqlite";
-const ZKV_STATE_DB: &str = "zkv_state.sqlite";
+/// The compact-block cache directory inside the engine directory.
+pub(crate) const BLOCKS_FOLDER: &str = "blocks";
+/// The wallet database's filename inside a database directory.
+pub(crate) const DATA_DB: &str = "data.sqlite";
+/// The per-coin and per-storage-engine subdirectories the wallet engine nests
+/// librustzcash's files under: `<db>/zec/lrz/`.
+///
+/// These mirror zecd's `Coin::data_dir` / `Coin::engine_dir`, which are frozen
+/// upstream and pinned by a test there. They are spelled out rather than read
+/// from zecd because this module sits below the engine seam and has to resolve
+/// paths on builds where the engine is absent (see `crate::engine`).
+pub(crate) const ENGINE_COIN_DIR: &str = "zec";
+pub(crate) const ENGINE_STORAGE_DIR: &str = "lrz";
+pub(crate) const ZKV_STATE_DB: &str = "zkv_state.sqlite";
+/// The advisory-lock file inside a database directory.
+///
+/// zkv no longer takes this lock itself: the wallet engine's node holds it for
+/// as long as it runs, and every zkv path that touches the wallet database
+/// mutably now goes through a node, so the node's lock is what serializes two
+/// zkv processes on one database. The name is kept here, rather than left
+/// implicit inside zecd, because `crate::engine::config` has a test asserting
+/// the two agree: if upstream ever renamed it, two zkv processes would stop
+/// excluding each other with nothing to notice. So it is read only by that
+/// test, which is what the allow is for.
+#[allow(dead_code)]
+pub(crate) const LOCK_FILE: &str = ".lock";
 const CURRENT_MARKER: &str = "current";
 /// Marker file (at the data-dir root) recording that the user has gone through
 /// (or dismissed) the GUI's first-run onboarding. State lives in the data dir,
@@ -259,12 +284,121 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
-/// Returns (db_root, data.sqlite path) for a named database. Does NOT create
-/// the directory; callers that need a writable directory go via `ensure_db_dir`.
+/// Where this database's librustzcash-owned files live: `data.sqlite`,
+/// `blockmeta.sqlite` and `blocks/`.
+///
+/// Two layouts are live at once, so this resolves by looking rather than by
+/// assuming. Historically these sat at the database directory's root, and a
+/// database no wallet-engine node has ever opened still keeps them there. The
+/// engine nests them under `<db>/zec/lrz/`, moving them once, under its datadir
+/// lock, the first time a node starts on that database. A read has to work on
+/// either side of that move.
+///
+/// `keys.toml`, the age identity and `zkv_state.sqlite` are unaffected: they
+/// are zkv's, not librustzcash's, and stay at the database root. Use
+/// [`db_dir`] for those.
+///
+/// # Errors
+///
+/// When `data.sqlite` is present in **both** places. That is the one case the
+/// engine's own migration refuses rather than choosing between, and zkv
+/// silently preferring one would leave the two readers of a single directory
+/// disagreeing about which database is real.
+pub fn engine_dir(name: &str) -> anyhow::Result<PathBuf> {
+    engine_dir_in(&db_dir(name)?)
+}
+
+/// [`engine_dir`] against an explicit database directory, for callers that
+/// already hold one (and so need no name to resolve).
+pub(crate) fn engine_dir_in(root: &Path) -> anyhow::Result<PathBuf> {
+    let nested = root.join(ENGINE_COIN_DIR).join(ENGINE_STORAGE_DIR);
+    match (root.join(DATA_DB).is_file(), nested.join(DATA_DB).is_file()) {
+        (true, true) => anyhow::bail!(
+            "this database has a {DATA_DB} both at {} and at {}, and zkv will not choose \
+             between them. Keep the one you want (the nested path is the current layout), \
+             move the other out of the database directory, and try again",
+            root.join(DATA_DB).display(),
+            nested.join(DATA_DB).display(),
+        ),
+        (_, true) => Ok(nested),
+        // Nothing nested: either the files are still at the root, or this is a
+        // database that has not been created yet, and a fresh one is laid down
+        // at the root for the engine to migrate on its first start.
+        _ => Ok(root.to_path_buf()),
+    }
+}
+
+/// Returns (engine dir, `data.sqlite` path) for a named database. Does NOT
+/// create the directory; callers that need a writable directory go via
+/// `ensure_db_dir`.
+///
+/// The first element is where librustzcash's files live. For a database with a
+/// wallet engine of its own that is the database root until a node has run and
+/// `<name>/zec/lrz` afterwards (see [`engine_dir`]); for a member of the shared
+/// scan it is a shard directory holding several members' accounts, which is why
+/// every read that goes through here is also account-scoped.
+///
+/// Routing lives here so the callers do not each have to ask: a read path takes
+/// a database name and gets the files that name means.
 pub fn get_db_paths(name: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
-    let root = db_dir(name)?;
-    let data = root.join(DATA_DB);
-    Ok((root, data))
+    let dir = wallet_home_dir(name)?;
+    let data = dir.join(DATA_DB);
+    Ok((dir, data))
+}
+
+/// The directory holding a database's librustzcash files; see
+/// [`get_db_paths`], whose first element this is.
+fn wallet_home_dir(name: &str) -> anyhow::Result<PathBuf> {
+    // No `keys.toml` yet means a database being laid down, which is always its
+    // own: enrolling in the shared scan writes that file first.
+    let Ok(cfg) = crate::config::WalletConfig::read(name) else {
+        return engine_dir(name);
+    };
+    match crate::fleet::locate(&cfg, name)? {
+        crate::fleet::WalletHome::Own { engine_dir } => Ok(engine_dir),
+        crate::fleet::WalletHome::Fleet { engine_dir } => Ok(engine_dir),
+        // Typed, not a message: this is a transient state with a specific
+        // remedy (sync, which is what causes the import), and callers have to
+        // tell it apart from a genuine failure to find the files. See
+        // [`ImportPending`].
+        crate::fleet::WalletHome::Importing => Err(ImportPending(name.to_owned()).into()),
+    }
+}
+
+/// A member of the shared scan whose account the wallet engine has not imported
+/// into a shard yet, so it has no wallet files to open.
+///
+/// The ordinary state of a database between `zkv watch` writing its manifest
+/// and the fleet node's next pass, and the reason this is a type rather than a
+/// message: a caller that only wants to *measure* local progress treats it as
+/// "nothing to measure" and syncs, which is precisely what makes the import
+/// happen, while the facade turns it into [`ZkvError::Importing`] rather than a
+/// nondescript failure. Use [`is_import_pending`] to recognise it, since it
+/// reaches most callers wrapped in an `anyhow` context.
+///
+/// [`ZkvError::Importing`]: crate::db::ZkvError::Importing
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportPending(pub String);
+
+impl std::fmt::Display for ImportPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the {:?} database is joining the shared scan and has not been imported yet",
+            self.0
+        )
+    }
+}
+
+impl std::error::Error for ImportPending {}
+
+/// Whether this error is [`ImportPending`], anywhere in its chain.
+///
+/// The chain walk rather than a bare `downcast_ref` because the error passes
+/// through `?` and `.context(..)` on the way up, and a caller that misses it
+/// reports a routine first-run state as a hard failure.
+pub fn is_import_pending(err: &anyhow::Error) -> bool {
+    err.chain().any(|e| e.is::<ImportPending>())
 }
 
 /// Path to the per-database KV-state snapshot sidecar (`zkv_state.sqlite`).
@@ -273,10 +407,6 @@ pub fn get_db_paths(name: &str) -> anyhow::Result<(PathBuf, PathBuf)> {
 /// preparation for the write side.
 pub fn zkv_state_path(name: &str) -> anyhow::Result<PathBuf> {
     Ok(db_dir(name)?.join(ZKV_STATE_DB))
-}
-
-pub fn get_block_path(fsblockdb_root: &Path, meta: &BlockMeta) -> PathBuf {
-    meta.block_file_path(&fsblockdb_root.join(BLOCKS_FOLDER))
 }
 
 /// Read the "current" marker; returns None if unset. Re-validates the contents
@@ -366,14 +496,38 @@ pub fn list_dbs() -> anyhow::Result<Vec<String>> {
     Ok(out)
 }
 
+/// Delete a database outright: the whole `<data-dir>/<name>` directory.
+///
+/// This is what `zkv remove` and the GUI's forget action mean, and both warn
+/// the user that it destroys the seed. It must therefore be the database
+/// *root*, not [`get_db_paths`]'s first element: that one resolves to the
+/// engine directory (`<name>/zec/lrz` once a node has run), so using it would
+/// delete the wallet files and leave `keys.toml`, the age identity, the
+/// snapshot and `pending.toml` behind. On a migrated database the user would
+/// be told the seed was gone while it was still on disk.
 pub async fn erase_wallet_state(name: &str) {
-    let (root, _) = match get_db_paths(name) {
+    let root = match db_dir(name) {
         Ok(p) => p,
         Err(e) => {
             error!("Failed to resolve {name}: {e}");
             return;
         }
     };
+    // A member's manifest lives outside its directory, and it is what the
+    // shared scan reads. Left behind, the scan would keep a deleted database's
+    // viewing key on disk and keep scanning for it. Removed first, so a failure
+    // to delete the directory does not leave the key enrolled either.
+    //
+    // The shard keeps the account regardless: the wallet engine has no way to
+    // remove one, which is what `zkv fleet rebuild` is for. Deliberately quiet
+    // about it here, since this path is already destroying the database.
+    if let Ok(cfg) = crate::config::WalletConfig::read(name) {
+        if !cfg.engine.is_standalone() {
+            if let Err(e) = crate::fleet::remove_manifest(cfg.network, name) {
+                error!("Failed to remove the shared-scan manifest for {name}: {e:#}");
+            }
+        }
+    }
     if let Err(e) = tokio::fs::remove_dir_all(&root).await {
         error!("Failed to remove {:?}: {}", root, e);
     }
@@ -382,8 +536,19 @@ pub async fn erase_wallet_state(name: &str) {
 pub fn init_dbs<P: Parameters + 'static>(
     params: P,
     name: &str,
-) -> anyhow::Result<WalletDb<rusqlite::Connection, P, SystemClock, OsRng>> {
+) -> anyhow::Result<WalletDb<rusqlite::Connection, P, SystemClock, UnwrapErr<SysRng>>> {
     ensure_db_dir(name)?;
+    // A member of the shared scan has no wallet files of its own, and creating
+    // some here would give it a second, empty account that reads would then
+    // have to choose against.
+    if let Ok(cfg) = crate::config::WalletConfig::read(name) {
+        if cfg.engine.is_fleet_member() {
+            anyhow::bail!(
+                "{name:?} is served by the shared scan, so it has no wallet database of its \
+                 own to create. `zkv fleet leave {name}` gives it one."
+            );
+        }
+    }
     let (db_cache, db_data) = get_db_paths(name)?;
     let mut db_cache = FsBlockDb::for_path(db_cache).map_err(error::Error::from)?;
     let mut db_data = open_wallet_conn(db_data, params)?;
@@ -412,7 +577,7 @@ pub fn init_dbs<P: Parameters + 'static>(
 pub fn open_wallet_db<P: Parameters + 'static>(
     path: impl AsRef<Path>,
     params: P,
-) -> anyhow::Result<WalletDb<rusqlite::Connection, P, SystemClock, OsRng>> {
+) -> anyhow::Result<WalletDb<rusqlite::Connection, P, SystemClock, UnwrapErr<SysRng>>> {
     let path = path.as_ref();
     let mut db_data = open_wallet_conn(path, params)?;
     init_wallet_db(&mut db_data, None)?;
@@ -447,11 +612,16 @@ pub(crate) fn configure_sqlite(conn: &rusqlite::Connection) -> rusqlite::Result<
 fn open_wallet_conn<P: Parameters + 'static>(
     path: impl AsRef<Path>,
     params: P,
-) -> anyhow::Result<WalletDb<rusqlite::Connection, P, SystemClock, OsRng>> {
+) -> anyhow::Result<WalletDb<rusqlite::Connection, P, SystemClock, UnwrapErr<SysRng>>> {
     let conn = rusqlite::Connection::open(path)?;
     configure_sqlite(&conn)?;
     rusqlite::vtab::array::load_module(&conn)?;
-    Ok(WalletDb::from_connection(conn, params, SystemClock, OsRng))
+    Ok(WalletDb::from_connection(
+        conn,
+        params,
+        SystemClock,
+        UnwrapErr(SysRng),
+    ))
 }
 
 #[cfg(test)]
@@ -661,5 +831,75 @@ mod tests {
         assert!(default_data_dir_from(false, false, None, None, Some(OsString::new())).is_err());
         // macOS with no $HOME errors too.
         assert!(default_data_dir_from(false, true, None, None, None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod engine_layout_tests {
+    use super::*;
+
+    /// Lay down a database directory holding `data.sqlite` at the root, nested
+    /// under `zec/lrz`, or both.
+    fn fixture(root: bool, nested: bool) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("temp dir");
+        if root {
+            std::fs::write(dir.path().join(DATA_DB), b"").unwrap();
+        }
+        if nested {
+            let deep = dir.path().join(ENGINE_COIN_DIR).join(ENGINE_STORAGE_DIR);
+            std::fs::create_dir_all(&deep).unwrap();
+            std::fs::write(deep.join(DATA_DB), b"").unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn a_database_no_node_has_opened_keeps_its_files_at_the_root() {
+        let dir = fixture(true, false);
+        assert_eq!(engine_dir_in(dir.path()).unwrap(), dir.path());
+    }
+
+    #[test]
+    fn a_migrated_database_resolves_to_the_nested_directory() {
+        let dir = fixture(false, true);
+        assert_eq!(
+            engine_dir_in(dir.path()).unwrap(),
+            dir.path().join(ENGINE_COIN_DIR).join(ENGINE_STORAGE_DIR),
+        );
+    }
+
+    #[test]
+    fn a_database_that_does_not_exist_yet_resolves_to_the_root() {
+        // Nothing to find either way: a fresh database is laid down at the
+        // root, and the engine migrates it on its first node start.
+        let dir = fixture(false, false);
+        assert_eq!(engine_dir_in(dir.path()).unwrap(), dir.path());
+    }
+
+    #[test]
+    fn a_wallet_database_in_both_places_is_refused_rather_than_guessed() {
+        // The engine's own migration refuses this rather than choosing, so zkv
+        // has to as well: picking one would leave the two readers of a single
+        // directory disagreeing about which database is real.
+        let dir = fixture(true, true);
+        let err = engine_dir_in(dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("will not choose"),
+            "the error should say it refuses to choose: {err}",
+        );
+        // And it must name both paths, since resolving it means deleting one.
+        assert!(
+            err.contains(ENGINE_STORAGE_DIR),
+            "names the nested path: {err}"
+        );
+    }
+
+    /// A directory, not a file, at the nested path is not a migrated database.
+    #[test]
+    fn an_empty_nested_directory_does_not_count_as_migrated() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join(ENGINE_COIN_DIR).join(ENGINE_STORAGE_DIR)).unwrap();
+        std::fs::write(dir.path().join(DATA_DB), b"").unwrap();
+        assert_eq!(engine_dir_in(dir.path()).unwrap(), dir.path());
     }
 }

@@ -2,7 +2,6 @@
 
 pub mod account;
 pub mod funding;
-pub mod lock;
 pub mod pending;
 pub mod recover;
 pub mod send;

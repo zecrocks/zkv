@@ -118,11 +118,9 @@ fn last_known_balance(name: &str) -> Option<String> {
     let summary = db_data
         .get_wallet_summary(ConfirmationsPolicy::default())
         .ok()??;
-    let total_zat: u64 = summary
-        .account_balances()
-        .values()
+    let total_zat: u64 = crate::internal::account::account_balance(&summary, &db_data, &cfg, name)
         .map(|b| u64::from(b.total()))
-        .sum();
+        .unwrap_or(0);
     let network = cfg.network;
     Some(
         format_zec(total_zat as i64, network)

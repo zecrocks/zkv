@@ -97,7 +97,7 @@ use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::ShieldedPool;
 
 use crate::{
-    config::{Role, WalletConfig},
+    config::{Role, WalletConfig, WalletEngine},
     data::{db_dir, init_dbs, Network},
     internal::{
         account::account_keys,
@@ -108,7 +108,7 @@ use crate::{
             cached_version, load_audit, load_history_page, load_state_with_height, wallet_tip,
             HistoryOrder,
         },
-        sync::{run_sync_read, run_sync_read_cancellable, CancelFlag},
+        sync::{read_sync, CancelFlag, NEAR_TIP_TOLERANCE},
         write::{
             broadcast_init, manage_and_broadcast, prepare, prepare_init, prepare_management,
             write_and_broadcast, write_many_and_broadcast, BatchItem, PreparedWrite, WriteError,
@@ -235,7 +235,7 @@ pub enum ZkvError {
     Initializing { done: u32, required: u32 },
 
     /// The local wallet hasn't scanned up to within
-    /// [`NEAR_TIP_TOLERANCE`](crate::internal::sync::NEAR_TIP_TOLERANCE) of the
+    /// [`NEAR_TIP_TOLERANCE`] of the
     /// current chain tip, so the "uninitialized" verdict isn't yet
     /// authoritative: a valid INIT could still be sitting in not-yet-scanned
     /// blocks. Re-broadcasting INIT is refused until a sync confirms the
@@ -255,6 +255,24 @@ pub enum ZkvError {
     /// Operation requires an admin database (one with a spending key).
     #[error("operation requires an admin database; this is watch-only")]
     WatchOnly,
+
+    /// The database is enrolled in the shared scan but the wallet engine has
+    /// not imported its account into a shard yet, so there is nothing local to
+    /// read. An ordinary transient state on a newly-watched database (the
+    /// engine onboards one member per sync pass), and deliberately distinct
+    /// from "this database has no wallet key imported", which describes a
+    /// database whose local data was lost and which needs repairing.
+    #[error(
+        "this database is joining the shared scan; its first sync pass has not imported it yet"
+    )]
+    Importing,
+
+    /// The shared scan refused this database's viewing key outright: a birthday
+    /// no tree state can serve, or a key already present in the shard. Unlike
+    /// [`ZkvError::Importing`] this never resolves on its own, which is why it
+    /// is a separate variant rather than a longer wait.
+    #[error("the shared scan cannot import this database: {0}")]
+    ImportFailed(String),
 
     /// This database's signing key lacks the on-chain authority for the
     /// requested operation: it isn't an owner (for a management op), or it
@@ -406,18 +424,40 @@ pub struct Database {
     name: String,
     cfg: WalletConfig,
     conn: ConnectionArgs,
+    /// How long to wait for a database another process holds. `None` skips
+    /// immediately, which is what a background loop wants.
+    busy_wait: Option<std::time::Duration>,
+    /// The wallet engine, built on first use rather than at `open`.
+    ///
+    /// Not at `open` for two reasons: opening a database is offline and
+    /// side-effect-free, while building an engine adopts it (which writes
+    /// `keys.toml`); and a handle that performs several writes should share
+    /// one node rather than paying a startup each time.
+    engine: tokio::sync::OnceCell<crate::engine::EngineRef>,
 }
+
+/// How long a one-shot command contributes to a converting database's shared
+/// scan before getting on with what it was asked to do. See
+/// [`Database::drive_pending_fleet`].
+const FLEET_NUDGE: std::time::Duration = std::time::Duration::from_secs(30);
 
 impl Database {
     /// Open an existing zkv database by name.
     ///
     /// Returns [`ZkvError::UnknownDatabase`] if no `keys.toml` exists.
     pub fn open(name: &str, conn: ConnectionArgs) -> Result<Self> {
-        let cfg = WalletConfig::read(name).map_err(|e| classify_open_error(e, name))?;
+        let mut cfg = WalletConfig::read(name).map_err(|e| classify_open_error(e, name))?;
+        // A watch-only database nobody has chosen for joins the shared scan
+        // here. Offline, idempotent, and it does not change what this handle
+        // reads: the database keeps its own files until its shard has caught
+        // up with them. See `crate::fleet`.
+        crate::fleet::enrol_if_unchosen(&mut cfg, name);
         Ok(Self {
             name: name.to_owned(),
             cfg,
             conn,
+            busy_wait: Some(crate::engine::DEFAULT_BUSY_WAIT),
+            engine: tokio::sync::OnceCell::new(),
         })
     }
 
@@ -521,7 +561,38 @@ impl Database {
     /// Create a new watch-only database for an existing `zkv1…` address. The
     /// network and birthday are both read from the address (its HRP and its
     /// metadata item, respectively).
+    ///
+    /// The database joins the data directory's **shared scan** unless that has
+    /// been turned off (see [`crate::fleet`] and `zkv fleet`): many watch-only
+    /// databases then share one node, one upstream connection and one pass over
+    /// the blocks, instead of running a node each. Use
+    /// [`Database::init_watch_standalone`] for a node of its own.
     pub async fn init_watch(name: &str, zkv_address: &str, conn: ConnectionArgs) -> Result<Self> {
+        let engine = if crate::fleet::fleet_is_default() {
+            WalletEngine::Fleet
+        } else {
+            WalletEngine::Own
+        };
+        Self::init_watch_with(name, zkv_address, conn, engine).await
+    }
+
+    /// [`Database::init_watch`] with a node of this database's own, whatever
+    /// the data directory's default is. This is `zkv watch --standalone`, and
+    /// the shape every watch database had before the shared scan existed.
+    pub async fn init_watch_standalone(
+        name: &str,
+        zkv_address: &str,
+        conn: ConnectionArgs,
+    ) -> Result<Self> {
+        Self::init_watch_with(name, zkv_address, conn, WalletEngine::Own).await
+    }
+
+    async fn init_watch_with(
+        name: &str,
+        zkv_address: &str,
+        conn: ConnectionArgs,
+        engine: WalletEngine,
+    ) -> Result<Self> {
         use zcash_client_backend::data_api::{AccountPurpose, WalletWrite};
 
         let parsed = parse_zkv_addr(zkv_address).map_err(ZkvError::Other)?;
@@ -546,23 +617,40 @@ impl Database {
         // Same fresh-tip guard as the admin-create path: don't build a watch db
         // against a stale/unreachable server's view of the chain. The birthday
         // is carried by the address, so it is pinned verbatim (no buffer).
-        let mut client = conn.connect(network).await.map_err(ZkvError::Other)?;
         let birthday =
-            crate::internal::sync::pinned_birthday(&mut client, network, parsed.birthday).await?;
+            crate::internal::sync::pinned_birthday(&conn, network, parsed.birthday).await?;
 
-        WalletConfig::init_watch(name, birthday.height(), network, zkv_address, parsed.pool)
-            .map_err(ZkvError::Other)?;
-        let mut db_data = init_dbs(network, name).map_err(ZkvError::Other)?;
-        db_data
-            .import_account_ufvk(
-                name,
-                &parsed.ufvk,
-                &birthday,
-                AccountPurpose::ViewOnly,
-                None,
-            )
-            .map_err(|e| ZkvError::Other(anyhow::anyhow!("{e:?}")))?;
-        drop(db_data);
+        WalletConfig::init_watch(
+            name,
+            birthday.height(),
+            network,
+            zkv_address,
+            parsed.pool,
+            engine,
+        )
+        .map_err(ZkvError::Other)?;
+
+        if engine.is_fleet_member() {
+            // A member has no wallet files of its own: the shard holds its
+            // account, and the fleet node imports it from the manifest on a
+            // later sync pass. Writing the manifest is therefore the whole of
+            // creation, and it is offline.
+            let cfg = WalletConfig::read(name).map_err(ZkvError::Other)?;
+            let manifest = crate::fleet::manifest_for(&cfg).map_err(ZkvError::Other)?;
+            crate::fleet::write_manifest(network, name, &manifest).map_err(ZkvError::Other)?;
+        } else {
+            let mut db_data = init_dbs(network, name).map_err(ZkvError::Other)?;
+            db_data
+                .import_account_ufvk(
+                    name,
+                    &parsed.ufvk,
+                    &birthday,
+                    AccountPurpose::ViewOnly,
+                    None,
+                )
+                .map_err(|e| ZkvError::Other(anyhow::anyhow!("{e:?}")))?;
+            drop(db_data);
+        }
 
         crate::demo::promote_current(name).map_err(ZkvError::Other)?;
         Self::open(name, conn)
@@ -735,7 +823,7 @@ impl Database {
     }
 
     /// Whether the local wallet has scanned up to the current chain tip
-    /// (wallet height is within [`NEAR_TIP_TOLERANCE`](crate::internal::sync::NEAR_TIP_TOLERANCE)
+    /// (wallet height is within [`NEAR_TIP_TOLERANCE`]
     /// of the lightwalletd tip and there are no outstanding scan ranges). One
     /// network round-trip for the tip. The tolerance matches the read sync and
     /// the GUI's "synced" indicator, so a database that reads as synced is also
@@ -770,12 +858,8 @@ impl Database {
     /// rather than performed. This reflects only already-promoted `VERSION`
     /// memos; a recent one in the live tail is seen on the next read.
     pub async fn sync(&self) -> Result<u32> {
-        if let Some(tip) = self.skip_sync_if_blocked()? {
-            return Ok(tip);
-        }
-        run_sync_read(&self.name, &self.conn, /* fetch_mempool_too = */ false)
+        self.sync_through_engine(Some(NEAR_TIP_TOLERANCE), None)
             .await
-            .map_err(ZkvError::Other)
     }
 
     /// Like [`Database::sync`], but cooperatively cancellable: when `cancel`
@@ -785,33 +869,90 @@ impl Database {
     /// pausing halts scanning promptly instead of only at the next cycle;
     /// passing `None` is identical to [`Database::sync`].
     pub async fn sync_cancellable(&self, cancel: Option<CancelFlag>) -> Result<u32> {
-        if let Some(tip) = self.skip_sync_if_blocked()? {
-            return Ok(tip);
-        }
-        run_sync_read_cancellable(
-            &self.name, &self.conn, /* fetch_mempool_too = */ false, cancel,
-        )
-        .await
-        .map_err(ZkvError::Other)
+        self.sync_through_engine(Some(NEAR_TIP_TOLERANCE), cancel)
+            .await
     }
 
-    /// Sync plus pull the current lightwalletd mempool into the local
-    /// wallet. Use this when you want a [`Confirmations::Mempool`] read
-    /// to see arbitrary off-wire mempool writes. Honors `blocksync` and the
-    /// read tip-tolerance exactly as [`Database::sync`] does; the fresh
-    /// mempool is still pulled on the tolerance-skip path.
+    /// Sync, never skipping, so a [`Confirmations::Mempool`] read is as fresh
+    /// as this handle can make it.
+    ///
+    /// **Known gap.** This no longer *pulls* the mempool. Before the wallet
+    /// engine, the read drained `GetMempoolStream` and decrypted every
+    /// transaction before returning; the node ingests the mempool through a
+    /// subscription its actor services only after catch-up, and the
+    /// `waitforsync` barrier underneath covers the scan and the enhancement
+    /// backlog but not that ingestion. There is no upstream signal to wait on,
+    /// so this passes `None` tolerance (never skip, keep the node up and
+    /// working) and returns.
+    ///
+    /// This database's *own* unconfirmed writes are unaffected: they come from
+    /// `pending.toml`, which [`Database::read`] merges regardless. What can be
+    /// missed is another writer's unconfirmed write, on a short-lived process
+    /// that exits before the node's subscription has ingested it. A long-lived
+    /// handle keeps a node alive and does see them.
     pub async fn sync_with_mempool(&self) -> Result<u32> {
         if let Some(tip) = self.skip_sync_if_blocked()? {
             return Ok(tip);
         }
-        run_sync_read(&self.name, &self.conn, /* fetch_mempool_too = */ true)
-            .await
-            .map_err(ZkvError::Other)
+        // `None` tolerance: never skip. The node keeps a live mempool
+        // subscription while it is caught up, so bringing it up is what makes
+        // unconfirmed writes visible at all, and the scan itself costs nothing
+        // when the wallet is already at the tip.
+        self.sync_through_engine(None, None).await
     }
 
     /// If the snapshot cache records a `blocksync` directive this build can't
     /// satisfy, return `Some(current_tip)` (skip the scan); otherwise `None`
     /// (caller should sync normally).
+    /// Bring the wallet up to date through the engine, unless it is already
+    /// close enough that this read cannot change.
+    ///
+    /// The skip decision is [`read_sync_skippable`]'s, not this method's: it
+    /// costs one local height read and one `GetLatestBlock` over zkv's own
+    /// transport, and needs no node. That ordering is the point. Most reads on
+    /// a warm wallet skip, and starting a node to discover that would cost far
+    /// more than the answer.
+    async fn sync_through_engine(
+        &self,
+        tolerance: Option<u32>,
+        cancel: Option<CancelFlag>,
+    ) -> Result<u32> {
+        if let Some(tip) = self.skip_sync_if_blocked()? {
+            return Ok(tip);
+        }
+        let engine = self.engine().await?;
+        let out = read_sync(
+            engine,
+            &self.name,
+            &self.conn,
+            self.cfg.network,
+            tolerance,
+            cancel,
+        )
+        .await;
+        // A database converting to the shared scan syncs twice: its own files,
+        // which are what this read will use, and then the shard, which is what
+        // it will use once the shard catches up. See `drive_pending_fleet`.
+        if let Ok(height) = &out {
+            self.drive_pending_fleet(*height).await;
+        }
+        match out {
+            Ok(height) => Ok(height),
+            // A cancellation is the caller getting what it asked for, not a
+            // failure, and the documented contract is the height reached. The
+            // engine keeps returning `Cancelled` because *it* cannot tell a
+            // stop from a success; the distinction is only meaningful here,
+            // where the caller owns the flag it flipped.
+            //
+            // Without this the GUI counted a deliberate pause as a sync-error
+            // strike and could show a failure banner for a button the user
+            // pressed. A partial sync is safe and resumes next call, so the
+            // wallet's own scanned height is the honest answer.
+            Err(e) if is_cancelled(&e) => Ok(self.synced_height()?.unwrap_or(0)),
+            Err(e) => Err(classify_sync_error(e)),
+        }
+    }
+
     fn skip_sync_if_blocked(&self) -> Result<Option<u32>> {
         let cached = cached_version(&self.name).map_err(ZkvError::Other)?;
         if cached.blocks_sync() {
@@ -976,9 +1117,11 @@ impl Database {
     /// watch-only databases.
     pub async fn init(&self) -> Result<String> {
         self.require_admin()?;
-        broadcast_init(&self.name, &self.conn)
+        let engine = self.engine().await?;
+        let out = broadcast_init(&self.name, engine)
             .await
-            .map_err(map_write_error)
+            .map_err(map_write_error);
+        out
     }
 
     /// Sync, sign, build, and broadcast a SET. Returns the broadcast
@@ -1119,9 +1262,16 @@ impl Database {
         self.require_admin()?;
         let amount = crate::internal::send::parse_zec(amount)
             .map_err(|m| ZkvError::Other(anyhow::anyhow!(m)))?;
-        crate::internal::send::send_funds(&self.name, &self.conn, recipient, amount, memo, no_sync)
-            .await
-            .map_err(map_write_error)
+        crate::internal::send::send_funds(
+            &self.name,
+            self.engine().await?,
+            recipient,
+            amount,
+            memo,
+            no_sync,
+        )
+        .await
+        .map_err(map_write_error)
     }
 
     /// Validate a recipient address for this database's network without
@@ -1294,16 +1444,11 @@ impl Database {
         scope: Option<String>,
     ) -> Result<String> {
         self.require_admin()?;
-        manage_and_broadcast(
-            &self.name,
-            &self.conn,
-            no_sync,
-            op,
-            target,
-            scope.as_deref(),
-        )
-        .await
-        .map_err(map_write_error)
+        let engine = self.engine().await?;
+        let out = manage_and_broadcast(&self.name, engine, no_sync, op, target, scope.as_deref())
+            .await
+            .map_err(map_write_error);
+        out
     }
 
     async fn do_write(
@@ -1314,9 +1459,11 @@ impl Database {
         value: Option<&str>,
     ) -> Result<String> {
         self.require_admin()?;
-        write_and_broadcast(&self.name, &self.conn, no_sync, op, key, value)
+        let engine = self.engine().await?;
+        let out = write_and_broadcast(&self.name, engine, no_sync, op, key, value)
             .await
-            .map_err(map_write_error)
+            .map_err(map_write_error);
+        out
     }
 
     async fn do_write_many(&self, no_sync: bool, ops: &[WriteOp]) -> Result<String> {
@@ -1343,9 +1490,122 @@ impl Database {
                 },
             })
             .collect();
-        write_many_and_broadcast(&self.name, &self.conn, no_sync, &items)
+        let engine = self.engine().await?;
+        let out = write_many_and_broadcast(&self.name, engine, no_sync, &items)
             .await
-            .map_err(map_write_error)
+            .map_err(map_write_error);
+        out
+    }
+
+    /// Sync, then broadcast a transaction request prepared and signed
+    /// elsewhere, returning the txid.
+    ///
+    /// For a relay rather than a writer: the faucet broadcasts INIT memos its
+    /// users signed, paying the Zcash fee on their behalf, so the signature
+    /// and the funds come from different wallets. Everything above this is the
+    /// caller's; this handle only supplies the money and the transport.
+    ///
+    /// Syncs first for the same reason every write does. The node holds its
+    /// datadir lock across both, so the spend is built against the tree the
+    /// sync just produced and no other scan or spend can interleave. Skipping
+    /// that is what produced consensus rejections when a spend re-selected a
+    /// note the chain already considered spent.
+    ///
+    /// Nothing is recorded in `pending.toml`: the memo belongs to the
+    /// requester's database, not this one.
+    pub async fn broadcast_request(&self, request: zip321::TransactionRequest) -> Result<String> {
+        self.require_admin()?;
+        let engine = self.engine().await?;
+        engine.sync_to_tip(None).await.map_err(map_engine_error)?;
+        engine.ship(request).await.map_err(|e| {
+            map_write_error(crate::internal::write::insufficient_from_engine(
+                e, &self.name,
+            ))
+        })
+    }
+
+    /// Drive the shared scan for a database that is converting to it, and flip
+    /// over when it has caught up.
+    ///
+    /// While converting, a database reads from its own files, so nothing here
+    /// affects the sync that just happened. What it does is make the shard
+    /// progress even for a user who only ever runs one-shot CLI commands: the
+    /// GUI keeps a fleet node running continuously, but `zkv get` would
+    /// otherwise never start one, and the conversion would never finish.
+    ///
+    /// Bounded, because this is somebody's `zkv get`. A shard rescanning from a
+    /// year-old birthday takes hours; waiting for it here would turn every read
+    /// into that. So it contributes a slice and returns, and the next command
+    /// contributes another.
+    ///
+    /// Best effort throughout: a fleet node that will not start, or a shard
+    /// that is behind, leaves the database exactly where it was, still reading
+    /// correctly from its own files.
+    async fn drive_pending_fleet(&self, own_scanned: u32) {
+        use crate::config::WalletEngine;
+
+        if self.cfg.engine != WalletEngine::FleetPending {
+            return;
+        }
+        let Ok(fleet) = crate::engine::shared(self.cfg.network, &self.conn) else {
+            return;
+        };
+        // The member may not be served yet: zkv wrote the manifest, and a node
+        // that was already running has not re-read the directory. Asking it to
+        // load one it already has is harmless.
+        let _ = fleet.load_member(&self.name).await;
+
+        let shard =
+            match tokio::time::timeout(FLEET_NUDGE, fleet.sync_wallet(&self.name, None)).await {
+                Ok(Ok(out)) => out.scanned_height,
+                // Either the slice expired or the shard is not ready. Both mean
+                // "not this time", and the next command tries again.
+                _ => return,
+            };
+
+        let mut cfg = match WalletConfig::read(&self.name) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+        match crate::fleet::flip_if_caught_up(&mut cfg, &self.name, own_scanned, shard) {
+            // The flip rewrites `keys.toml`; this handle keeps reading from the
+            // old files, which are gone, only if it is reused. It is not: the
+            // conversion completes for the *next* `Database::open`, which is
+            // the boundary where the engine is chosen.
+            Ok(true) => {}
+            Ok(false) => {}
+            Err(e) => tracing::warn!("completing the shared-scan conversion: {e:#}"),
+        }
+    }
+
+    /// Skip a database another process is using instead of waiting for it.
+    /// Skip a database another process is using instead of waiting for it.
+    ///
+    /// For a background refresh loop: stalling a worker thread on a database
+    /// some other zkv process holds is worse than coming back next cycle, and
+    /// the caller reports it as in-use either way.
+    pub fn skip_if_busy(mut self) -> Self {
+        self.busy_wait = None;
+        self
+    }
+
+    /// This database's wallet engine, started on first use.
+    ///
+    /// The engine itself is inert until something needs the chain, so this is
+    /// cheap; the node behind it starts on the first operation that syncs or
+    /// sends, and lives until the handle is dropped. That is what lets a
+    /// caller doing several writes pay one node startup rather than one each.
+    async fn engine(&self) -> Result<&crate::engine::EngineRef> {
+        self.engine
+            .get_or_try_init(|| async {
+                // Re-read rather than reuse `self.cfg`: enrolling in the shared
+                // scan rewrites `keys.toml`, and this is the first thing that
+                // runs afterwards.
+                let cfg = WalletConfig::read(&self.name).map_err(ZkvError::Other)?;
+                crate::engine::engine_for(&self.name, cfg, &self.conn, self.busy_wait)
+                    .map_err(map_engine_error)
+            })
+            .await
     }
 
     fn require_admin(&self) -> Result<()> {
@@ -1383,12 +1643,29 @@ pub fn install_default_subscriber() {
 }
 
 fn classify_open_error(e: anyhow::Error, db_name: &str) -> ZkvError {
+    if crate::data::is_import_pending(&e) {
+        return ZkvError::Importing;
+    }
     let msg = format!("{e:#}");
     if msg.contains("no database named") || msg.contains("no keys.toml") {
         ZkvError::UnknownDatabase(db_name.to_owned())
     } else {
         ZkvError::Other(e)
     }
+}
+
+/// Map a sync failure onto the facade's vocabulary.
+///
+/// Only one case needs naming: a member of the shared scan whose account is not
+/// imported yet is [`ZkvError::Importing`], a state that resolves itself, not
+/// the anonymous `Other` a caller can only report as a failure. Everything else
+/// stays whole, since the engine's own messages name the database and the
+/// remedy.
+fn classify_sync_error(e: anyhow::Error) -> ZkvError {
+    if crate::data::is_import_pending(&e) {
+        return ZkvError::Importing;
+    }
+    ZkvError::Other(e)
 }
 
 /// Map a write-path failure to a structured [`ZkvError`].
@@ -1399,6 +1676,40 @@ fn classify_open_error(e: anyhow::Error, db_name: &str) -> ZkvError {
 /// other error falls through to [`ZkvError::Other`]). The `ClientUpgradeRequired`
 /// operation is always [`GatedOp::Write`]; the write path is the only place
 /// that blocks on the version gate.
+/// Map an engine failure onto the facade's vocabulary.
+///
+/// Only the cases the facade already has words for are translated; everything
+/// else stays whole as `Other`, since the engine's messages already name the
+/// database and the remedy.
+/// Whether a sync error is the cooperative stop the caller asked for.
+///
+/// `read_sync` hands back `anyhow::Error`, so the typed variant has to be
+/// recovered by downcast rather than matched.
+fn is_cancelled(e: &anyhow::Error) -> bool {
+    matches!(
+        e.downcast_ref::<crate::engine::EngineError>(),
+        Some(crate::engine::EngineError::Cancelled)
+    )
+}
+
+pub(crate) fn map_engine_error(e: crate::engine::EngineError) -> ZkvError {
+    use crate::engine::EngineError;
+    match e {
+        // Another process holds the database. That is the same condition the
+        // legacy path surfaced by blocking on `DbLock`, so it keeps the same
+        // shape rather than becoming a new variant.
+        EngineError::Busy(db) => ZkvError::Other(anyhow::anyhow!(
+            "database {db:?} is in use by another process"
+        )),
+        // The shared scan's two import states. Both used to be inferred from
+        // the absence of an account, which could not tell them apart; the node
+        // publishes them now.
+        EngineError::NotImported(_) => ZkvError::Importing,
+        EngineError::ImportFailed { reason, .. } => ZkvError::ImportFailed(reason),
+        other => ZkvError::Other(other.into()),
+    }
+}
+
 fn map_write_error(e: anyhow::Error) -> ZkvError {
     let Some(we) = e.downcast_ref::<WriteError>() else {
         return ZkvError::Other(e);
@@ -1594,10 +1905,9 @@ async fn create_admin(
 
     // Refuse to pin a birthday against a stale/unreachable tip. Honor an
     // explicit `birthday` verbatim; otherwise default to tip − safety buffer.
-    let mut client = conn.connect(params).await.map_err(ZkvError::Other)?;
     let birthday_acct = match birthday {
-        Some(height) => crate::internal::sync::pinned_birthday(&mut client, params, height).await?,
-        None => crate::internal::sync::near_tip_birthday(&mut client, params).await?,
+        Some(height) => crate::internal::sync::pinned_birthday(&conn, params, height).await?,
+        None => crate::internal::sync::near_tip_birthday(&conn, params).await?,
     };
 
     WalletConfig::init_admin(name, mnemonic, birthday_acct.height(), params, pool)
@@ -1830,6 +2140,38 @@ mod tests {
         }
     }
 
+    /// A cancellation must be recognisable through the `anyhow` wrapper, so
+    /// the facade can honour its documented Ok-on-cancel contract.
+    ///
+    /// The predicate is what keeps a deliberate GUI pause from counting as a
+    /// sync-error strike, and it has to survive the `anyhow` boxing that
+    /// `read_sync` does. A plain error, and any other engine error, must still
+    /// read as a real failure: swallowing those would hide a broken sync
+    /// behind a "you cancelled" that nobody asked for.
+    #[test]
+    fn only_a_cancellation_reads_as_cancelled() {
+        let cancelled: anyhow::Error = crate::engine::EngineError::Cancelled.into();
+        assert!(is_cancelled(&cancelled));
+
+        // Wrapped in more context, as a caller adding its own would leave it.
+        let with_context = cancelled.context("while syncing");
+        assert!(
+            is_cancelled(&with_context),
+            "a cancellation must stay recognisable under added context",
+        );
+
+        for other in [
+            anyhow::Error::from(crate::engine::EngineError::Busy("db".to_owned())),
+            anyhow::Error::from(crate::engine::EngineError::Unsupported("socks".to_owned())),
+            anyhow::anyhow!("transport error"),
+        ] {
+            assert!(
+                !is_cancelled(&other),
+                "a real failure must not be mistaken for a cancellation: {other:#}",
+            );
+        }
+    }
+
     #[test]
     fn map_insufficient_funds_preserves_amounts() {
         let e = anyhow::Error::new(WriteError::InsufficientFunds {
@@ -1898,6 +2240,33 @@ mod tests {
     fn map_unrecognized_error_falls_through_to_other() {
         let e = anyhow::anyhow!("disk on fire");
         assert!(matches!(map_write_error(e), ZkvError::Other(_)));
+    }
+
+    #[test]
+    fn a_pending_import_is_importing_not_a_failure() {
+        use anyhow::Context as _;
+
+        let pending = || anyhow::Error::new(crate::data::ImportPending("reader".to_owned()));
+        assert!(matches!(
+            classify_sync_error(pending()),
+            ZkvError::Importing
+        ));
+        assert!(matches!(
+            classify_open_error(pending(), "reader"),
+            ZkvError::Importing
+        ));
+        // It reaches the facade through `?` and `.context(..)`, so recognising
+        // it cannot depend on its being the outermost error. This is the case
+        // that made `zkv watch` fail its own first sync.
+        let wrapped = Err::<(), _>(pending())
+            .context("syncing \"reader\"")
+            .context("read_sync")
+            .unwrap_err();
+        assert!(matches!(classify_sync_error(wrapped), ZkvError::Importing));
+        assert!(matches!(
+            classify_sync_error(anyhow::anyhow!("disk on fire")),
+            ZkvError::Other(_)
+        ));
     }
 
     #[test]

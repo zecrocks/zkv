@@ -6,7 +6,7 @@ use crate::{
     commands::connection_args::ConnectionCliArgs,
     config::{Role, WalletConfig},
     data::{get_db_paths, open_wallet_db, resolve_db},
-    internal::sync::run_sync_read,
+    internal::sync::{read_sync_with_status, NEAR_TIP_TOLERANCE},
     ui::{self, format_zec},
 };
 
@@ -30,7 +30,15 @@ impl Command {
 
         let connection = self.connection.into_inner();
         if !self.offline && !crate::commands::blocksync_skip(&name)? {
-            run_sync_read(&name, &connection, false).await?;
+            let engine = crate::engine::EngineRef::open(&name, &connection)?;
+            read_sync_with_status(
+                &engine,
+                &name,
+                &connection,
+                cfg.network,
+                Some(NEAR_TIP_TOLERANCE),
+            )
+            .await?;
         }
 
         let (_, db_data_path) = get_db_paths(&name)?;
@@ -39,11 +47,14 @@ impl Command {
             .get_wallet_summary(ConfirmationsPolicy::default())?
             .ok_or_else(|| anyhow!("no wallet summary yet, try running `zkv sync`"))?;
 
-        let total_zat: u64 = summary
-            .account_balances()
-            .values()
-            .map(|b| u64::from(b.total()))
-            .sum();
+        // This database's own account, not every account in the file. For an
+        // own-node database those are the same number; for a member of the
+        // shared scan the file is its shard, so summing it would print its
+        // shard-mates' money under this name.
+        let total_zat: u64 =
+            crate::internal::account::account_balance(&summary, &db_data, &cfg, &name)
+                .map(|b| u64::from(b.total()))
+                .unwrap_or(0);
 
         let network = cfg.network;
         println!("{}", format_zec(total_zat as i64, network).trim_start());

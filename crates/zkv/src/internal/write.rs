@@ -5,9 +5,7 @@ use std::str::FromStr;
 
 use anyhow::anyhow;
 use zcash_address::ZcashAddress;
-use zcash_client_backend::data_api::{
-    error::Error as WalletError, wallet::ConfirmationsPolicy, WalletRead,
-};
+use zcash_client_backend::data_api::{wallet::ConfirmationsPolicy, WalletRead};
 use zcash_protocol::{
     memo::{Memo, MemoBytes},
     value::Zatoshis,
@@ -17,7 +15,7 @@ use zip321::{Payment, TransactionRequest};
 use crate::{
     config::{Role, WalletConfig},
     data::{get_db_paths, open_wallet_db},
-    error,
+    engine::{Engine, EngineError},
     internal::{
         account::{account_keys, signing_key},
         pending::{self, PendingEntry},
@@ -26,11 +24,8 @@ use crate::{
             signed_init_payload, signed_payload, signing_domain, InitState, Op, PendingOp,
             ReplayResult, VersionState,
         },
-        send::pay,
         state::{load_state, INIT_CONFIRMATIONS},
-        sync::run_sync,
     },
-    remote::ConnectionArgs,
     ui::format_zec,
 };
 
@@ -629,17 +624,23 @@ pub fn prepare_init(db_name: &str) -> anyhow::Result<PreparedWrite> {
 
 /// Broadcast a freshly-built INIT. Caller has already established (a) the DB
 /// is in Uninitialized state, and (b) the wallet has spendable funds.
-pub async fn broadcast_init(db_name: &str, connection: &ConnectionArgs) -> anyhow::Result<String> {
-    // Exclude any other zkv process touching this database while we build and
-    // broadcast the spend (reentrant with the sync path's lock).
-    let _lock = crate::internal::lock::DbLock::acquire(db_name)?;
+pub async fn broadcast_init(db_name: &str, engine: &Engine) -> anyhow::Result<String> {
+    // No `DbLock` here. The node holds zecd's datadir lock, which is the same
+    // `.lock` file, and taking ours as well would deadlock against it: `flock`
+    // is not reentrant across separate handles, and zkv's own reentrancy
+    // registry knows nothing about the node's handle. The node's lock covers
+    // this whole span, and its busy-wait preserves the "wait your turn"
+    // behaviour every zkv command has always had.
     let prepared = prepare_init(db_name)?;
     tracing::debug!(
         zkv_addr = %prepared.zkv_addr,
         recipient_ua = %prepared.recipient_ua,
         "preparing INIT",
     );
-    let txid = pay(db_name, connection, prepared.request).await?;
+    let txid = engine
+        .ship(prepared.request)
+        .await
+        .map_err(|e| insufficient_from_engine(e, db_name))?;
     // INIT's "key" is the zkv address (matching the confirmed kv_history row),
     // so the History view's per-key filter excludes it but the genesis entry
     // still renders.
@@ -662,17 +663,22 @@ pub async fn broadcast_init(db_name: &str, connection: &ConnectionArgs) -> anyho
 /// the returned string).
 pub async fn write_and_broadcast(
     db_name: &str,
-    connection: &ConnectionArgs,
+    engine: &Engine,
     no_sync: bool,
     op: Op,
     key: &str,
     value: Option<&str>,
 ) -> anyhow::Result<String> {
-    // Hold the database lock across the pre-broadcast sync and the spend so the
-    // two stay atomic against another zkv process (reentrant with run_sync).
-    let _lock = crate::internal::lock::DbLock::acquire(db_name)?;
+    // See `broadcast_init` on why this takes no `DbLock`: the node's datadir
+    // lock is the same file, and it spans the sync and the send together.
     if !no_sync {
-        run_sync(db_name, connection, false).await?;
+        engine.sync_to_tip(None).await?;
+        // The read paths prune `pending.toml` after their sync; a write-only
+        // client (an oracle that only ever calls `set`) never takes one, so
+        // without this its pending file is pruned only by the staleness cutoff
+        // an hour later, and until then every version this picks treats
+        // long-confirmed writes as still in flight.
+        crate::internal::sync::prune_pending(db_name);
     }
 
     let prepared = prepare(db_name, op, key, value)?;
@@ -682,10 +688,10 @@ pub async fn write_and_broadcast(
         "preparing {} {}", op.as_str(), key,
     );
 
-    let txid = match pay(db_name, connection, prepared.request).await {
-        Ok(t) => t,
-        Err(e) => return Err(augment_insufficient_funds(e, db_name)),
-    };
+    let txid = engine
+        .ship(prepared.request)
+        .await
+        .map_err(|e| insufficient_from_engine(e, db_name))?;
     record_pending(db_name, &txid, op, key, value, &prepared.memo_text);
     Ok(txid)
 }
@@ -699,15 +705,20 @@ pub async fn write_and_broadcast(
 /// `merge_pending`'s dedup-by-txid and the read path's per-output scan).
 pub async fn write_many_and_broadcast(
     db_name: &str,
-    connection: &ConnectionArgs,
+    engine: &Engine,
     no_sync: bool,
     ops: &[BatchItem<'_>],
 ) -> anyhow::Result<String> {
-    // Hold the database lock across the pre-broadcast sync and the spend so the
-    // two stay atomic against another zkv process (reentrant with run_sync).
-    let _lock = crate::internal::lock::DbLock::acquire(db_name)?;
+    // See `broadcast_init` on why this takes no `DbLock`: the node's datadir
+    // lock is the same file, and it spans the sync and the send together.
     if !no_sync {
-        run_sync(db_name, connection, false).await?;
+        engine.sync_to_tip(None).await?;
+        // The read paths prune `pending.toml` after their sync; a write-only
+        // client (an oracle that only ever calls `set`) never takes one, so
+        // without this its pending file is pruned only by the staleness cutoff
+        // an hour later, and until then every version this picks treats
+        // long-confirmed writes as still in flight.
+        crate::internal::sync::prune_pending(db_name);
     }
 
     let prepared = prepare_batch(db_name, ops)?;
@@ -717,10 +728,10 @@ pub async fn write_many_and_broadcast(
         "preparing sendmany of {} ops", prepared.plan_ops.len(),
     );
 
-    let txid = match pay(db_name, connection, prepared.request).await {
-        Ok(t) => t,
-        Err(e) => return Err(augment_insufficient_funds(e, db_name)),
-    };
+    let txid = engine
+        .ship(prepared.request)
+        .await
+        .map_err(|e| insufficient_from_engine(e, db_name))?;
     for ((op, key, value), memo_text) in prepared.plan_ops.iter().zip(&prepared.memo_texts) {
         record_pending(db_name, &txid, *op, key, value.as_deref(), memo_text);
     }
@@ -738,17 +749,22 @@ pub async fn write_many_and_broadcast(
 /// a key/value (its effect only shows once confirmed, like any registry op).
 pub async fn manage_and_broadcast(
     db_name: &str,
-    connection: &ConnectionArgs,
+    engine: &Engine,
     no_sync: bool,
     op: Op,
     target: &str,
     scope: Option<&str>,
 ) -> anyhow::Result<String> {
-    // Hold the database lock across the pre-broadcast sync and the spend so the
-    // two stay atomic against another zkv process (reentrant with run_sync).
-    let _lock = crate::internal::lock::DbLock::acquire(db_name)?;
+    // See `broadcast_init` on why this takes no `DbLock`: the node's datadir
+    // lock is the same file, and it spans the sync and the send together.
     if !no_sync {
-        run_sync(db_name, connection, false).await?;
+        engine.sync_to_tip(None).await?;
+        // The read paths prune `pending.toml` after their sync; a write-only
+        // client (an oracle that only ever calls `set`) never takes one, so
+        // without this its pending file is pruned only by the staleness cutoff
+        // an hour later, and until then every version this picks treats
+        // long-confirmed writes as still in flight.
+        crate::internal::sync::prune_pending(db_name);
     }
 
     let prepared = prepare_management(db_name, op, target, scope)?;
@@ -758,56 +774,110 @@ pub async fn manage_and_broadcast(
         "preparing {} {target}", op.as_str(),
     );
 
-    let txid = match pay(db_name, connection, prepared.request).await {
-        Ok(t) => t,
-        Err(e) => return Err(augment_insufficient_funds(e, db_name)),
-    };
+    let txid = engine
+        .ship(prepared.request)
+        .await
+        .map_err(|e| insufficient_from_engine(e, db_name))?;
     record_pending(db_name, &txid, op, target, scope, &prepared.memo_text);
     Ok(txid)
 }
 
-/// Pending zatoshis from the wallet summary: in-flight incoming notes, change
-/// pending confirmation, and unshielded transparent funds (which would need
-/// shielding before they could fund a write).
-fn pending_zats(db_name: &str) -> anyhow::Result<u64> {
+/// `(spendable, pending)` for this database, in zatoshis.
+///
+/// Both come from one wallet summary, since every caller wants them together
+/// and opening the wallet database twice to read one number each would be
+/// wasteful. `(0, 0)` when the wallet has never been scanned.
+fn balances_zats(db_name: &str) -> anyhow::Result<(u64, u64)> {
     let cfg = WalletConfig::read(db_name)?;
     let (_, db_data_path) = get_db_paths(db_name)?;
     let db_data = open_wallet_db(db_data_path, cfg.network)?;
     let summary = match db_data.get_wallet_summary(ConfirmationsPolicy::default())? {
         Some(s) => s,
-        None => return Ok(0),
+        None => return Ok((0, 0)),
     };
+    let mut spendable: u64 = 0;
     let mut pending: u64 = 0;
     for b in summary.account_balances().values() {
+        spendable += u64::from(b.spendable_value());
         pending += u64::from(b.value_pending_spendability());
         pending += u64::from(b.change_pending_confirmation());
         pending += u64::from(b.unshielded_balance().total());
     }
-    Ok(pending)
+    Ok((spendable, pending))
 }
 
-/// If `err` is the `zcash_client_backend` "insufficient funds" error, rewrite
-/// it to mention any pending (confirming) balance the wallet is aware of.
-/// Otherwise return it unchanged.
-pub(crate) fn augment_insufficient_funds(err: anyhow::Error, db_name: &str) -> anyhow::Error {
-    let Some(error::Error::Wallet(WalletError::InsufficientFunds {
-        available,
-        required,
-    })) = err.downcast_ref::<error::Error>()
+/// Rewrite the engine's "insufficient funds" into the structured
+/// [`WriteError::InsufficientFunds`] the facade and its consumers expect.
+///
+/// The node reports the amounts behind a `-6` in process
+/// (`EngineError::Rpc::funds`), so the numbers come from the wallet that
+/// actually refused the send: `required` is what the input selector needed
+/// including the real fee, not an estimate of it.
+///
+/// zkv falls back to reading its own balances when the node cannot say. Each
+/// amount is optional upstream, deliberately: a genuine zero and "not known
+/// here" are different answers, and only the fallback should be reached for
+/// the latter. `required` then reverts to [`MIN_WRITE_FEE_ZATS`], which for a
+/// zkv write is a faithful floor (every memo output is zero-value, so the whole
+/// requirement is the fee) but understates a write that has to spend several
+/// notes.
+pub(crate) fn insufficient_from_engine(err: EngineError, db_name: &str) -> anyhow::Error {
+    let EngineError::Rpc {
+        code,
+        ref message,
+        ref funds,
+    } = err
     else {
-        return err;
+        return err.into();
     };
+    if code != crate::engine::codes::INSUFFICIENT_FUNDS {
+        return err.into();
+    }
     let network = WalletConfig::read(db_name)
         .map(|c| c.network)
-        .unwrap_or_default();
+        .unwrap_or(crate::data::Network::Main);
+
+    // Pending is the node's when it spoke: value awaiting confirmations, its
+    // own change included. Mature transparent coinbase is deliberately left
+    // out, as `balances_zats` leaves it out: it is spendable only through
+    // `z_shieldcoinbase`, so counting it would promise funds no write can use.
+    let reported = funds.as_ref().and_then(|f| {
+        Some((
+            f.available?,
+            f.required?,
+            f.pending_incoming.saturating_add(f.pending_change),
+        ))
+    });
+
+    let (available, required, pending) = match reported {
+        Some(amounts) => {
+            tracing::debug!(%message, "the node reported the amounts behind its refusal");
+            amounts
+        }
+        None => {
+            let (available, pending) = balances_zats(db_name).unwrap_or((0, 0));
+            tracing::debug!(
+                %message,
+                "the node did not report amounts; falling back to local balances",
+            );
+            (available, MIN_WRITE_FEE_ZATS, pending)
+        }
+    };
+
     WriteError::InsufficientFunds {
-        available: u64::from(*available),
-        required: u64::from(*required),
-        pending: pending_zats(db_name).unwrap_or(0),
+        available,
+        required,
+        pending,
         network,
     }
     .into()
 }
+
+/// The ZIP-317 fee for the smallest possible zkv write: one shielded input,
+/// one zero-value memo output, one change output. The fallback `required`
+/// for the case where the node refuses a send without saying how much it
+/// needed; see [`insufficient_from_engine`].
+const MIN_WRITE_FEE_ZATS: u64 = 10_000;
 
 /// Sign and print a data memo (`SET`/`SETL`/`DEL`) only, no sync, no
 /// broadcast. Backs `zkv sign set` / `zkv sign del`.
@@ -997,5 +1067,75 @@ mod tests {
     fn build_request_rejects_bad_recipient() {
         let err = build_request("not-a-zcash-address", "ZKV0 SET k v").unwrap_err();
         assert!(format!("{err:#}").contains("bad recipient UA"));
+    }
+
+    /// The node's own numbers are preferred over zkv's local reading, and the
+    /// fee estimate is only a fallback.
+    ///
+    /// `available`/`required` are optional upstream on purpose: a genuine zero
+    /// and "not known here" are different answers, so a partial report must
+    /// fall back rather than present a confident zero. These cases run without
+    /// a database, so the fallback's local balance read fails and lands on
+    /// `(0, 0)`; what is asserted is which branch was taken.
+    #[test]
+    fn insufficient_funds_prefers_the_amounts_the_node_reported() {
+        use crate::engine::InsufficientFunds;
+
+        let rpc = |funds: Option<InsufficientFunds>| EngineError::Rpc {
+            code: crate::engine::codes::INSUFFICIENT_FUNDS,
+            message: "Insufficient funds".into(),
+            funds,
+        };
+        let mapped = |e: EngineError| {
+            let err = insufficient_from_engine(e, "no-such-database-for-this-test");
+            match err.downcast::<WriteError>() {
+                Ok(WriteError::InsufficientFunds {
+                    available,
+                    required,
+                    pending,
+                    ..
+                }) => (available, required, pending),
+                other => panic!("expected a structured insufficient-funds error, got {other:?}"),
+            }
+        };
+
+        // `InsufficientFunds` is `#[non_exhaustive]`, so it is built by
+        // mutation rather than with a struct literal.
+        let funds = |available, required, pending_incoming, pending_change| {
+            let mut f = InsufficientFunds::default();
+            f.available = available;
+            f.required = required;
+            f.pending_incoming = pending_incoming;
+            f.pending_change = pending_change;
+            // Never spendable by an ordinary send, so it must not be counted.
+            f.mature_coinbase = 999_999;
+            f
+        };
+
+        // Fully reported: the node's figures, with both pending buckets summed
+        // and the mature coinbase left out.
+        assert_eq!(
+            mapped(rpc(Some(funds(Some(7_000), Some(10_000), 300, 40)))),
+            (7_000, 10_000, 340),
+        );
+
+        // No detail at all, and a partial report: both take the fallback, so
+        // `required` is zkv's fee floor rather than a confident zero.
+        assert_eq!(mapped(rpc(None)), (0, MIN_WRITE_FEE_ZATS, 0));
+        assert_eq!(
+            mapped(rpc(Some(funds(Some(7_000), None, 0, 0)))),
+            (0, MIN_WRITE_FEE_ZATS, 0),
+        );
+
+        // Another code carries through untouched: only `-6` has these amounts.
+        let other = insufficient_from_engine(
+            EngineError::Rpc {
+                code: crate::engine::codes::UNKNOWN_WALLET,
+                message: "no such wallet".into(),
+                funds: None,
+            },
+            "no-such-database-for-this-test",
+        );
+        assert!(other.downcast::<WriteError>().is_err());
     }
 }

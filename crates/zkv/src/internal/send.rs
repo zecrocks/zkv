@@ -1,66 +1,25 @@
-//! Build and broadcast a tiny shielded self-send carrying a zkv memo, in the
-//! database's configured pool (Sapling or Orchard).
+//! Plain value transfers, and the address handling they share with the GUI.
+//!
+//! The transaction building itself belongs to the wallet engine now: this
+//! module composes a [`TransactionRequest`] and hands it to `Engine::ship`,
+//! exactly as the memo write path does. What is left here is zkv's own:
+//! parsing a user-typed ZEC amount, and classifying a user-typed recipient
+//! address against the database's network before anything is broadcast.
 
-use std::num::NonZeroUsize;
 use std::str::FromStr;
 
 use anyhow::anyhow;
-use secrecy::ExposeSecret as _;
 
 use zcash_address::{ConversionError, ZcashAddress};
-use zcash_client_backend::{
-    data_api::{
-        wallet::{
-            create_proposed_transactions,
-            input_selection::{GreedyInputSelector, SpendPolicy},
-            propose_transfer, ConfirmationsPolicy, SpendingKeys,
-        },
-        Account, WalletRead,
-    },
-    fees::{standard::MultiOutputChangeStrategy, DustOutputPolicy, SplitPolicy, StandardFeeRule},
-    proto::service,
-    wallet::OvkPolicy,
-};
-use zcash_keys::{address::Address, keys::UnifiedSpendingKey};
-use zcash_proofs::prover::LocalTxProver;
+use zcash_keys::address::Address;
 use zcash_protocol::{
     consensus::{NetworkType, Parameters},
     memo::{Memo, MemoBytes},
     value::Zatoshis,
-    ShieldedPool,
 };
 use zip321::{Payment, TransactionRequest};
 
-use crate::{
-    config::WalletConfig,
-    data::{get_db_paths, open_wallet_db},
-    error,
-    internal::{sync::run_sync, write::augment_insufficient_funds},
-    remote::ConnectionArgs,
-};
-
-/// Note-management defaults for the change splitter ([`MultiOutputChangeStrategy`]):
-/// keep ~`TARGET_NOTE_COUNT` spendable change notes so a high-frequency writer
-/// isn't stalled waiting on a single unconfirmed note. Internal constants (no
-/// longer CLI flags) because zkv writes are uniform.
-const TARGET_NOTE_COUNT: usize = 4;
-
-/// Floor for each split change note, per network. Mainnet uses 0.005 ZEC
-/// (matches zcash_client_backend's own `SplitPolicy::MIN_NOTE_VALUE`); test
-/// networks use a much smaller 0.0005 TAZ so even a ~0.0025 TAZ faucet drip
-/// splits into several notes on a new user's first write. This value doubles
-/// as the `ExceedsMinValue` threshold for counting existing notes toward the
-/// target, so it is the single knob that controls splitting.
-const MIN_SPLIT_VALUE_MAIN: u64 = 500_000;
-const MIN_SPLIT_VALUE_TEST: u64 = 50_000;
-
-/// Per-network floor (in zatoshis) for each split change note.
-fn min_split_output_value(net: NetworkType) -> u64 {
-    match net {
-        NetworkType::Main => MIN_SPLIT_VALUE_MAIN,
-        NetworkType::Test | NetworkType::Regtest => MIN_SPLIT_VALUE_TEST,
-    }
-}
+use crate::config::WalletConfig;
 
 /// A user-facing network label for error text.
 fn net_label(net: NetworkType) -> &'static str {
@@ -198,7 +157,7 @@ pub fn describe_recipient(
 /// TEX recipients work too.
 pub async fn send_funds(
     db_name: &str,
-    connection: &ConnectionArgs,
+    engine: &crate::engine::Engine,
     recipient: &str,
     amount: Zatoshis,
     memo: Option<&str>,
@@ -208,8 +167,11 @@ pub async fn send_funds(
     let cfg = WalletConfig::read(db_name)?;
     validate_recipient(recipient, cfg.network).map_err(|m| anyhow!(m))?;
 
+    // Through the engine, like every other spend the facade drives: taking
+    // zkv's own DbLock here and then starting a node would have each waiting
+    // on the other's hold of the same `.lock` file.
     if !no_sync {
-        run_sync(db_name, connection, false).await?;
+        engine.sync_to_tip(None).await?;
     }
 
     let address = ZcashAddress::from_str(recipient).map_err(|e| anyhow!("bad address: {e}"))?;
@@ -233,154 +195,17 @@ pub async fn send_funds(
     let request =
         TransactionRequest::new(vec![payment]).map_err(|e| anyhow!("bad tx request: {e}"))?;
 
-    pay(db_name, connection, request)
+    engine
+        .ship(request)
         .await
-        .map_err(|e| augment_insufficient_funds(e, db_name))
-}
-
-/// Build and broadcast a single transaction containing the supplied payment(s).
-/// Picks the only local account in the named database, unwraps the stored seed
-/// via the age identity (the `security-theater-key` file), signs, and submits
-/// to the configured lightwalletd.
-///
-/// Returns the broadcast txid as a hex string.
-pub async fn pay(
-    db_name: &str,
-    connection: &ConnectionArgs,
-    request: TransactionRequest,
-) -> anyhow::Result<String> {
-    let config = WalletConfig::read(db_name)?;
-    let params = config.network;
-
-    let (_, db_data_path) = get_db_paths(db_name)?;
-    let mut db_data = open_wallet_db(db_data_path, params)?;
-
-    // For zkv the wallet always has exactly one account (the admin's). Pick it.
-    let account_ids = db_data.get_account_ids()?;
-    let account_id = match account_ids.as_slice() {
-        [id] => *id,
-        [] => return Err(crate::internal::account::no_account_error(db_name)),
-        _ => anyhow::bail!("database {db_name:?} has multiple accounts; zkv assumes one"),
-    };
-    let account = db_data
-        .get_account(account_id)?
-        .ok_or_else(|| anyhow!("account vanished"))?;
-    let derivation = account
-        .source()
-        .key_derivation()
-        .ok_or_else(|| anyhow!("cannot spend from a watch-only database"))?;
-
-    // Unwrap the stored seed using the age identity in the db dir.
-    let seed = config.decrypt_seed()?;
-    let usk =
-        UnifiedSpendingKey::from_seed(&params, seed.expose_secret(), derivation.account_index())
-            .map_err(error::Error::from)?;
-
-    let mut client = connection.connect(params).await?;
-
-    tracing::debug!(db = db_name, "creating transaction");
-    let prover = LocalTxProver::bundled();
-    // The change strategy's `fallback_change_pool` is where change lands when
-    // the transaction has no shielded inputs. It must be a pool the fee/change
-    // accounting models directly (`OutputManifest` has only Sapling and Orchard
-    // slots): passing `Ironwood` trips a `total_shielded() == target_change_count`
-    // assertion in `zcash_client_backend`. The builder routes Orchard-pool
-    // change into the V6 Ironwood bundle when NU6.3 is active, so fold Ironwood
-    // to Orchard here (matching zcash-devtool, which always passes Orchard).
-    let fallback_change_pool = match config.pool {
-        ShieldedPool::Ironwood => ShieldedPool::Orchard,
-        other => other,
-    };
-    let change_strategy = MultiOutputChangeStrategy::new(
-        StandardFeeRule::Zip317,
-        None,
-        fallback_change_pool,
-        DustOutputPolicy::default(),
-        SplitPolicy::with_min_output_value(
-            NonZeroUsize::new(TARGET_NOTE_COUNT).expect("nonzero const"),
-            zcash_protocol::value::Zatoshis::from_u64(min_split_output_value(
-                params.network_type(),
-            ))?,
-        ),
-    );
-    let input_selector = GreedyInputSelector::new();
-
-    let proposal = propose_transfer(
-        &mut db_data,
-        &params,
-        account.id(),
-        &input_selector,
-        &change_strategy,
-        request,
-        ConfirmationsPolicy::default(),
-        // spend_policy (Ironwood RC, transparent-inputs feature): the library
-        // default is shielded-only (every shielded pool in the build, no
-        // transparent UTXOs). zkv's funding UA is shielded-only
-        // (ua_request_for_pool omits the transparent receiver), so writes are
-        // funded by and spent from shielded notes; there are no transparent
-        // inputs to select.
-        &SpendPolicy::default(),
-        // lock_inputs: None, so the selected inputs are not locked against
-        // concurrent proposals. Input locking exists to keep two overlapping
-        // proposals for one account from selecting the same notes; zkv already
-        // serializes every spend on the per-database `lock::DbLock` (held across
-        // sync + spend, and cross-process), so there is no second proposer to
-        // race with and nothing to reserve.
-        None,
-        // proposed_version: None lets the wallet pick the tx version for the
-        // target height (Ironwood/V6 past NU6.3). It rides on the resulting
-        // Proposal, so create_proposed_transactions reads it back rather than
-        // taking it as an argument.
-        None,
-    )
-    .map_err(error::Error::from)?;
-
-    tracing::debug!(?proposal, "proposed transfer");
-
-    let txids = create_proposed_transactions(
-        &mut db_data,
-        &params,
-        &prover,
-        &prover,
-        &SpendingKeys::from_unified_spending_key(usk),
-        OvkPolicy::Sender,
-        &proposal,
-        // expiry_height: None keeps the builder-derived default expiry. zkv has
-        // no reason to override it; a write that doesn't confirm is retried as a
-        // fresh transaction, and `pending.toml` tracks the in-flight one.
-        None,
-    )
-    .map_err(error::Error::from)?;
-
-    if txids.len() > 1 {
-        anyhow::bail!("Multi-transaction proposals are not supported.");
-    }
-    let txid = *txids.first();
-
-    tracing::debug!(%txid, "broadcasting");
-    let tx = db_data
-        .get_transaction(txid)?
-        .ok_or_else(|| anyhow!("Transaction not found for id {:?}", txid))?;
-    let mut raw_tx = service::RawTransaction::default();
-    tx.write(&mut raw_tx.data)
-        .map_err(|e| anyhow!("serializing transaction {:?}: {e}", tx.txid()))?;
-    let txid = tx.txid();
-    let response = client.send_transaction(raw_tx).await?.into_inner();
-
-    if response.error_code != 0 {
-        return Err(error::Error::SendFailed {
-            code: response.error_code,
-            reason: response.error_message,
-        }
-        .into());
-    }
-
-    Ok(txid.to_string())
+        .map_err(|e| crate::internal::write::insufficient_from_engine(e, db_name))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zcash_keys::keys::UnifiedSpendingKey;
+    use zcash_protocol::ShieldedPool;
 
     fn zats(s: &str) -> u64 {
         u64::from(parse_zec(s).expect("valid amount"))

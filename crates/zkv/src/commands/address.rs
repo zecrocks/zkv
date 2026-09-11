@@ -32,10 +32,9 @@ impl Command {
         let cfg = WalletConfig::read(&name)?;
         let (_, db_data_path) = get_db_paths(&name)?;
         let db_data = open_wallet_db(db_data_path, cfg.network)?;
-        let ids = db_data.get_account_ids()?;
-        let account_id = *ids
-            .first()
-            .ok_or_else(|| crate::internal::account::no_account_error(&name))?;
+        // Not "the first account": a member of the shared scan reads a shard
+        // holding several, and its own is the one its viewing key opens.
+        let account_id = crate::internal::account::select_account(&db_data, &cfg, &name)?;
         let account = db_data
             .get_account(account_id)?
             .ok_or_else(|| anyhow!("account vanished"))?;

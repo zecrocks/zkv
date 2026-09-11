@@ -154,9 +154,8 @@ impl Command {
             .birthday
             .or_else(|| parsed_addr.as_ref().map(|p| p.birthday))
             .expect("address or birthday is required (checked above)");
-        let mut client = connection.connect(params).await?;
         let birthday =
-            crate::internal::sync::pinned_birthday(&mut client, params, birthday_height).await?;
+            crate::internal::sync::pinned_birthday(&connection, params, birthday_height).await?;
 
         WalletConfig::init_admin(&name, &mnemonic, birthday.height(), params, pool)?;
 

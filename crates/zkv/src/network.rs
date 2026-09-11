@@ -20,8 +20,9 @@ use zcash_protocol::consensus::{
 use zcash_protocol::local_consensus::LocalNetwork;
 
 /// The network a zkv database is bound to. `Copy` so it threads by value
-/// through the wallet APIs exactly as the upstream `consensus::Network` did.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// through the wallet APIs exactly as the upstream `consensus::Network` did,
+/// and `Hash` so the shared scan can key one node per network.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum Network {
     /// Production Zcash.
     #[default]

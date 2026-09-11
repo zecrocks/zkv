@@ -5,13 +5,14 @@ use serde::Serialize;
 
 use crate::{
     commands::connection_args::ConnectionCliArgs,
+    config::WalletConfig,
     data::resolve_db,
     internal::{
         protocol::{
             AuditResult, AuditRow, HistoryEntry, HistoryResult, HistoryStatus, Op, RowOutcome,
         },
         state::{load_audit, load_history_page, load_state, HistoryOrder},
-        sync::run_sync_read_confs,
+        sync::{read_sync_tolerance, read_sync_with_status},
     },
 };
 
@@ -20,7 +21,7 @@ pub(crate) enum OutputFormat {
     /// Human-readable, tab-separated lines (one per write) on stdout.
     #[default]
     Friendly,
-    /// Machine-readable JSON: `{ "signer": "...", "entries": [ ... ] }`.
+    /// Machine-readable JSON: `{ "creator": "...", "entries": [ ... ] }`.
     Json,
 }
 
@@ -140,8 +141,15 @@ impl Command {
         let connection = self.connection.into_inner();
 
         if !self.offline && !crate::commands::blocksync_skip(&name)? {
-            let fetch_mempool_too = self.confirmations == 0;
-            run_sync_read_confs(&name, &connection, self.confirmations, fetch_mempool_too).await?;
+            let engine = crate::engine::EngineRef::open(&name, &connection)?;
+            read_sync_with_status(
+                &engine,
+                &name,
+                &connection,
+                WalletConfig::read(&name)?.network,
+                read_sync_tolerance(self.confirmations),
+            )
+            .await?;
         }
 
         // Version gate (authoritative post-sync state): warn if the database is

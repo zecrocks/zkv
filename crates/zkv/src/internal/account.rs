@@ -65,6 +65,89 @@ pub(crate) struct AccountKeys {
     pub account_index: Option<AccountId>,
 }
 
+/// Pick the account this database means, out of whatever the wallet file holds.
+///
+/// A database with a wallet engine of its own has exactly one account, so
+/// "the first" was always right and stays the fallback. A member of the shared
+/// scan does not: its file is a shard holding many members' accounts, and the
+/// first is whichever was imported first. So when `keys.toml` pins a viewing
+/// key, the account is the one that key opens.
+///
+/// Matching on the **encoded viewing key** is what the wallet engine itself
+/// does to reconcile a manifest with an account, so the two cannot disagree
+/// about which account belongs to which database. The pin is written at
+/// creation for a member, and by adoption for everything else, so the fallback
+/// only covers a database that predates adoption and therefore has one account.
+pub fn select_account<DB>(
+    db_data: &DB,
+    cfg: &WalletConfig,
+    db_name: &str,
+) -> anyhow::Result<DB::AccountId>
+where
+    DB: WalletRead,
+    DB::Error: std::fmt::Debug,
+    DB::AccountId: Copy,
+{
+    let ids = db_data
+        .get_account_ids()
+        .map_err(|e| anyhow!("reading accounts: {e:?}"))?;
+    if let Some(want) = cfg.ufvk.as_deref() {
+        for id in &ids {
+            let Some(account) = db_data
+                .get_account(*id)
+                .map_err(|e| anyhow!("reading account: {e:?}"))?
+            else {
+                continue;
+            };
+            if account
+                .ufvk()
+                .is_some_and(|k| k.encode(&cfg.network) == want)
+            {
+                return Ok(*id);
+            }
+        }
+        // A member whose account is genuinely absent is "not imported yet",
+        // which the caller distinguishes; falling through to the first account
+        // here would hand it somebody else's memos.
+        if cfg.engine.is_fleet_member() {
+            return Err(anyhow!(
+                "the {db_name:?} database's account is not in its shard yet"
+            ));
+        }
+    }
+    ids.first()
+        .copied()
+        .ok_or_else(|| no_account_error(db_name))
+}
+
+/// This database's own balances out of a wallet summary, and nothing else's.
+///
+/// A summary covers every account in the file it came from. For a database with
+/// a wallet engine of its own that is one account, so summing the map and
+/// picking this account are the same number. For a member of the shared scan
+/// the file is its shard, so summing the map reports **its shard-mates' money
+/// under this database's name**, which is the same mistake the wallet engine
+/// made on its own read path until it was fixed (upstream #270).
+///
+/// `None` when this database has no account in the file yet, which for a member
+/// means the import has not run. That is a truthful "nothing", distinct from a
+/// zero balance, and callers that cannot express the difference should say
+/// nothing rather than print a zero.
+pub fn account_balance<'a, P: zcash_protocol::consensus::Parameters + 'static>(
+    summary: &'a zcash_client_backend::data_api::WalletSummary<zcash_client_sqlite::AccountUuid>,
+    db_data: &zcash_client_sqlite::WalletDb<
+        rusqlite::Connection,
+        P,
+        zcash_client_sqlite::util::SystemClock,
+        rand::rand_core::UnwrapErr<rand::rngs::SysRng>,
+    >,
+    cfg: &WalletConfig,
+    db_name: &str,
+) -> Option<&'a zcash_client_backend::data_api::AccountBalance> {
+    let id = select_account(db_data, cfg, db_name).ok()?;
+    summary.account_balances().get(&id)
+}
+
 /// Open the wallet DB for `db_name`, derive everything the read/write paths
 /// need, and drop the DB before returning. The `cfg` parameter is taken
 /// rather than re-read so callers that already loaded it can reuse it.
@@ -72,8 +155,7 @@ pub(crate) fn account_keys(cfg: &WalletConfig, db_name: &str) -> anyhow::Result<
     let (_, db_data_path) = get_db_paths(db_name)?;
     let db_data = open_wallet_db(&db_data_path, cfg.network)?;
 
-    let ids = db_data.get_account_ids()?;
-    let account_id = *ids.first().ok_or_else(|| no_account_error(db_name))?;
+    let account_id = select_account(&db_data, cfg, db_name)?;
     let account = db_data
         .get_account(account_id)?
         .ok_or_else(|| anyhow!("account vanished"))?;

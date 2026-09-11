@@ -49,7 +49,6 @@ pub enum Error {
     InvalidMemo,
     InvalidKeysFile,
     InvalidTreeState,
-    SendFailed { code: i32, reason: String },
     SendMax(SendMaxErrorT),
     Shield(ShieldErrorT),
     TransparentMemo(usize),
@@ -67,7 +66,6 @@ impl fmt::Display for Error {
             Error::InvalidMemo => write!(f, "Invalid memo"),
             Error::InvalidKeysFile => write!(f, "Invalid keys file"),
             Error::InvalidTreeState => write!(f, "Invalid TreeState received from server"),
-            Error::SendFailed { code, reason } => write!(f, "Send failed: ({code}) {reason}"),
             Error::SendMax(e) => e.fmt(f),
             Error::TransparentMemo(idx) => {
                 write!(f, "Payment {idx} invalid: can't send memo to a t-address")

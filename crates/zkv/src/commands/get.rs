@@ -11,7 +11,7 @@ use crate::{
         pending,
         protocol::{InitState, KeyState, PendingOp},
         state::load_state,
-        sync::run_sync_read_confs,
+        sync::{read_sync_tolerance, read_sync_with_status},
     },
 };
 
@@ -70,8 +70,15 @@ impl Command {
         let connection = self.connection.into_inner();
 
         if !self.offline && !crate::commands::blocksync_skip(&name)? {
-            let fetch_mempool_too = self.confirmations == 0;
-            run_sync_read_confs(&name, &connection, self.confirmations, fetch_mempool_too).await?;
+            let engine = crate::engine::EngineRef::open(&name, &connection)?;
+            read_sync_with_status(
+                &engine,
+                &name,
+                &connection,
+                WalletConfig::read(&name)?.network,
+                read_sync_tolerance(self.confirmations),
+            )
+            .await?;
         }
 
         let min_confs = self.confirmations;

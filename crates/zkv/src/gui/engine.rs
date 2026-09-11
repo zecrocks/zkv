@@ -162,6 +162,12 @@ pub struct DbSummary {
     /// Whether per-database auto-sync is paused (drives the sidebar icon).
     /// Reflects only per-db pause, never the global pause-all.
     pub paused: bool,
+    /// Which wallet engine serves this database: `"own"` for a node of its
+    /// own, `"fleet"` for a member of the network's shared scan, and
+    /// `"joining"` while it is converting (still reading from its own files).
+    /// The GUI uses it to explain why a database has no local wallet files and
+    /// why a freshly-watched one reports no keys for a while.
+    pub engine: String,
     /// Block timestamp (unix seconds) of the most recent confirmed write to
     /// any key, for "most recently updated" sidebar ordering. `None` if the
     /// database has no confirmed writes yet.
@@ -514,6 +520,9 @@ pub struct PauseResp {
 #[derive(Serialize)]
 pub struct SettingsResp {
     pub sync_workers: usize,
+    /// Whether new watch-only databases join the network's shared scan rather
+    /// than getting a wallet engine of their own.
+    pub fleet_watch: bool,
 }
 
 #[derive(Serialize)]
@@ -687,11 +696,6 @@ impl Engine {
         // that console should carry only `tracing` log events. See
         // `ui::set_quiet`.
         crate::ui::set_quiet();
-        // For the same reason, forbid the reorg-recovery path from blocking on a
-        // `[y/N]` stdin prompt: a GUI launched from a terminal inherits its TTY,
-        // so the `is_terminal()` guard alone wouldn't stop a background auto-sync
-        // from hijacking stdin and hanging the app.
-        crate::internal::sync::set_interactive_prompts_enabled(false);
         let server_label = server_endpoint(&conn, Network::Main);
         Arc::new(Engine {
             conn,
@@ -906,6 +910,7 @@ impl Engine {
                     keys: 0,
                     unsynced: 0,
                     paused: is_paused,
+                    engine: engine_str(cfg.engine).to_owned(),
                     updated_at: None,
                     synced: None,
                     detailed: false,
@@ -1688,6 +1693,12 @@ impl Engine {
         // they resume on the next cycle. Only worth signalling on pause.
         if paused {
             self.sync_cancel.store(true, Ordering::Relaxed);
+            // Pausing everything means the shared scan should stop too, and
+            // stopping it releases its datadir lock so a CLI command can use
+            // it. Detached because pausing is a button press and shutting a
+            // node down waits for its actors; the loop is already halted by the
+            // flag above, and the node restarts lazily on resume.
+            tokio::spawn(crate::engine::shutdown_all());
         }
         PauseResp { paused }
     }
@@ -1707,10 +1718,21 @@ impl Engine {
 
     /// Set the number of databases the background loop syncs concurrently.
     /// Clamped to `1..=MAX_SYNC_WORKERS`; takes effect next cycle.
-    pub fn set_settings(&self, sync_workers: usize) -> SettingsResp {
+    pub fn set_settings(&self, sync_workers: usize, fleet_watch: Option<bool>) -> SettingsResp {
         let n = sync_workers.clamp(1, MAX_SYNC_WORKERS);
         self.sync_workers.store(n, Ordering::Relaxed);
-        SettingsResp { sync_workers: n }
+        // Only for databases created from now on: this changes no existing
+        // one, in either direction. `zkv fleet join` and `leave` are how a
+        // database already on disk moves.
+        if let Some(on) = fleet_watch {
+            if let Err(e) = crate::fleet::set_fleet_default(on) {
+                tracing::warn!("recording the shared-scan default: {e:#}");
+            }
+        }
+        SettingsResp {
+            sync_workers: n,
+            fleet_watch: crate::fleet::fleet_is_default(),
+        }
     }
 
     /// Render `data` as a scannable QR-code SVG. Pure CPU (no wallet).
@@ -1797,20 +1819,15 @@ impl Engine {
                     let cancel = engine.sync_cancel.clone();
                     let label = name.clone();
                     let result = run_blocking(move |h| {
-                        // Non-blocking cross-process lock: if another zkv process
-                        // holds it, don't stall this worker thread on a blocking
-                        // flock — report the db as in-use and try again next
-                        // cycle. Held across the sync; `sync_cancellable`'s own
-                        // (reentrant) acquire shares it via the lock registry.
-                        let _xlock = match crate::internal::lock::DbLock::try_acquire(&name)? {
-                            Some(g) => g,
-                            None => {
-                                return Err(ZkvError::Other(anyhow::anyhow!(
-                                    "another zkv process is using this database"
-                                )))
-                            }
-                        };
-                        let db = Database::open(&name, conn)?;
+                        // Exclusion comes from the wallet engine's own datadir
+                        // lock now, so this must NOT take zkv's `DbLock` as
+                        // well: they are the same `.lock` file through separate
+                        // handles, and the node would fail to acquire what this
+                        // thread already holds. `skip_if_busy` keeps the
+                        // behaviour that matters here, which is to give up at
+                        // once and come back next cycle rather than stall a
+                        // worker thread on a database another process is using.
+                        let db = Database::open(&name, conn)?.skip_if_busy();
                         h.block_on(db.sync_cancellable(Some(cancel)))
                     })
                     .await;
@@ -1962,7 +1979,12 @@ fn is_benign_sync_error(raw: &str) -> bool {
 /// as "can't reach the server" for weeks with nothing to go on.
 fn friendly_sync_error(raw: &str) -> String {
     let low = raw.to_ascii_lowercase();
-    if low.contains("another zkv process") {
+    // Matches what `map_engine_error` renders for `EngineError::Busy`, which is
+    // `database "x" is in use by another process`. It deliberately does *not*
+    // match on "another zkv process": that phrase appears only in a
+    // `tracing::warn` inside the retry loop, never in an error, so keying on it
+    // meant this arm never fired and the GUI showed the raw internal string.
+    if low.contains("in use by another process") {
         "Another zkv process is using this database. It will sync once that finishes.".to_owned()
     } else if low.contains("no wallet key") || low.contains("has no account") {
         "This database's wallet key is missing; it rebuilds automatically on the next sync."
@@ -1977,6 +1999,18 @@ fn friendly_sync_error(raw: &str) -> String {
         format!("Can't reach the lightwalletd server right now; retrying automatically. ({raw})")
     } else {
         raw.to_owned()
+    }
+}
+
+/// How a database's wallet engine is labelled in the GUI.
+fn engine_str(engine: crate::config::WalletEngine) -> &'static str {
+    use crate::config::WalletEngine;
+    match engine {
+        // "Not chosen yet" is not a state worth showing: it behaves exactly
+        // like its own node, and it converts on the next open.
+        WalletEngine::Unset | WalletEngine::Own => "own",
+        WalletEngine::FleetPending => "joining",
+        WalletEngine::Fleet => "fleet",
     }
 }
 
@@ -2084,6 +2118,7 @@ fn summarize_db_full(
         keys,
         unsynced,
         paused: paused.contains(name),
+        engine: engine_str(cfg.engine).to_owned(),
         updated_at,
         synced,
         detailed: true,
@@ -2474,6 +2509,12 @@ fn qr_svg(data: &str) -> anyhow::Result<String> {
 mod tests {
     use super::*;
 
+    /// The exact string the GUI's auto-sync sees when another process holds
+    /// this database: `EngineError::Busy` as the facade renders it.
+    fn busy_error_text() -> String {
+        crate::db::map_engine_error(crate::engine::EngineError::Busy("mydb".to_owned())).to_string()
+    }
+
     #[test]
     fn benign_sync_errors_are_not_surfaced() {
         // Block-cache misses self-heal while the wallet stays synced, so they
@@ -2484,13 +2525,17 @@ mod tests {
         ] {
             assert!(is_benign_sync_error(raw), "should be benign: {raw}");
         }
-        // Errors the user can act on (or that persist) are NOT benign.
+        // Errors the user can act on (or that persist) are NOT benign. The
+        // busy one is built through the real mapping rather than typed out:
+        // the GUI's auto-sync gets its string from `map_engine_error`, and a
+        // hand-written literal here would keep passing while the production
+        // wording drifted away from it.
         for raw in [
-            "transport error",
-            "another zkv process is using this database",
-            "the \"x\" database has no wallet key imported yet",
+            "transport error".to_owned(),
+            busy_error_text(),
+            "the \"x\" database has no wallet key imported yet".to_owned(),
         ] {
-            assert!(!is_benign_sync_error(raw), "should not be benign: {raw}");
+            assert!(!is_benign_sync_error(&raw), "should not be benign: {raw}");
         }
     }
 
@@ -2502,9 +2547,15 @@ mod tests {
         let net = friendly_sync_error("h2 protocol error: error reading a body from connection");
         assert!(net.contains("Can't reach"), "{net}");
         assert!(net.contains("h2 protocol error"), "{net}");
+        // Same reasoning as the benign case above: the input is the error the
+        // auto-sync loop actually receives when another process holds the
+        // datadir lock, not a literal invented to satisfy the matcher. Keyed on
+        // a literal, this assertion passed for a build in which the arm was
+        // unreachable.
         assert!(
-            friendly_sync_error("another zkv process is using this database")
-                .contains("Another zkv process")
+            friendly_sync_error(&busy_error_text()).contains("Another zkv process"),
+            "a held database must get the friendly banner, got: {}",
+            friendly_sync_error(&busy_error_text()),
         );
         assert!(
             friendly_sync_error("database has no wallet key imported yet")

@@ -65,15 +65,130 @@ fn pool_output_codes(pool: ShieldedPool) -> &'static [i64] {
     }
 }
 
-/// Render [`pool_output_codes`] as a SQL `IN`-list body (e.g. `"3, 4"`) for
-/// inlining into a query. The values are trusted integer constants, never user
-/// input, so string interpolation is safe here.
-fn pool_in_list(pool: ShieldedPool) -> String {
+/// The base note table and index column behind each pool code.
+///
+/// These are `zcash_client_sqlite`'s own tables, which is the whole reason
+/// [`received_outputs_sql`] carries the warning it does.
+fn pool_table(code: i64) -> (&'static str, &'static str) {
+    match code {
+        2 => ("sapling_received_notes", "output_index"),
+        3 => ("orchard_received_notes", "action_index"),
+        4 => ("ironwood_received_notes", "action_index"),
+        other => unreachable!("pool code {other} is not one zkv reads"),
+    }
+}
+
+/// The spend-record table for a pool code. Note the singular: the table is
+/// named for one note's spend, not for the notes table it references
+/// (`orchard_received_note_spends`, beside `orchard_received_notes`), which is
+/// close enough to derive wrongly and have SQLite report it only at run time.
+fn pool_spends_table(code: i64) -> &'static str {
+    match code {
+        2 => "sapling_received_note_spends",
+        3 => "orchard_received_note_spends",
+        4 => "ironwood_received_note_spends",
+        other => unreachable!("pool code {other} is not one zkv reads"),
+    }
+}
+
+/// `v_received_outputs`, restricted to a database's own pools and written out
+/// against the base tables, as the body of a subquery.
+///
+/// Columns: `transaction_id`, `output_index`, `account_id`, `value`, `memo`,
+/// `pool`.
+///
+/// **Why not query the view.** `v_received_outputs` and the `v_tx_outputs` /
+/// `v_transactions` views built on it are aggregates over every note and every
+/// spend in the wallet, and SQLite pushes no `WHERE` term through them:
+/// upstream measured this on SQLite 3.50 against the real schema, with the
+/// predicate on `txid` *and* on the grouping column, and both plan as a full
+/// scan of all four note tables plus `sent_notes`. So a query that wants one
+/// account's memos past a watermark paid a whole-history aggregation, which is
+/// exactly the `O(total writes)` cost the snapshot exists to remove: a
+/// long-lived oracle paid it on every read, and the history page paid it once
+/// per row. zecd hit the same wall from the other side and rewrote its
+/// per-transaction reads the same way (upstream #249: `gettransaction` went
+/// from 4.6 s to an index seek on a 130k-transaction wallet).
+///
+/// Restricting each arm at the leaves instead turns every access into an index
+/// seek, and dropping the pools this database does not read means the other
+/// note tables are never opened at all.
+///
+/// **This mirrors `zcash_client_sqlite`'s own `v_received_outputs` term for
+/// term, so if a librustzcash bump changes that view this must change with
+/// it.** `the_base_table_scan_matches_the_view_it_replaces` is what catches
+/// that: it populates a real wallet database and requires the two to return
+/// identical rows.
+fn received_outputs_sql(pool: ShieldedPool) -> String {
     pool_output_codes(pool)
         .iter()
-        .map(|c| c.to_string())
+        .map(|&code| {
+            let (table, index) = pool_table(code);
+            format!(
+                "SELECT transaction_id, {index} AS output_index, account_id, value, memo, \
+                 {code} AS pool FROM {table}"
+            )
+        })
         .collect::<Vec<_>>()
-        .join(", ")
+        .join(" UNION ALL ")
+}
+
+/// The spend-record tables for a database's pools, as the body of a subquery
+/// with one column: `transaction_id`.
+///
+/// A row means "a note this wallet received was spent by that transaction",
+/// which is how [`fill_tx_fee_and_output`] decides whether a transaction's fee
+/// is the wallet's own to report.
+///
+/// Not account-scoped, matching the `v_transactions` lookup it replaces: a zkv
+/// database's wallet file holds exactly one account. A shard file holds several,
+/// so a fleet member has to add the predicate here (the note tables carry
+/// `account_id`; the spend tables reach it through their note).
+fn spent_outputs_sql(pool: ShieldedPool) -> String {
+    pool_output_codes(pool)
+        .iter()
+        .map(|&code| format!("SELECT transaction_id FROM {}", pool_spends_table(code)))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ")
+}
+
+/// The statement [`scan_memos_past_watermark`] runs.
+///
+/// A function rather than an inline `format!` so the differential test runs
+/// this exact text against a populated wallet database, rather than a
+/// transcription of it that could drift.
+fn scan_memos_sql(pool: ShieldedPool) -> String {
+    format!(
+        "SELECT COALESCE(MAX(n.memo, sn.memo), n.memo, sn.memo) AS memo,
+                t.mined_height AS mined_height,
+                b.time AS block_time,
+                fa.uuid AS from_account_uuid,
+                t.txid AS txid,
+                n.output_index AS output_index
+         FROM ({received}) n
+         JOIN accounts acct ON acct.id = n.account_id
+         JOIN transactions t ON t.id_tx = n.transaction_id
+         LEFT JOIN blocks b ON b.height = t.mined_height
+         LEFT JOIN sent_notes sn
+                ON sn.transaction_id = n.transaction_id
+               AND sn.output_pool = n.pool
+               AND sn.output_index = n.output_index
+         LEFT JOIN accounts fa ON fa.id = sn.from_account_id
+         WHERE acct.uuid = :account_uuid
+           AND (n.memo IS NOT NULL OR fa.uuid = :account_uuid)
+           AND (t.mined_height IS NOT NULL
+                OR t.expiry_height IS NULL
+                OR t.expiry_height = 0
+                OR t.expiry_height >= :tip)
+           AND (t.mined_height IS NULL
+                OR t.mined_height > :wm_height
+                OR (t.mined_height = :wm_height
+                    AND (t.txid > :wm_txid
+                         OR (t.txid = :wm_txid
+                             AND n.output_index > :wm_output_index))))
+         ORDER BY t.mined_height ASC NULLS LAST, t.txid ASC, n.output_index ASC",
+        received = received_outputs_sql(pool),
+    )
 }
 
 /// Query `data.sqlite` for this database's-pool text memos addressed to this
@@ -99,27 +214,22 @@ fn scan_memos_past_watermark(
     // the memo via a `COALESCE` scalar subquery against `sent_notes` because the
     // pool-4 received note was scanned with a NULL memo; that workaround is gone
     // now that the received note is populated at its own pool code.)
-    let mut stmt = conn.prepare(&format!(
-        "SELECT v.memo AS memo,
-                t.mined_height, t.block_time, v.from_account_uuid, v.txid, v.output_index
-         FROM v_tx_outputs v
-         JOIN v_transactions t ON t.txid = v.txid AND t.account_uuid = v.to_account_uuid
-         WHERE v.to_account_uuid = :account_uuid
-           AND v.output_pool IN ({pools})
-           AND (v.memo IS NOT NULL OR v.from_account_uuid = :account_uuid)
-           AND (t.mined_height IS NOT NULL
-                OR t.expiry_height IS NULL
-                OR t.expiry_height = 0
-                OR t.expiry_height >= :tip)
-           AND (t.mined_height IS NULL
-                OR t.mined_height > :wm_height
-                OR (t.mined_height = :wm_height
-                    AND (v.txid > :wm_txid
-                         OR (v.txid = :wm_txid
-                             AND v.output_index > :wm_output_index))))
-         ORDER BY t.mined_height ASC NULLS LAST, v.txid ASC, v.output_index ASC",
-        pools = pool_in_list(pool),
-    ))?;
+    // Written against the base tables rather than `v_tx_outputs` joined to
+    // `v_transactions`; see [`received_outputs_sql`] for why, and for what has
+    // to move if librustzcash changes those views.
+    //
+    // Three details carry over from the view rather than being simplifications
+    // of it. The memo is `MAX(memo)` over the received row and the `sent_notes`
+    // row for the same output, which for two values is "the larger of the two,
+    // ignoring NULL" (SQLite's scalar `MAX` is NULL if either argument is, so
+    // the `COALESCE` supplies the aggregate's NULL-skipping). `from_account_uuid`
+    // comes from that same `sent_notes` row, and is what makes an output the
+    // wallet created recognisable as a self-send. And the join to
+    // `v_transactions` was never a filter here: it emits a row for every
+    // (account, transaction) the account received in, which is every row this
+    // query can select, so reading `transactions` and `blocks` directly drops
+    // nothing.
+    let mut stmt = conn.prepare(&scan_memos_sql(pool))?;
 
     let decoded: Vec<DecodedRow> = stmt
         .query_and_then(
@@ -256,18 +366,77 @@ fn tip_and_fully_scanned(
     Ok((tip, fully_scanned))
 }
 
+/// The lowest height at which this account holds an output in its own pool
+/// whose transaction has not been fetched in full yet, so its memos are still
+/// unknown. `None` when every such transaction has been enhanced.
+///
+/// Scanning a compact block records the transaction through librustzcash's
+/// `put_tx_meta`, which leaves `transactions.raw` NULL; only the enhancement
+/// pass (`put_tx_data`, reached via `decrypt_and_store_transaction`) writes
+/// `raw`. Compact blocks carry no memos, so `raw IS NULL` is exactly "this
+/// transaction's memos are not known yet" -- and a not-yet-known memo reads as
+/// NULL, which [`scan_memos_past_watermark`] cannot distinguish from a genuine
+/// no-memo output. Such a row must therefore stay *above* the watermark until
+/// its memo lands; see [`promote_cutoff`].
+///
+/// Note this reads the base `transactions` table, which is where `raw` lives:
+/// `v_transactions` does not expose it. The outputs come from the base note
+/// tables too, for the reason [`received_outputs_sql`] gives.
+fn unenhanced_floor(
+    conn: &Connection,
+    account_uuid_bytes: &[u8],
+    pool: ShieldedPool,
+) -> anyhow::Result<Option<u32>> {
+    let floor: Option<i64> = conn.query_row(
+        &format!(
+            "SELECT MIN(t.mined_height)
+             FROM ({received}) n
+             JOIN accounts acct ON acct.id = n.account_id
+             JOIN transactions t ON t.id_tx = n.transaction_id
+             WHERE acct.uuid = :account_uuid
+               AND t.mined_height IS NOT NULL
+               AND t.raw IS NULL",
+            received = received_outputs_sql(pool),
+        ),
+        named_params! { ":account_uuid": account_uuid_bytes },
+        |row| row.get(0),
+    )?;
+    Ok(floor
+        .filter(|h| *h > 0)
+        .map(|h| u32::try_from(h).unwrap_or(u32::MAX)))
+}
+
 /// The highest block height a row may be at and still be safe to promote into
 /// the snapshot (advancing the watermark to it). A row qualifies only when it
-/// is both:
+/// is all of:
 ///
-/// * at least [`SAFE_DEPTH`] blocks below the chain `tip` (reorg safety), and
+/// * at least [`SAFE_DEPTH`] blocks below the chain `tip` (reorg safety),
 /// * at or below the wallet's `fully_scanned` frontier, so every block up to
 ///   the new watermark has already been scanned and no earlier memo (e.g. the
-///   genesis INIT) can be backfilled below the watermark afterward.
+///   genesis INIT) can be backfilled below the watermark afterward, and
+/// * below the lowest un-enhanced row ([`unenhanced_floor`]), so the watermark
+///   never passes a transaction whose memos have not been fetched yet.
+///
+/// The third clamp matters because scanning and enhancement are separate
+/// passes: a block can be fully scanned while the memos in it are still
+/// unknown (they arrive only with the full transaction). Promoting past such a
+/// row would drop it below the watermark, and the memo it later gains would
+/// never be read: silent data loss, and for a genesis INIT specifically, a
+/// database stuck "uninitialized". A wallet engine that enhances lazily in the
+/// background (rather than in the same pass as the scan) widens that window
+/// from rare to routine.
+///
+/// Holding the cutoff back only costs replay work: an un-promoted row stays in
+/// the live tail and is replayed on each read, so a transaction that never
+/// enhances slows reads down but never corrupts them.
 ///
 /// Pure so the boundary is unit-testable without a wallet DB.
-fn promote_cutoff(tip: u32, fully_scanned: u32) -> u32 {
-    tip.saturating_sub(SAFE_DEPTH).min(fully_scanned)
+fn promote_cutoff(tip: u32, fully_scanned: u32, unenhanced_from: Option<u32>) -> u32 {
+    let scanned_safe = tip.saturating_sub(SAFE_DEPTH).min(fully_scanned);
+    match unenhanced_from {
+        Some(h) => scanned_safe.min(h.saturating_sub(1)),
+        None => scanned_safe,
+    }
 }
 
 /// Load all of this database's-pool text memos addressed to its account and
@@ -369,7 +538,41 @@ pub fn load_state_with_height(
     // write dropped as NotInitialized. Clamping to `fully_scanned` guarantees
     // every block at or below the watermark has already been scanned, so no
     // earlier memo can appear after the fact.
-    let promote_cutoff = promote_cutoff(tip, fully_scanned);
+    //
+    // Being scanned is not enough on its own, though: compact blocks carry no
+    // memos, so a scanned row's memo arrives only when the full transaction is
+    // fetched. The cutoff is therefore also held below the lowest row still
+    // waiting for that fetch.
+    let unenhanced_from = unenhanced_floor(&conn, account_uuid_bytes.as_slice(), cfg.pool)?;
+    let promote_cutoff = promote_cutoff(tip, fully_scanned, unenhanced_from);
+
+    // A row waiting on its full transaction is routine while a sync is in
+    // flight, and self-clears when the enhancement pass reaches it. One that
+    // stays pending far behind the frontier is not: enhancement is stuck, and
+    // the snapshot has stopped promoting, so every read replays a tail that
+    // only grows. Reads stay correct either way, so this is a diagnostic, not
+    // an error.
+    if let Some(h) = unenhanced_from {
+        let scanned_safe = tip.saturating_sub(SAFE_DEPTH).min(fully_scanned);
+        if h.saturating_sub(1) < scanned_safe {
+            let held_back = scanned_safe - h.saturating_sub(1);
+            if held_back > SAFE_DEPTH {
+                tracing::warn!(
+                    unenhanced_height = h,
+                    held_back_blocks = held_back,
+                    "a transaction at height {h} has still not been fetched in full, so its \
+                     memos are unknown and the snapshot cannot promote past it; reads stay \
+                     correct but replay a growing tail. Re-running sync usually clears it",
+                );
+            } else {
+                tracing::debug!(
+                    unenhanced_height = h,
+                    held_back_blocks = held_back,
+                    "holding the promote cutoff below a transaction awaiting enhancement",
+                );
+            }
+        }
+    }
     let mut promotable: Vec<PromoteRow> = Vec::new();
     let mut tail: Vec<(String, WriteStatus, String, Option<u32>)> = Vec::new();
     for row in decoded {
@@ -952,15 +1155,26 @@ pub fn load_audit(db_name: &str, min_confs: u32) -> anyhow::Result<AuditResult> 
 
 /// Fill each entry's `fee` and `output_value` from the wallet DB.
 ///
-/// - **Fee** comes from `v_transactions.fee_paid`, but only when this wallet
-///   *built* the tx (its `account_balance_delta` is negative, i.e. we spent).
-///   A received tx may report a `fee_paid` that was paid by the *sender*, not
-///   us; showing it as our fee is the "output amount shows up as the fee" bug,
-///   so a received write leaves `fee` unset.
+/// - **Fee** comes from `transactions.fee`, but only when this wallet *built*
+///   the tx, which is to say only when it spent one of its own notes in it. A
+///   received tx may report a fee that was paid by the *sender*, not us;
+///   showing it as our fee is the "output amount shows up as the fee" bug, so
+///   a received write leaves `fee` unset.
+///
+///   The old form asked `v_transactions.account_balance_delta < 0` for this,
+///   which is the same question one step removed: the delta is negative exactly
+///   when the account spent more than it received, and a wallet that spends in
+///   its own transaction always pays the fee out of that difference. Asking
+///   whether it spent is both the intent the doc comment already stated and a
+///   query that can use an index, where summing the delta means aggregating
+///   every note in the wallet (see [`received_outputs_sql`]). The two answers
+///   differ only if a transaction both spends the wallet's notes and pays it
+///   more than the fee from outside, which zkv never builds and which would
+///   still be a transaction whose fee is ours.
 /// - **Output value** is the zatoshi `value` of this write's own shielded
-///   output (`v_tx_outputs`, matched on txid + output_index + pool). A plain
-///   zkv write is a zero-value output and stays `None`; a nonzero value means
-///   the write also moved ZEC (a tip/deposit broadcast with the memo).
+///   output, matched on txid + output index + pool. A plain zkv write is a
+///   zero-value output and stays `None`; a nonzero value means the write also
+///   moved ZEC (a tip/deposit broadcast with the memo).
 ///
 /// Entries with no resolvable txid (pending-from-`pending.toml`) are skipped.
 fn fill_tx_fee_and_output(
@@ -968,12 +1182,19 @@ fn fill_tx_fee_and_output(
     entries: &mut [HistoryEntry],
     pool: ShieldedPool,
 ) -> anyhow::Result<()> {
-    let mut tx_stmt =
-        conn.prepare("SELECT account_balance_delta, fee_paid FROM v_transactions WHERE txid = ?1")?;
+    let mut tx_stmt = conn.prepare(&format!(
+        "SELECT t.fee AS fee,
+                EXISTS (SELECT 1 FROM ({spends}) s WHERE s.transaction_id = t.id_tx) AS spent
+         FROM transactions t
+         WHERE t.txid = ?1",
+        spends = spent_outputs_sql(pool),
+    ))?;
     let mut out_stmt = conn.prepare(&format!(
-        "SELECT value FROM v_tx_outputs
-         WHERE txid = ?1 AND output_index = ?2 AND output_pool IN ({pools})",
-        pools = pool_in_list(pool),
+        "SELECT n.value
+         FROM ({received}) n
+         JOIN transactions t ON t.id_tx = n.transaction_id
+         WHERE t.txid = ?1 AND n.output_index = ?2",
+        received = received_outputs_sql(pool),
     ))?;
     // A single tx can carry several writes; cache its fee lookup by txid.
     let mut fee_cache: HashMap<String, Option<u64>> = HashMap::new();
@@ -986,15 +1207,15 @@ fn fill_tx_fee_and_output(
             None => {
                 let f = tx_stmt
                     .query_row([&blob], |row| {
-                        let delta: Option<i64> = row.get(0)?;
-                        let fee: Option<i64> = row.get(1)?;
-                        Ok((delta, fee))
+                        let fee: Option<i64> = row.get(0)?;
+                        let spent: bool = row.get(1)?;
+                        Ok((fee, spent))
                     })
                     .optional()?
-                    .and_then(|(delta, fee)| {
-                        // Outgoing (we spent) ⇒ the fee is ours to show.
-                        let outgoing = delta.unwrap_or(0) < 0;
-                        fee.filter(|f| outgoing && *f >= 0).map(|f| f as u64)
+                    .and_then(|(fee, spent)| {
+                        // We spent one of our own notes in it, so we built it,
+                        // so the fee is ours to show.
+                        fee.filter(|f| spent && *f >= 0).map(|f| f as u64)
                     });
                 fee_cache.insert(e.txid.clone(), f);
                 f
@@ -1032,14 +1253,15 @@ mod tests {
     #[test]
     fn promote_cutoff_uses_reorg_margin_when_fully_synced() {
         // Steady state: the fully-scanned frontier is at (or above) the chain
-        // tip, so the only binding constraint is the SAFE_DEPTH reorg margin.
+        // tip and every transaction has been enhanced, so the only binding
+        // constraint is the SAFE_DEPTH reorg margin.
         let tip = 4_000_000;
         assert_eq!(
-            promote_cutoff(tip, tip),
+            promote_cutoff(tip, tip, None),
             tip - SAFE_DEPTH,
             "a caught-up wallet promotes everything older than SAFE_DEPTH",
         );
-        assert_eq!(promote_cutoff(tip, tip + 50), tip - SAFE_DEPTH);
+        assert_eq!(promote_cutoff(tip, tip + 50, None), tip - SAFE_DEPTH);
     }
 
     #[test]
@@ -1051,16 +1273,176 @@ mod tests {
         // past the still-unscanned INIT block and lose it forever.
         let tip = 4_000_000;
         let fully_scanned = 3_900_000; // far below tip - SAFE_DEPTH
-        assert_eq!(promote_cutoff(tip, fully_scanned), fully_scanned);
-        assert!(promote_cutoff(tip, fully_scanned) < tip - SAFE_DEPTH);
+        assert_eq!(promote_cutoff(tip, fully_scanned, None), fully_scanned);
+        assert!(promote_cutoff(tip, fully_scanned, None) < tip - SAFE_DEPTH);
     }
 
     #[test]
     fn promote_cutoff_is_zero_before_any_scan() {
         // Brand-new wallet: nothing scanned, so nothing is promotable yet (the
         // whole history stays in the live tail and is replayed in memory).
-        assert_eq!(promote_cutoff(4_000_000, 0), 0);
-        assert_eq!(promote_cutoff(0, 0), 0);
+        assert_eq!(promote_cutoff(4_000_000, 0, None), 0);
+        assert_eq!(promote_cutoff(0, 0, None), 0);
+    }
+
+    #[test]
+    fn promote_cutoff_stays_below_the_lowest_unenhanced_row() {
+        // A block can be scanned while the memos in it are still unknown:
+        // compact blocks carry no memos, so a row's memo arrives only when the
+        // full transaction is fetched. Promoting past such a row would push it
+        // below the watermark, and the memo it later gains would never be read.
+        let tip = 4_000_000;
+        let unenhanced = 3_500_000;
+        assert_eq!(
+            promote_cutoff(tip, tip, Some(unenhanced)),
+            unenhanced - 1,
+            "the cutoff stops one block short of the un-enhanced row",
+        );
+        // The clamp only ever holds the cutoff back, never pushes it forward:
+        // an un-enhanced row above the scanned/reorg-safe frontier is already
+        // in the live tail and changes nothing.
+        assert_eq!(
+            promote_cutoff(tip, tip, Some(tip - 5)),
+            tip - SAFE_DEPTH,
+            "an un-enhanced row inside the reorg margin is not the binding constraint",
+        );
+    }
+
+    /// One fixture row: `(txid, mined_height, enhanced, to_account, pool)`.
+    /// `enhanced` stands in for a non-NULL `transactions.raw`, and a `None`
+    /// height for a transaction still in the mempool.
+    type FixtureRow<'a> = (&'a [u8], Option<i64>, bool, &'a [u8], i64);
+
+    /// A stand-in for the two `data.sqlite` relations [`unenhanced_floor`]
+    /// reads, shaped like librustzcash's: the `transactions` base table (for
+    /// `raw`, which `v_transactions` does not expose) and the `v_tx_outputs`
+    /// view, here a plain table since only its columns matter to a SELECT.
+    /// Stand-ins for the base tables [`unenhanced_floor`] reads: only the
+    /// columns it touches. That the query agrees with the librustzcash view it
+    /// replaced is covered by
+    /// [`super::differential::the_unenhanced_floor_matches_the_view_it_replaces`],
+    /// which runs against a populated real wallet database; this fixture is for
+    /// enumerating the selection rules cheaply.
+    fn wallet_db_fixture(rows: &[FixtureRow<'_>]) -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE accounts (id INTEGER PRIMARY KEY, uuid BLOB NOT NULL);
+             CREATE TABLE transactions (
+                 id_tx INTEGER PRIMARY KEY, txid BLOB NOT NULL, mined_height INTEGER, raw BLOB
+             );
+             CREATE TABLE sapling_received_notes (
+                 transaction_id INTEGER, output_index INTEGER, account_id INTEGER,
+                 value INTEGER, memo BLOB
+             );
+             CREATE TABLE orchard_received_notes (
+                 transaction_id INTEGER, action_index INTEGER, account_id INTEGER,
+                 value INTEGER, memo BLOB
+             );
+             CREATE TABLE ironwood_received_notes (
+                 transaction_id INTEGER, action_index INTEGER, account_id INTEGER,
+                 value INTEGER, memo BLOB
+             );",
+        )
+        .unwrap();
+        let mut accounts: Vec<&[u8]> = Vec::new();
+        for (i, (txid, mined_height, enhanced, to_account, pool)) in rows.iter().enumerate() {
+            let id_tx = i as i64 + 1;
+            if !accounts.contains(to_account) {
+                accounts.push(to_account);
+                conn.execute(
+                    "INSERT INTO accounts (id, uuid) VALUES (?1, ?2)",
+                    rusqlite::params![accounts.len() as i64, to_account],
+                )
+                .unwrap();
+            }
+            let account_id = accounts.iter().position(|a| a == to_account).unwrap() as i64 + 1;
+            conn.execute(
+                "INSERT INTO transactions (id_tx, txid, mined_height, raw) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![id_tx, txid, mined_height, enhanced.then(|| vec![0u8; 4])],
+            )
+            .unwrap();
+            let (table, index_col) = pool_table(*pool);
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table} (transaction_id, {index_col}, account_id, value, memo)
+                     VALUES (?1, 0, ?2, 0, NULL)"
+                ),
+                rusqlite::params![id_tx, account_id],
+            )
+            .unwrap();
+        }
+        conn
+    }
+
+    const US: &[u8] = b"our-account-uuid";
+    const THEM: &[u8] = b"other-account-id";
+
+    #[test]
+    fn unenhanced_floor_is_none_when_everything_is_enhanced() {
+        let conn = wallet_db_fixture(&[
+            (b"tx1", Some(100), true, US, 3),
+            (b"tx2", Some(200), true, US, 4),
+        ]);
+        assert_eq!(
+            unenhanced_floor(&conn, US, ShieldedPool::Orchard).unwrap(),
+            None,
+            "nothing is waiting on a full-transaction fetch",
+        );
+    }
+
+    #[test]
+    fn unenhanced_floor_finds_the_lowest_pending_row() {
+        let conn = wallet_db_fixture(&[
+            (b"tx1", Some(100), true, US, 3),
+            (b"tx2", Some(300), false, US, 3),
+            (b"tx3", Some(250), false, US, 4), // lower, and an Ironwood output
+            (b"tx4", Some(400), false, US, 3),
+        ]);
+        assert_eq!(
+            unenhanced_floor(&conn, US, ShieldedPool::Orchard).unwrap(),
+            Some(250),
+            "an Orchard database counts both pool codes 3 and 4",
+        );
+    }
+
+    #[test]
+    fn unenhanced_floor_ignores_other_accounts_pools_and_unmined_rows() {
+        let conn = wallet_db_fixture(&[
+            (b"tx1", Some(10), false, THEM, 3), // another account
+            (b"tx2", Some(20), false, US, 2),   // Sapling, not our pool
+            (b"tx3", None, false, US, 3),       // still in the mempool
+            (b"tx4", Some(900), false, US, 3),  // the only row that counts
+        ]);
+        assert_eq!(
+            unenhanced_floor(&conn, US, ShieldedPool::Orchard).unwrap(),
+            Some(900),
+        );
+        // ... and a Sapling database sees the mirror image.
+        assert_eq!(
+            unenhanced_floor(&conn, US, ShieldedPool::Sapling).unwrap(),
+            Some(20),
+        );
+    }
+
+    #[test]
+    fn unenhanced_floor_on_an_empty_wallet_is_none() {
+        // MIN() over no rows is SQL NULL, not an error or a zero.
+        let conn = wallet_db_fixture(&[]);
+        assert_eq!(
+            unenhanced_floor(&conn, US, ShieldedPool::Orchard).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn promote_cutoff_with_unenhanced_genesis_promotes_nothing() {
+        // The pathological case this clamp exists for: the very first block
+        // holding one of our outputs is scanned but not yet enhanced. Nothing
+        // may promote until it is, so the genesis INIT cannot be buried.
+        assert_eq!(promote_cutoff(4_000_000, 4_000_000, Some(1)), 0);
+        // Saturating: a row at height 0 is not a real mined height, but the
+        // arithmetic must not underflow regardless.
+        assert_eq!(promote_cutoff(4_000_000, 4_000_000, Some(0)), 0);
     }
 
     #[test]
@@ -1110,5 +1492,467 @@ mod tests {
         // Wrong length and non-hex are rejected.
         assert!(txid_blob_from_hex("dead").is_none());
         assert!(txid_blob_from_hex(&"zz".repeat(32)).is_none());
+    }
+}
+
+/// The base-table rewrites, checked against the librustzcash views they
+/// replace on a real wallet database.
+///
+/// zkv's read path used to select from `v_tx_outputs` joined to
+/// `v_transactions`, and those views aggregate every note in the wallet, so
+/// every read paid a whole-history aggregation (see [`received_outputs_sql`]).
+/// The replacements are written against the base tables and must answer
+/// *identically*, so each test here runs both and requires the same rows. A
+/// librustzcash bump that changes either view fails the build rather than
+/// quietly changing what zkv reads.
+///
+/// The fixture is a real `data.sqlite` created through
+/// [`crate::data::open_wallet_db`] (so the schema and the views are the ones
+/// shipping), populated by direct inserts rather than by scanning a chain.
+#[cfg(test)]
+mod differential {
+    use super::*;
+    use rusqlite::params;
+
+    const US: [u8; 16] = [1u8; 16];
+    const THEM: [u8; 16] = [2u8; 16];
+
+    /// The query zkv ran before the rewrite, kept here as the reference the new
+    /// one is required to agree with.
+    fn legacy_scan_sql(pool: ShieldedPool) -> String {
+        let pools = pool_output_codes(pool)
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "SELECT v.memo AS memo,
+                    t.mined_height, t.block_time, v.from_account_uuid, v.txid, v.output_index
+             FROM v_tx_outputs v
+             JOIN v_transactions t ON t.txid = v.txid AND t.account_uuid = v.to_account_uuid
+             WHERE v.to_account_uuid = :account_uuid
+               AND v.output_pool IN ({pools})
+               AND (v.memo IS NOT NULL OR v.from_account_uuid = :account_uuid)
+               AND (t.mined_height IS NOT NULL
+                    OR t.expiry_height IS NULL
+                    OR t.expiry_height = 0
+                    OR t.expiry_height >= :tip)
+               AND (t.mined_height IS NULL
+                    OR t.mined_height > :wm_height
+                    OR (t.mined_height = :wm_height
+                        AND (v.txid > :wm_txid
+                             OR (v.txid = :wm_txid
+                                 AND v.output_index > :wm_output_index))))
+             ORDER BY t.mined_height ASC NULLS LAST, v.txid ASC, v.output_index ASC"
+        )
+    }
+
+    type ScanRow = (
+        Option<Vec<u8>>,
+        Option<i64>,
+        Option<i64>,
+        Option<Vec<u8>>,
+        Vec<u8>,
+        i64,
+    );
+
+    fn run_scan(conn: &Connection, sql: &str, wm: &snapshot::Watermark) -> Vec<ScanRow> {
+        let mut stmt = conn.prepare(sql).unwrap();
+        stmt.query_map(
+            named_params! {
+                ":account_uuid": &US[..],
+                ":tip": 400,
+                ":wm_height": wm.height,
+                ":wm_txid": &wm.txid,
+                ":wm_output_index": wm.output_index,
+            },
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
+        )
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect()
+    }
+
+    fn txid(n: u8) -> Vec<u8> {
+        vec![n; 32]
+    }
+
+    /// A populated wallet database covering every shape the read path
+    /// distinguishes: a self-send (the wallet created the output, so it has a
+    /// `sent_notes` row and a spend), a plain receive, an unenhanced row, an
+    /// unmined row, another account's note, another pool's note, a memo-less
+    /// output, and a self-send whose received memo has not been backfilled.
+    fn fixture() -> (tempfile::TempDir, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data.sqlite");
+        drop(crate::data::open_wallet_db(&path, crate::network::Network::Test).unwrap());
+        let conn = Connection::open(&path).unwrap();
+
+        for (id, uuid) in [(1i64, US), (2, THEM)] {
+            conn.execute(
+                "INSERT INTO accounts (id, uuid, account_kind, uivk, birthday_height)
+                 VALUES (?1, ?2, 1, ?3, 1)",
+                params![id, &uuid[..], format!("uivk{id}")],
+            )
+            .unwrap();
+        }
+        for (height, time) in [(100i64, 1_000i64), (200, 2_000)] {
+            conn.execute(
+                "INSERT INTO blocks (height, hash, time, sapling_tree) VALUES (?1, ?2, ?3, ?4)",
+                params![height, vec![height as u8; 32], time, Vec::<u8>::new()],
+            )
+            .unwrap();
+        }
+
+        // (id_tx, txid byte, mined_height, enhanced, expiry, fee)
+        type TxRow = (i64, u8, Option<i64>, bool, Option<i64>, Option<i64>);
+        let txs: &[TxRow] = &[
+            (1, 0xA1, Some(100), true, Some(150), Some(1_000)),
+            (2, 0xB2, Some(200), true, Some(250), Some(2_000)),
+            (3, 0xC3, Some(200), false, Some(250), None),
+            (4, 0xD4, None, true, Some(500), Some(4_000)),
+            (5, 0xE5, Some(100), true, Some(150), None),
+            (6, 0xF6, Some(100), true, Some(150), None),
+            (7, 0x17, Some(100), true, Some(150), None),
+            (8, 0x28, Some(100), true, Some(150), Some(8_000)),
+            (9, 0x39, Some(100), true, Some(150), None),
+        ];
+        for (id, b, mined, enhanced, expiry, fee) in txs {
+            conn.execute(
+                "INSERT INTO transactions
+                     (id_tx, txid, block, mined_height, expiry_height, raw, fee, min_observed_height)
+                 VALUES (?1, ?2, ?3, ?3, ?4, ?5, ?6, 1)",
+                params![
+                    id,
+                    txid(*b),
+                    mined,
+                    expiry,
+                    enhanced.then(|| vec![0u8; 4]),
+                    fee
+                ],
+            )
+            .unwrap();
+        }
+
+        // (table, transaction_id, index, account_id, memo)
+        let notes: &[(&str, i64, i64, i64, Option<&str>)] = &[
+            // A self-send: the wallet created this output (sent_notes below).
+            ("orchard", 1, 0, 1, Some("one")),
+            // A plain receive, in the Ironwood pool.
+            ("ironwood", 2, 1, 1, Some("two")),
+            // Mined but not yet enhanced: memo unknown.
+            ("orchard", 3, 0, 1, None),
+            // Unmined, still within its expiry.
+            ("orchard", 4, 0, 1, Some("four")),
+            // Another account's note.
+            ("orchard", 5, 0, 2, Some("them")),
+            // Another pool: invisible to an Ironwood database.
+            ("sapling", 6, 0, 1, Some("sapling")),
+            // No memo and not a self-send: excluded by the read path.
+            ("orchard", 7, 0, 1, None),
+            // A self-send whose received memo was not backfilled, so the memo
+            // has to come off the sent_notes row.
+            ("orchard", 8, 0, 1, None),
+            // The note tx1 spends, so the wallet "spent in" tx1.
+            ("orchard", 9, 0, 1, Some("prior")),
+        ];
+        for (i, (pool, tx, idx, acct, memo)) in notes.iter().enumerate() {
+            let id = i as i64 + 1;
+            let (table, index_col, extra_cols, extra_vals) = match *pool {
+                "sapling" => ("sapling_received_notes", "output_index", ", rcm", ", X''"),
+                "orchard" => (
+                    "orchard_received_notes",
+                    "action_index",
+                    ", rho, rseed",
+                    ", X'', X''",
+                ),
+                _ => (
+                    "ironwood_received_notes",
+                    "action_index",
+                    ", rho, rseed, note_version",
+                    ", X'', X'', 3",
+                ),
+            };
+            conn.execute(
+                &format!(
+                    "INSERT INTO {table}
+                         (id, transaction_id, {index_col}, account_id, diversifier, value,
+                          is_change, memo{extra_cols})
+                     VALUES (?1, ?2, ?3, ?4, X'', ?5, 0, ?6{extra_vals})"
+                ),
+                params![id, tx, idx, acct, 100_000 + id, memo.map(|m| m.as_bytes())],
+            )
+            .unwrap();
+        }
+
+        // The wallet created tx1's and tx8's outputs, and spent a note in tx1.
+        // The third row is an output the wallet *sent* to somebody else in tx1,
+        // with a memo and no received note of its own: visible to the view,
+        // invisible to the read path.
+        conn.execute(
+            "INSERT INTO sent_notes
+                 (id, transaction_id, output_pool, output_index, from_account_id, value, memo)
+             VALUES (1, 1, 3, 0, 1, 100001, ?1),
+                    (2, 8, 3, 0, 1, 100008, ?2),
+                    (3, 1, 3, 7, 1, 500000, ?3)",
+            params![&b"one"[..], &b"eight"[..], &b"outgoing"[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO orchard_received_note_spends (orchard_received_note_id, transaction_id)
+             VALUES (9, 1)",
+            [],
+        )
+        .unwrap();
+        (dir, conn)
+    }
+
+    /// A history entry carrying only what [`fill_tx_fee_and_output`] reads.
+    /// `HistoryEntry` has no `Default`, and spelling out every field at three
+    /// call sites would bury the two that matter.
+    fn entry_for(blob: &[u8], output_index: u32) -> HistoryEntry {
+        HistoryEntry {
+            op: crate::protocol::Op::Set,
+            key: String::new(),
+            value: None,
+            height: None,
+            timestamp: None,
+            txid: hex_txid(blob),
+            output_index,
+            signature: None,
+            seq: None,
+            signer: None,
+            verified: None,
+            status: crate::protocol::HistoryStatus::Confirmed { confirmations: 1 },
+            memo: None,
+            fee: None,
+            output_value: None,
+        }
+    }
+
+    #[test]
+    fn the_base_table_scan_matches_the_view_it_replaces() {
+        let (_dir, conn) = fixture();
+        for pool in [ShieldedPool::Ironwood, ShieldedPool::Sapling] {
+            for wm in [
+                snapshot::Watermark::default(),
+                snapshot::Watermark {
+                    height: 100,
+                    txid: txid(0xA1),
+                    output_index: 0,
+                },
+                snapshot::Watermark {
+                    height: 200,
+                    txid: txid(0xFF),
+                    output_index: 0,
+                },
+            ] {
+                let new = run_scan(&conn, &scan_memos_sql(pool), &wm);
+                let old = run_scan(&conn, &legacy_scan_sql(pool), &wm);
+                assert_eq!(
+                    new, old,
+                    "pool {pool:?}, watermark height {}: the base-table scan must return \
+                     exactly what the view returned",
+                    wm.height,
+                );
+            }
+        }
+    }
+
+    /// The rows the reference query is actually asked to produce, so a fixture
+    /// that accidentally selects nothing cannot make the comparison vacuous.
+    #[test]
+    fn the_scan_sees_the_writes_the_fixture_planted() {
+        let (_dir, conn) = fixture();
+        let rows = run_scan(
+            &conn,
+            &scan_memos_sql(ShieldedPool::Ironwood),
+            &snapshot::Watermark::default(),
+        );
+        let memos: Vec<Option<String>> = rows
+            .iter()
+            .map(|r| {
+                r.0.as_ref()
+                    .map(|m| String::from_utf8_lossy(m).into_owned())
+            })
+            .collect();
+        assert_eq!(
+            memos,
+            vec![
+                // Chain order is (height, txid, output index), and these three
+                // share a height, so they come back in txid order: 0x28, 0x39,
+                // 0xA1. tx8's received memo is NULL and the sent_notes row
+                // supplies it.
+                Some("eight".into()),
+                Some("prior".into()),
+                Some("one".into()),
+                Some("two".into()),
+                Some("four".into()),
+            ],
+            "mined rows in chain order, then the unmined one",
+        );
+        // The self-sends are attributed to this account; the plain receive is not.
+        assert_eq!(rows[0].3.as_deref(), Some(&US[..]));
+        assert_eq!(rows[2].3.as_deref(), Some(&US[..]));
+        assert_eq!(rows[3].3, None);
+        // Another account's note, another pool's note, the unenhanced row and
+        // the memo-less receive are all absent.
+        assert!(!memos.contains(&Some("them".into())));
+        assert!(!memos.contains(&Some("sapling".into())));
+    }
+
+    #[test]
+    fn the_unenhanced_floor_matches_the_view_it_replaces() {
+        let (_dir, conn) = fixture();
+        for pool in [ShieldedPool::Ironwood, ShieldedPool::Sapling] {
+            let pools = pool_output_codes(pool)
+                .iter()
+                .map(|c| c.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let old: Option<i64> = conn
+                .query_row(
+                    &format!(
+                        "SELECT MIN(tx.mined_height)
+                         FROM v_tx_outputs v
+                         JOIN transactions tx ON tx.txid = v.txid
+                         WHERE v.to_account_uuid = :account_uuid
+                           AND v.output_pool IN ({pools})
+                           AND tx.mined_height IS NOT NULL
+                           AND tx.raw IS NULL",
+                    ),
+                    named_params! { ":account_uuid": &US[..] },
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let new = unenhanced_floor(&conn, &US, pool).unwrap();
+            assert_eq!(
+                new,
+                old.filter(|h| *h > 0).map(|h| h as u32),
+                "pool {pool:?}",
+            );
+        }
+        // And it is the height the fixture planted, not a vacuous None.
+        assert_eq!(
+            unenhanced_floor(&conn, &US, ShieldedPool::Ironwood).unwrap(),
+            Some(200),
+        );
+    }
+
+    #[test]
+    fn the_fee_and_output_lookups_match_the_views_they_replace() {
+        let (_dir, conn) = fixture();
+        let pool = ShieldedPool::Ironwood;
+        let pools = "3, 4";
+        for (tx_byte, output_index) in [(0xA1u8, 0i64), (0xB2, 1), (0x28, 0)] {
+            let blob = txid(tx_byte);
+
+            let old_fee: Option<u64> = conn
+                .query_row(
+                    "SELECT account_balance_delta, fee_paid FROM v_transactions WHERE txid = ?1",
+                    [&blob],
+                    |row| {
+                        let delta: Option<i64> = row.get(0)?;
+                        let fee: Option<i64> = row.get(1)?;
+                        Ok((delta, fee))
+                    },
+                )
+                .optional()
+                .unwrap()
+                .and_then(|(delta, fee)| {
+                    let outgoing = delta.unwrap_or(0) < 0;
+                    fee.filter(|f| outgoing && *f >= 0).map(|f| f as u64)
+                });
+
+            let mut entries = vec![entry_for(&blob, output_index as u32)];
+            fill_tx_fee_and_output(&conn, &mut entries, pool).unwrap();
+            assert_eq!(
+                entries[0].fee, old_fee,
+                "tx {tx_byte:#x}: the fee must match what the view reported",
+            );
+
+            let old_value: Option<i64> = conn
+                .query_row(
+                    &format!(
+                        "SELECT value FROM v_tx_outputs
+                         WHERE txid = ?1 AND output_index = ?2 AND output_pool IN ({pools})"
+                    ),
+                    params![&blob, output_index],
+                    |r| r.get(0),
+                )
+                .optional()
+                .unwrap();
+            assert_eq!(
+                entries[0].output_value,
+                old_value.filter(|v| *v > 0).map(|v| v as u64),
+                "tx {tx_byte:#x}: the output value must match what the view reported",
+            );
+        }
+
+        // Not vacuous: tx1 is a self-send, so its fee is the wallet's own and
+        // is reported; tx2 is a plain receive, so its fee is the sender's.
+        let mut entries = vec![entry_for(&txid(0xA1), 0), entry_for(&txid(0xB2), 1)];
+        fill_tx_fee_and_output(&conn, &mut entries, pool).unwrap();
+        assert_eq!(entries[0].fee, Some(1_000));
+        assert_eq!(entries[1].fee, None);
+    }
+
+    /// The pending-GC set must be exactly the mined transactions whose memo the
+    /// read path can see, which is what lets a pending entry be dropped without
+    /// the state flapping.
+    ///
+    /// The reference is the old view query plus one predicate,
+    /// `to_account_uuid IS NOT NULL`, which keeps the rows the wallet
+    /// *received*. Without it the view also matches an output the wallet sent
+    /// to a third party, which has no received note and which the read path
+    /// therefore cannot see; the fixture plants one (tx10) so this is exercised
+    /// rather than assumed. Dropping a pending entry on the strength of such a
+    /// row would drop it while the write was still invisible.
+    #[test]
+    fn the_pending_gc_set_is_what_the_read_path_can_see() {
+        let (_dir, conn) = fixture();
+        let mut old: Vec<String> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT v.txid FROM v_tx_outputs v
+                     JOIN v_transactions t ON t.txid = v.txid
+                     WHERE t.mined_height IS NOT NULL
+                       AND v.memo IS NOT NULL
+                       AND v.to_account_uuid IS NOT NULL",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |r| r.get::<_, Vec<u8>>(0))
+                .unwrap()
+                .filter_map(|r| r.ok())
+                .filter_map(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+                .map(|a| zcash_primitives::transaction::TxId::from_bytes(a).to_string())
+                .collect::<Vec<_>>();
+            rows
+        };
+        let mut new: Vec<String> = crate::internal::sync::mined_with_memo_txids(&conn)
+            .unwrap()
+            .into_iter()
+            .collect();
+        old.sort();
+        new.sort();
+        assert_eq!(new, old);
+        assert!(!new.is_empty(), "the fixture must plant memos to compare");
+    }
+
+    /// `HistoryEntry`'s txid field is the display (reversed) hex, which is what
+    /// `fill_tx_fee_and_output` converts back to a blob.
+    fn hex_txid(blob: &[u8]) -> String {
+        let arr = <[u8; 32]>::try_from(blob).unwrap();
+        zcash_primitives::transaction::TxId::from_bytes(arr).to_string()
     }
 }

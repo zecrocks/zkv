@@ -51,10 +51,11 @@ wildcards = "deny"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
-# Empty on purpose. The Ironwood (NU6.3) crate set used to be pinned to git
-# revisions of zcash/librustzcash, zcash/orchard, and
-# zcash/incrementalmerkletree via [patch.crates-io] in the workspace Cargo.toml,
-# because the wallet crates' crates.io releases still linked the pre-Ironwood
-# consensus crates. All of it is published now, the patches are gone, and the
-# whole dependency graph resolves from crates.io, so no git source is allowed.
-allow-git = []
+# Nothing comes from git. The Ironwood (NU6.3) crate set used to be pinned to
+# git revisions of zcash/librustzcash, zcash/orchard, and
+# zcash/incrementalmerkletree via [patch.crates-io] in the workspace
+# Cargo.toml, because the wallet crates' crates.io releases still linked the
+# pre-Ironwood consensus crates; all of it is published now and the patches are
+# gone. zecd, the wallet engine, is `=0.8.0-rc2` from crates.io as well, so
+# there is no `allow-git` at all and a new git source is a build failure rather
+# than a judgement call.

@@ -72,6 +72,22 @@ pub struct WalletConfig {
     /// from, and written to, this pool. Chosen at creation and fixed
     /// thereafter. Absent in `keys.toml` (legacy databases) means Orchard.
     pub pool: ShieldedPool,
+    /// This database's Unified Full Viewing Key, in its encoded `uview…`
+    /// form, pinned so the wallet engine can check that `data.sqlite` still
+    /// holds the account this `keys.toml` describes.
+    ///
+    /// Absent means the database has not been adopted by the engine yet; see
+    /// [`crate::engine::migrate`], which derives it from the seed (or, for a
+    /// watch-only database, from the stored address) and writes it here.
+    ///
+    /// Nothing secret: a viewing key is the public identifier of the database,
+    /// and the `zkv1…` address is the same key under a different label.
+    pub ufvk: Option<String>,
+    /// Which wallet engine serves this database; see [`WalletEngine`].
+    pub engine: WalletEngine,
+    /// The cached shard directory name for a fleet member (`shard-0000`).
+    /// A hint only, refreshed by `crate::fleet::locate_member`.
+    shard: Option<String>,
     seed_ciphertext: Option<String>,
     db_dir: PathBuf,
 }
@@ -194,10 +210,25 @@ impl WalletConfig {
         pool: ShieldedPool,
     ) -> anyhow::Result<()> {
         let dir = ensure_db_dir(db_name)?;
+        Self::init_admin_at(&dir, mnemonic, birthday, network, pool)
+    }
+
+    /// [`WalletConfig::init_admin`] against an explicit directory, rather than
+    /// resolving one from the process-wide data directory. The name-taking
+    /// form is the normal entry point; this one exists so the config layer can
+    /// be exercised without reaching for global state.
+    pub(crate) fn init_admin_at(
+        dir: &Path,
+        mnemonic: &Mnemonic,
+        birthday: BlockHeight,
+        network: Network,
+        pool: ShieldedPool,
+    ) -> anyhow::Result<()> {
+        std::fs::create_dir_all(dir)?;
 
         // Generate the fresh age identity (the `security-theater-key` file).
         let identity = age::x25519::Identity::generate();
-        write_identity(&dir, &identity)?;
+        write_identity(dir, &identity)?;
 
         // Wrap the mnemonic under the identity (obfuscation only, not a
         // security boundary; the protection is the file permissions, see the
@@ -207,7 +238,7 @@ impl WalletConfig {
         let ciphertext = encrypt_mnemonic(recipients.iter().map(|r| r.as_ref() as _), mnemonic)?;
 
         write_config(
-            &dir,
+            dir,
             ConfigEncoding {
                 mnemonic: Some(ciphertext),
                 network: Some(network.name().to_string()),
@@ -215,6 +246,14 @@ impl WalletConfig {
                 role: Some("admin".to_owned()),
                 zkv_address: None,
                 pool: pool_encoding(pool),
+                // Filled in when the wallet engine first opens the database,
+                // so that pinning has exactly one implementation rather than
+                // one here and another for databases that predate the field.
+                ufvk: None,
+                // An admin database always has a node of its own: it holds a
+                // spending key, and the fleet is watch-only.
+                engine: None,
+                shard: None,
             },
         )
     }
@@ -227,10 +266,38 @@ impl WalletConfig {
         network: Network,
         zkv_address: &str,
         pool: ShieldedPool,
+        engine: WalletEngine,
     ) -> anyhow::Result<()> {
         let dir = ensure_db_dir(db_name)?;
+        Self::init_watch_at(&dir, birthday, network, zkv_address, pool, engine)
+    }
+
+    /// [`WalletConfig::init_watch`] against an explicit directory; see
+    /// [`WalletConfig::init_admin_at`].
+    pub(crate) fn init_watch_at(
+        dir: &Path,
+        birthday: BlockHeight,
+        network: Network,
+        zkv_address: &str,
+        pool: ShieldedPool,
+        engine: WalletEngine,
+    ) -> anyhow::Result<()> {
+        std::fs::create_dir_all(dir)?;
+        // A fleet member has no `data.sqlite` of its own to derive the viewing
+        // key from later, and the resolver needs it to find the member's
+        // account in a shard, so it is pinned at creation from the address.
+        // For an own-node database this stays absent and adoption fills it in.
+        let ufvk = if engine.is_standalone() {
+            None
+        } else {
+            Some(
+                crate::protocol::parse_zkv_addr(zkv_address)?
+                    .ufvk
+                    .encode(&network),
+            )
+        };
         write_config(
-            &dir,
+            dir,
             ConfigEncoding {
                 mnemonic: None,
                 network: Some(network.name().to_string()),
@@ -238,20 +305,68 @@ impl WalletConfig {
                 role: Some("watch".to_owned()),
                 zkv_address: Some(zkv_address.to_owned()),
                 pool: pool_encoding(pool),
+                // See `init_admin`: the engine pins this on first open.
+                ufvk,
+                engine: engine.label().map(str::to_owned),
+                shard: None,
             },
         )
+    }
+
+    /// Record which engine serves this database, preserving every other field.
+    /// The transition it drives is described in `crate::fleet`.
+    pub fn set_engine(&mut self, engine: WalletEngine) -> anyhow::Result<()> {
+        self.engine = engine;
+        if engine.is_standalone() {
+            // Placement is meaningless once the database is off the fleet, and
+            // a stale hint would send a later rejoin at the wrong shard first.
+            self.shard = None;
+        }
+        rewrite_config(&self.db_dir, self.to_encoding())
+    }
+
+    /// The cached shard directory name, if this member has been located before.
+    pub fn shard(&self) -> Option<&str> {
+        self.shard.as_deref()
+    }
+
+    /// Drop the remembered shard, after something moved every member's account
+    /// (a rebuild). The next read re-derives it.
+    pub fn forget_shard(&mut self) -> anyhow::Result<()> {
+        if self.shard.is_none() {
+            return Ok(());
+        }
+        self.shard = None;
+        rewrite_config(&self.db_dir, self.to_encoding())
+    }
+
+    /// Remember where this member's account was found. A hint, so a failure to
+    /// persist it is not worth failing the read that produced it.
+    pub fn cache_shard(&mut self, shard: &str) -> anyhow::Result<()> {
+        if self.shard.as_deref() == Some(shard) {
+            return Ok(());
+        }
+        self.shard = Some(shard.to_owned());
+        rewrite_config(&self.db_dir, self.to_encoding())
     }
 
     /// Read the config for an existing database by name.
     pub fn read(db_name: &str) -> anyhow::Result<Self> {
         let dir = db_dir(db_name)?;
-        let path = dir.join(KEYS_FILE);
-        if !path.exists() {
+        if !dir.join(KEYS_FILE).exists() {
             anyhow::bail!(
                 "no database named {db_name:?} (no keys.toml found in {})",
                 dir.display()
             );
         }
+        Self::read_at(&dir)
+    }
+
+    /// [`WalletConfig::read`] against an explicit directory; see
+    /// [`WalletConfig::init_admin_at`].
+    pub(crate) fn read_at(dir: &Path) -> anyhow::Result<Self> {
+        let dir = dir.to_path_buf();
+        let path = dir.join(KEYS_FILE);
         let mut buf = String::new();
         BufReader::new(File::open(&path)?).read_to_string(&mut buf)?;
         let cfg: ConfigEncoding = toml::from_str(&buf)?;
@@ -277,15 +392,111 @@ impl WalletConfig {
         // Legacy or unset pool means Orchard, matching pre-pool-field databases.
         let pool = pool_from_label(cfg.pool.as_deref());
 
+        let engine = WalletEngine::from_label(cfg.engine.as_deref());
+        // A fleet member is watch-only with a known viewing key, both by
+        // construction upstream (the fleet serves UFVKs, never seeds) and
+        // because the resolver finds its account by matching that key. Refuse
+        // rather than resolve: a hand-edited file that claims otherwise would
+        // otherwise send reads to whichever account came first in a shard.
+        if !engine.is_standalone() {
+            if role == Role::Admin {
+                anyhow::bail!(
+                    "{}: an admin database cannot be a fleet member (the fleet is \
+                     watch-only); remove the `engine` line to serve it from its own node",
+                    path.display(),
+                );
+            }
+            if cfg.ufvk.is_none() && cfg.zkv_address.is_none() {
+                anyhow::bail!(
+                    "{}: a fleet member needs its viewing key (`ufvk`) or its `zkv_address` \
+                     to find its account in a shard",
+                    path.display(),
+                );
+            }
+        }
+
         Ok(Self {
             network,
             role,
             birthday,
             zkv_address: cfg.zkv_address,
             pool,
+            ufvk: cfg.ufvk,
+            engine,
+            shard: cfg.shard,
             seed_ciphertext: cfg.mnemonic,
             db_dir: dir,
         })
+    }
+
+    /// A config that describes no database, for the shared scan's node.
+    ///
+    /// A fleet node serves many databases and holds none: it needs a network
+    /// (which it carries separately) and nothing else off this struct. Every
+    /// other field is deliberately the emptiest value that cannot be mistaken
+    /// for real: watch-only, no address, no key, no seed, no directory.
+    pub(crate) fn placeholder(network: Network) -> Self {
+        Self {
+            network,
+            role: Role::Watch,
+            birthday: network
+                .activation_height(NetworkUpgrade::Sapling)
+                .expect("Sapling activation height known"),
+            zkv_address: None,
+            pool: ShieldedPool::Orchard,
+            ufvk: None,
+            engine: WalletEngine::Unset,
+            shard: None,
+            seed_ciphertext: None,
+            db_dir: PathBuf::new(),
+        }
+    }
+
+    /// The directory this config was read from, which is also where the
+    /// wallet database, the snapshot and the age identity live.
+    pub fn db_dir(&self) -> &Path {
+        &self.db_dir
+    }
+
+    /// This config as it is written to `keys.toml`.
+    ///
+    /// Every field round-trips, so rewriting a config that was read back
+    /// cannot silently drop one. That matters because the file has two
+    /// readers now: zkv, and the wallet engine's zecd node, whose own writer
+    /// keeps only the fields it knows about. zkv writing the file itself is
+    /// what keeps `role`, `pool` and `zkv_address` alive.
+    fn to_encoding(&self) -> ConfigEncoding {
+        ConfigEncoding {
+            mnemonic: self.seed_ciphertext.clone(),
+            network: Some(self.network.name().to_string()),
+            birthday: Some(u32::from(self.birthday)),
+            role: Some(
+                match self.role {
+                    Role::Admin => "admin",
+                    Role::Watch => "watch",
+                }
+                .to_owned(),
+            ),
+            zkv_address: self.zkv_address.clone(),
+            pool: pool_encoding(self.pool),
+            ufvk: self.ufvk.clone(),
+            engine: self.engine.label().map(str::to_owned),
+            shard: self.shard.clone(),
+        }
+    }
+
+    /// Record this database's viewing key in `keys.toml`, preserving every
+    /// other field.
+    ///
+    /// Writing it from zkv, rather than letting the engine's node fill it in
+    /// on first open, is deliberate: zecd pins the key it finds if the field
+    /// is empty, and its writer rewrites the file through a struct that has no
+    /// `role`, `pool` or `zkv_address`, so those would be dropped. Getting
+    /// there first means the field is already populated and that path never
+    /// runs.
+    pub fn pin_ufvk(&mut self, ufvk: &str) -> anyhow::Result<()> {
+        self.ufvk = Some(ufvk.to_owned());
+        rewrite_config(&self.db_dir, self.to_encoding())
     }
 
     /// Read the age identity and unwrap the stored seed.
@@ -326,6 +537,99 @@ struct ConfigEncoding {
     /// `"sapling"` or `"orchard"`; absent means Orchard (legacy databases).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pool: Option<String>,
+    /// The pinned `uview…` viewing key; absent until the wallet engine adopts
+    /// the database. Shares its name and encoding with the field zecd reads,
+    /// so one file satisfies both readers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    ufvk: Option<String>,
+    /// Which wallet engine serves this database: absent (or anything
+    /// unrecognised) means its own per-database node, `"fleet"` means it is a
+    /// member of the shared per-network fleet, and `"fleet-pending"` means it
+    /// is converting (see [`WalletEngine`]).
+    ///
+    /// Deliberately *not* under `deny_unknown_fields`, and deliberately
+    /// meaningless to a pre-fleet build: an older zkv reading a member's
+    /// `keys.toml` ignores this, looks for the wallet files that are no longer
+    /// there, and reports the database as having no key imported. That is the
+    /// documented downgrade boundary, and `zkv fleet leave` from a current
+    /// build undoes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    engine: Option<String>,
+    /// Which shard directory currently holds this member's account, cached so
+    /// a read does not have to open every shard to find it. Purely a hint: it
+    /// is re-derived whenever it does not hold, and it is never authoritative
+    /// (the shard databases are, exactly as upstream keeps placement out of
+    /// its manifests).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    shard: Option<String>,
+}
+
+/// Which wallet engine serves a database.
+///
+/// Only watch-only databases can be anything but [`WalletEngine::Own`]: the
+/// fleet is watch-only by construction upstream, and an admin database needs
+/// its own node to spend from anyway.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WalletEngine {
+    /// No choice recorded, which is every database created before the shared
+    /// scan existed. Served from its own node exactly like [`WalletEngine::Own`],
+    /// and the one state a watch-only database is enrolled *out of*
+    /// automatically: an absent field means nobody has decided, where `own`
+    /// means somebody decided against.
+    Unset,
+    /// A node of this database's own, with the database directory as its
+    /// datadir. Every admin database, and any watch-only database that opted
+    /// out with `--standalone`.
+    Own,
+    /// Converting from [`WalletEngine::Own`] to [`WalletEngine::Fleet`]: the
+    /// manifest is written and the shard is catching up, while reads and syncs
+    /// still use this database's own files, so it never goes dark. See
+    /// `crate::fleet` for the transition.
+    FleetPending,
+    /// A member of the shared per-network fleet: no wallet files of its own,
+    /// its account living in a shard database that many members share.
+    Fleet,
+}
+
+impl WalletEngine {
+    fn label(self) -> Option<&'static str> {
+        match self {
+            WalletEngine::Unset => None,
+            WalletEngine::Own => Some("own"),
+            WalletEngine::FleetPending => Some("fleet-pending"),
+            WalletEngine::Fleet => Some("fleet"),
+        }
+    }
+
+    fn from_label(label: Option<&str>) -> WalletEngine {
+        match label {
+            None => WalletEngine::Unset,
+            Some("fleet") => WalletEngine::Fleet,
+            Some("fleet-pending") => WalletEngine::FleetPending,
+            // `own`, or a spelling from a future build. Both mean "serve it
+            // from its own node", which is the mode whose files are where zkv
+            // has always kept them, and both mean a choice was recorded, so
+            // neither is enrolled automatically.
+            Some(_) => WalletEngine::Own,
+        }
+    }
+
+    /// Whether the database's wallet files live in a shard rather than in its
+    /// own directory. False while pending, which is the point of that state.
+    pub fn is_fleet_member(self) -> bool {
+        matches!(self, WalletEngine::Fleet)
+    }
+
+    /// Whether this database has anything to do with the shared scan at all.
+    pub fn is_standalone(self) -> bool {
+        matches!(self, WalletEngine::Unset | WalletEngine::Own)
+    }
+
+    /// Whether nobody has yet chosen how this database is served, which is the
+    /// only state automatic enrolment acts on.
+    pub fn is_unset(self) -> bool {
+        matches!(self, WalletEngine::Unset)
+    }
 }
 
 /// `keys.toml` encoding for a pool. Orchard is the implied default and is
@@ -374,6 +678,37 @@ fn write_config(dir: &Path, cfg: ConfigEncoding) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Replace an existing `keys.toml` with new contents.
+///
+/// [`write_config`] deliberately refuses to overwrite, so that creating a
+/// database can never clobber one that is already there. Rewriting an existing
+/// config is a different operation and needs to be safe in a different way:
+/// the file holds the wrapped seed, so a half-written one is a lost wallet.
+/// This writes a sibling temp file with the same `0600` mode and renames it
+/// over the original, which is atomic within a directory, so a reader sees
+/// either the old file or the new one.
+fn rewrite_config(dir: &Path, cfg: ConfigEncoding) -> anyhow::Result<()> {
+    let path = dir.join(KEYS_FILE);
+    let tmp = dir.join(format!("{KEYS_FILE}.tmp{}", std::process::id()));
+    let s = toml::to_string(&cfg)
+        .map_err::<anyhow::Error, _>(|_| anyhow!("could not serialize config"))?;
+
+    // A leftover temp file from a crashed rewrite would otherwise block this
+    // one forever, and its contents are of no value: the real file is intact.
+    let _ = fs::remove_file(&tmp);
+    let mut f = create_private_file(&tmp)
+        .map_err(|e| anyhow!("could not create {}: {e}", tmp.display()))?;
+    write!(f, "{s}")?;
+    f.sync_all()?;
+    drop(f);
+
+    fs::rename(&tmp, &path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        anyhow!("could not replace {}: {e}", path.display())
+    })?;
+    Ok(())
+}
+
 fn write_identity(dir: &Path, identity: &age::x25519::Identity) -> anyhow::Result<()> {
     let path = dir.join(IDENTITY_FILE);
     let mut f = create_private_file(&path)?;
@@ -390,7 +725,7 @@ fn write_identity(dir: &Path, identity: &age::x25519::Identity) -> anyhow::Resul
 /// best-effort: if it fails (e.g. a read-only filesystem) the legacy path is
 /// returned so the seed still decrypts. When neither file exists the current
 /// path is returned so the read error names the file we now expect.
-fn identity_path(dir: &Path) -> PathBuf {
+pub(crate) fn identity_path(dir: &Path) -> PathBuf {
     let current = dir.join(IDENTITY_FILE);
     if current.exists() {
         return current;
@@ -628,5 +963,173 @@ mod tests {
         assert!(dir.join(LEGACY_IDENTITY_FILE).exists());
 
         fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod engine_field_tests {
+    use super::*;
+    use zcash_protocol::consensus::BlockHeight;
+
+    /// A real `zkvtest1…` address. Enrolling in the shared scan pins the
+    /// viewing key out of the address, so this cannot be a placeholder.
+    fn address() -> String {
+        let ufvk = zcash_keys::keys::UnifiedSpendingKey::from_seed(
+            &Network::Test,
+            &[7u8; 64],
+            zip32::AccountId::ZERO,
+        )
+        .unwrap()
+        .to_unified_full_viewing_key();
+        crate::protocol::encode_zkv_addr(&ufvk, &Network::Test, ShieldedPool::Ironwood, 3_000_000)
+            .unwrap()
+    }
+
+    fn watch_dir(engine: WalletEngine) -> (tempfile::TempDir, WalletConfig, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let addr = address();
+        WalletConfig::init_watch_at(
+            dir.path(),
+            BlockHeight::from_u32(3_000_000),
+            Network::Test,
+            &addr,
+            ShieldedPool::Ironwood,
+            engine,
+        )
+        .unwrap();
+        let cfg = WalletConfig::read_at(dir.path()).unwrap();
+        (dir, cfg, addr)
+    }
+
+    /// The default is unchanged and unwritten: a database with a wallet engine
+    /// of its own produces the same `keys.toml` it always did, so nothing about
+    /// existing databases or older builds moves.
+    #[test]
+    fn an_unset_engine_writes_no_new_lines() {
+        let (dir, cfg, _addr) = watch_dir(WalletEngine::Unset);
+        assert_eq!(cfg.engine, WalletEngine::Unset);
+        assert_eq!(cfg.shard(), None);
+        let text = std::fs::read_to_string(dir.path().join(KEYS_FILE)).unwrap();
+        assert!(!text.contains("engine"), "{text}");
+        assert!(!text.contains("shard"), "{text}");
+    }
+
+    /// A file written before the field existed reads as its own engine, which
+    /// is what every database on disk today is.
+    #[test]
+    fn a_pre_fleet_keys_file_reads_as_unset() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(KEYS_FILE),
+            "network = \"test\"\nbirthday = 100\nrole = \"watch\"\nzkv_address = \"z\"\n",
+        )
+        .unwrap();
+        let cfg = WalletConfig::read_at(dir.path()).unwrap();
+        assert_eq!(cfg.engine, WalletEngine::Unset);
+        assert!(
+            cfg.engine.is_unset(),
+            "nobody has chosen for this database yet"
+        );
+    }
+
+    /// An `engine` spelling from a future build must not be guessed at: serving
+    /// the database from its own files is the reading whose data is where this
+    /// build expects it.
+    #[test]
+    fn an_unknown_engine_spelling_falls_back_to_own() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(KEYS_FILE),
+            "network = \"test\"\nbirthday = 100\nrole = \"watch\"\n\
+             zkv_address = \"z\"\nengine = \"warp-drive\"\n",
+        )
+        .unwrap();
+        let cfg = WalletConfig::read_at(dir.path()).unwrap();
+        assert_eq!(cfg.engine, WalletEngine::Own);
+        // And it counts as a recorded choice, so a database is never enrolled
+        // behind the user's back on the strength of not being understood.
+        assert!(!cfg.engine.is_unset());
+    }
+
+    /// `--standalone` records a choice, and that is what stops the automatic
+    /// enrolment treating the database as one nobody has decided about.
+    #[test]
+    fn an_explicit_own_engine_is_written_and_read_back() {
+        let (dir, cfg, _addr) = watch_dir(WalletEngine::Own);
+        assert_eq!(cfg.engine, WalletEngine::Own);
+        assert!(!cfg.engine.is_unset());
+        let text = std::fs::read_to_string(dir.path().join(KEYS_FILE)).unwrap();
+        assert!(text.contains("engine = \"own\""), "{text}");
+    }
+
+    #[test]
+    fn the_engine_and_shard_fields_round_trip() {
+        let (dir, mut cfg, addr) = watch_dir(WalletEngine::Fleet);
+        assert_eq!(cfg.engine, WalletEngine::Fleet);
+        // A member pins its viewing key at creation: it has no wallet database
+        // of its own to derive one from later, and the resolver needs it.
+        assert!(cfg.ufvk.is_some());
+
+        cfg.cache_shard("shard-0007").unwrap();
+        let reread = WalletConfig::read_at(dir.path()).unwrap();
+        assert_eq!(reread.engine, WalletEngine::Fleet);
+        assert_eq!(reread.shard(), Some("shard-0007"));
+        // Every other field survives the rewrite, which is the property that
+        // matters: the file has two readers and the other one drops what it
+        // does not know.
+        assert_eq!(reread.role, Role::Watch);
+        assert_eq!(reread.pool, ShieldedPool::Ironwood);
+        assert_eq!(reread.zkv_address.as_deref(), Some(addr.as_str()));
+        assert_eq!(reread.birthday, BlockHeight::from_u32(3_000_000));
+
+        // Pending is a distinct state, and it is not a member: that is what
+        // keeps a converting database reading from its own files.
+        let mut cfg = reread;
+        cfg.set_engine(WalletEngine::FleetPending).unwrap();
+        let reread = WalletConfig::read_at(dir.path()).unwrap();
+        assert_eq!(reread.engine, WalletEngine::FleetPending);
+        assert!(!reread.engine.is_fleet_member());
+
+        // Leaving drops the placement hint, so a later rejoin does not start by
+        // looking in a shard this database is no longer in.
+        let mut cfg = reread;
+        cfg.set_engine(WalletEngine::Own).unwrap();
+        let reread = WalletConfig::read_at(dir.path()).unwrap();
+        assert_eq!(reread.engine, WalletEngine::Own);
+        assert_eq!(reread.shard(), None);
+    }
+
+    /// The fleet is watch-only upstream, and the resolver finds a member's
+    /// account by its viewing key. A file claiming otherwise is refused rather
+    /// than resolved, because resolving it would hand reads whichever account
+    /// happened to come first in a shard.
+    #[test]
+    fn an_incoherent_member_is_refused_rather_than_resolved() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(KEYS_FILE),
+            "network = \"test\"\nbirthday = 1\nrole = \"admin\"\nmnemonic = \"x\"\n\
+             engine = \"fleet\"\n",
+        )
+        .unwrap();
+        // `WalletConfig` has no `Debug` on purpose (it carries the wrapped
+        // seed), so the error is taken by matching rather than by `unwrap_err`.
+        let err = match WalletConfig::read_at(dir.path()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("an admin fleet member must be refused"),
+        };
+        assert!(err.contains("watch-only"), "{err}");
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join(KEYS_FILE),
+            "network = \"test\"\nbirthday = 1\nrole = \"watch\"\nengine = \"fleet\"\n",
+        )
+        .unwrap();
+        let err = match WalletConfig::read_at(dir.path()) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("a member with no viewing key must be refused"),
+        };
+        assert!(err.contains("viewing key"), "{err}");
     }
 }

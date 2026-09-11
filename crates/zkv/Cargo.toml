@@ -2,7 +2,7 @@
 name = "zcash_zkv"
 version = "0.2.0"
 edition = "2021"
-rust-version = "1.88"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 description = "A Redis-style key-value store backed by Zcash Orchard memos."
 repository = "https://github.com/zecrocks/zkv"
@@ -53,26 +53,23 @@ toml = "0.8"
 uuid = { version = "1", features = ["v4", "serde"] }
 
 # Async + network
-futures-util = "0.3"
 hyper-util = { version = "0.1", features = ["tokio"] }
 tokio = { workspace = true, features = ["fs", "io-std", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-socks = "0.5"
 tonic = { version = "0.14", features = ["gzip", "tls-ring", "tls-webpki-roots"] }
 tower = { workspace = true }
-prost = "0.14"
 
 # Key derivation
 bip0039 = { version = "0.12", features = ["std", "all-languages"] }
-bip32 = { version = "=0.6.0-pre.1", default-features = false, features = ["secp256k1-ffi"] }
 ripemd = "0.1"
 nonempty = { version = "0.11", default-features = false }
 
-# Zcash
-# orchard 0.15 is released, so the exact `=0.15.0-pre.2` pin (which existed only
-# to match the git rev upstream librustzcash used to be patched to) is gone.
-orchard = { version = "0.15", default-features = false }
-pczt = "0.9"
-sapling = { package = "sapling-crypto", version = "0.7" }
+# Zcash. `orchard` and `sapling` are the Zakura Common forks, renamed back onto
+# their upstream keys so no `use` path changes; they are pinned `=1.0.0` because
+# the wallet layer pins them that way. See the Zcash block in the workspace
+# Cargo.toml for the whole arrangement and the lockstep rule.
+orchard = { package = "zakura-orchard", version = "=1.0.0", default-features = false }
+sapling = { package = "zakura-sapling-crypto", version = "=1.0.0" }
 transparent = { workspace = true }
 zcash_address = { workspace = true }
 zcash_client_backend = { workspace = true }
@@ -82,9 +79,7 @@ zcash_keys = { workspace = true }
 # tree transitively via sapling-crypto / orchard / zcash_client_backend).
 zcash_note_encryption = { workspace = true }
 zcash_primitives = { workspace = true }
-zcash_proofs = { version = "0.30", features = ["bundled-prover"] }
 zcash_protocol = { workspace = true }
-zcash_script = "0.4"
 zip32 = { workspace = true }
 zip321 = { workspace = true }
 
@@ -126,14 +121,18 @@ tauri = { version = "2", optional = true }
 tauri-plugin-dialog = { version = "2", optional = true }
 tauri-plugin-opener = { version = "2", optional = true }
 
-# Cross-platform advisory file locking (flock / LockFileEx). Used to keep two
-# zkv processes from operating on the same database concurrently. Default
-# `sync` feature only; no async runtime backend.
-fs4 = "1.1.0"
-
 # Logging
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true, optional = true }
+
+# The wallet engine (chain sync, wallet DB, spend + broadcast), reachable only
+# from `crate::engine`: nothing else in the crate may name a `zecd::` path.
+zecd = { workspace = true }
+
+[dev-dependencies]
+# Scratch data directories for tests that write a real keys.toml and read it
+# back (the wallet engine's adoption round-trip, in particular).
+tempfile = "3"
 
 [features]
 default = ["transparent-inputs", "default-subscriber", "cli", "gui"]

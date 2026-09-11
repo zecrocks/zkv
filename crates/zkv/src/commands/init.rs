@@ -15,7 +15,7 @@ use crate::{
     internal::{
         protocol::{encode_zkv_addr, zkv_verifying_pubkey, InitState},
         state::{load_state, INIT_CONFIRMATIONS},
-        sync::run_sync_with_status,
+        sync::read_sync_with_status,
         write::{broadcast_init, prepare_init},
     },
     remote::ConnectionArgs,
@@ -132,8 +132,7 @@ impl Command {
         // Pin the wallet birthday at tip − safety buffer: a brand-new wallet has
         // no history before now. Refuses a stale/unreachable tip so the birthday
         // is never anchored to a stale view of the chain.
-        let mut client = connection.connect(params).await?;
-        let birthday = crate::internal::sync::near_tip_birthday(&mut client, params).await?;
+        let birthday = crate::internal::sync::near_tip_birthday(&connection, params).await?;
 
         WalletConfig::init_admin(&name, &mnemonic, birthday.height(), params, pool)?;
 
@@ -236,8 +235,14 @@ impl Command {
 
         eprintln!("Database {name:?} already exists; checking whether it needs initialization…");
 
-        // Sync before deciding anything: the on-chain state is authoritative.
-        run_sync_with_status(name, &connection, false).await?;
+        // Sync before deciding anything: the on-chain state is authoritative,
+        // so this does not take the read tolerance's skip. The engine is built
+        // and dropped here rather than shared with `poll_for_init` below: each
+        // holds the datadir lock for its own span, and they run in sequence.
+        {
+            let engine = crate::engine::Engine::open(name, &connection)?;
+            read_sync_with_status(&engine, name, &connection, cfg.network, None).await?;
+        }
         let result = load_state(name, INIT_CONFIRMATIONS, false)?;
         if let Some(warning) = result.version.upgrade_warning() {
             eprintln!("warning: {warning}");
@@ -497,6 +502,13 @@ async fn poll_for_init(
     connection: &ConnectionArgs,
     timeout: Duration,
 ) -> anyhow::Result<()> {
+    // One engine for the whole poll, used for both the sync and the
+    // broadcast. It cannot be mixed with the legacy `run_sync` here: the node
+    // holds zecd's datadir lock, `run_sync` takes zkv's on the same `.lock`
+    // file, and each would then wait on the other. Building it also adopts the
+    // database, which is what a first `zkv init` on an old data directory
+    // needs anyway.
+    let engine = zkv::engine::Engine::open(db_name, connection)?;
     let start = Instant::now();
     let mut last_phase: Option<PollPhase> = None;
     let mut pending_init_txid: Option<String> = None;
@@ -521,7 +533,7 @@ async fn poll_for_init(
             );
         }
 
-        run_sync_with_status(db_name, connection, false).await?;
+        engine.sync_to_tip(None).await?;
 
         let result = load_state(db_name, INIT_CONFIRMATIONS, false)?;
         match result.init {
@@ -618,7 +630,7 @@ async fn poll_for_init(
                     format_zec_decimal(bal.spendable),
                     network.ticker(),
                 ));
-                match broadcast_init(db_name, connection).await {
+                match broadcast_init(db_name, &engine).await {
                     Ok(txid) => {
                         ui::arrow(format!("INIT broadcast: {txid}"));
                         pending_init_txid = Some(txid);

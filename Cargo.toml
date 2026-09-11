@@ -49,7 +49,11 @@ zkv = { package = "zcash_zkv", path = "crates/zkv", version = "0.2.0" }
 anyhow = "1"
 clap = { version = "4.5", features = ["derive", "string"] }
 hex = "0.4"
-rand = { version = "0.8", default-features = false }
+# rand 0.10 is the generation the Zakura Common stack speaks: `WalletDb` takes a
+# `rand_core 0.10` RNG, so zkv's own RNG use follows it (see the Zcash block
+# below). `thread_rng` implies `std`/`sys_rng`, which is what
+# `rand::rngs::SysRng` (the OS RNG the wallet database is opened with) needs.
+rand = { version = "0.10", default-features = false, features = ["thread_rng"] }
 rusqlite = { version = "0.37", features = ["time", "uuid"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -59,30 +63,111 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 axum = { version = "0.7", default-features = false, features = ["tokio", "http1", "json"] }
 
-# Zcash ecosystem: version-locked as a set.
+# Zcash ecosystem: version-locked as a set, on the **Zakura Common** forks.
 #
-# Ironwood (NU6.3 / V6 transaction) support, now entirely from stable crates.io
-# releases. The whole librustzcash set used to be repointed at upstream
-# `zcash/librustzcash` main via [patch.crates-io] because the consensus-layer
-# crates were only available as `-pre` releases and the wallet crates' crates.io
-# builds still depended on the older stable ones. Upstream has since published
-# the real releases (zcash_primitives 0.30, zcash_keys 0.16, zcash_transparent
-# 0.10, zcash_address 0.13, zcash_protocol 0.10.4, plus orchard 0.15 and
-# shardtree 0.7), so the git patches are gone: see the note where
-# [patch.crates-io] used to live. The wallet crates have now reached their
-# final 0.24 / 0.22 releases too, so nothing here is a pre-release any more.
-# The released line also carries the NU6.3 mainnet activation height
-# (3_428_143, 2026-07-28), which the old `-pre` git pin lacked.
+# Since 2026-09 the librustzcash crypto and wallet crates come from Zakura
+# Common (https://zakura.com/announcements/zakura-common/), published on
+# crates.io under `zakura-*` names: the proving/protocol family from
+# `zakura-core/common` (`zakura-orchard`, `zakura-primitives`, `zakura-keys`,
+# `zakura-sapling-crypto`, plus the halo2/pasta/bellman/jubjub stack beneath
+# them) and the wallet layer from `zakura-core/wallet-libraries`
+# (`zakura-client-backend`, `zakura-client-sqlite`). The forks keep
+# librustzcash's *library* names, so each dependency key stays the upstream one
+# via `package = "zakura-..."` and no `use` path in zkv's sources changed: the
+# switch is a Cargo-level rename plus the `rand 0.10` migration the forks
+# brought (see `rand` above, and `data.rs`).
+#
+# zkv follows because zecd does (its own Zcash block is the source of truth for
+# these versions). The two share `WalletDb` handle types across the
+# `crate::engine` seam, and a crates.io `orchard` beside `zakura-orchard` is a
+# second, incompatible type family that compiles fine right up until the two
+# meet at a call site. `scripts/verify-zakura-graph.sh` (the `zakura-graph` CI
+# job) reads `cargo metadata` and fails if the resolved graph carries a
+# crates.io original of a forked crate or a duplicate `zakura-*` version.
+#
+# Two pinning rules, both inherited from zakura-core/wallet-libraries:
+#
+# - The crypto family is pinned `=1.0.0` because the published wallet layer
+#   (`0.1.0-rc4`) pins it that way itself. `zakura-core/common` has since
+#   published 1.1.0 and 1.2.0, but the wallet layer still requires `=1.0.0` on
+#   every crypto crate it uses, so taking a newer family waits on a wallet-layer
+#   release; relaxing the requirement here alone changes nothing.
+# - The crates the forks still take from crates.io stay on crates.io here too
+#   (`zcash_protocol`, `zcash_address`, `zcash_transparent`,
+#   `zcash_note_encryption`, `zip32`, `zip321`), at requirements compatible with
+#   the forks', so exactly one copy of each enters the graph. Their types cross
+#   the fork boundary, so a divergent pin surfaces as a type error naming two
+#   identical-looking paths.
+#
+# IMPORTANT: bump this set only in lockstep with zecd's pins, never alone. MSRV
+# is 1.91, the floor every `zakura-*` crate declares. Ironwood (NU6.3 / V6) is
+# carried by the forked line exactly as the published one carried it, mainnet
+# activation height 3_428_143 included; the forks' sources are the upstream
+# `zcash_client_sqlite 0.22` / `orchard 0.15` / `zcash_primitives 0.30` trees
+# rewired onto the forked crypto, so the API is the one zkv was already built
+# against.
 transparent = { package = "zcash_transparent", version = "0.10" }
 zcash_address = "0.13"
 zcash_note_encryption = "0.4.2"
-zcash_client_backend = { version = "0.24", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt"] }
-zcash_client_sqlite = { version = "0.22", features = ["unstable", "orchard", "serde"] }
-zcash_keys = { version = "0.16.1", features = ["orchard", "unstable"] }
-zcash_primitives = "0.30"
+zcash_client_backend = { package = "zakura-client-backend", version = "0.1.0-rc4", features = ["lightwalletd-tonic-tls-webpki-roots", "orchard", "pczt"] }
+zcash_client_sqlite = { package = "zakura-client-sqlite", version = "0.1.0-rc4", features = ["unstable", "orchard", "serde"] }
+zcash_keys = { package = "zakura-keys", version = "=1.0.0", features = ["orchard", "unstable"] }
+zcash_primitives = { package = "zakura-primitives", version = "=1.0.0" }
 zcash_protocol = { version = "0.10.4", features = ["local-consensus"] }
 zip32 = "0.2"
 zip321 = "0.9"
+
+# The wallet engine. zecd is a Zcash wallet server that ships an embeddable
+# node (`zecd::node::NodeBuilder` / `Node::call`) over this exact Zcash set, so
+# cargo unifies the two dependency trees for free. zkv talks to it only through
+# `crate::engine`, never elsewhere.
+#
+# `default-features = false` drops zecd's own axum HTTP servers and clap CLI:
+# an embedder wants the node and the library cores, not the daemon.
+#
+# IMPORTANT: zecd's pins are the source of truth for the Zcash versions above.
+# Bumping either side means bumping both together, or cargo resolves two
+# incompatible copies of the wallet crates and the shared `data.sqlite` handle
+# types stop unifying. That is doubly true now that both sides are on the
+# Zakura Common forks, where the mismatch is between two crates with the same
+# library name.
+#
+# Portable as of 0.7.0-rc2, which splits `lock.rs`'s `hostname()` per platform.
+# Until then it called the Unix-only `libc::gethostname` ungated, on the path
+# `NodeBuilder::prepare` takes to lock the datadir, so the crate did not compile
+# for Windows at all and the dependency had to be target-gated. That was the one
+# thing blocking the port; upstream also added a `windows-cross` CI job so it
+# cannot silently regress.
+#
+# The four asks the port left open landed in 0.7.0-rc3 (upstream #219), and zkv
+# depends on all of them: `chain_probe::{account_birthday, tip_status}` with
+# the supported `chain` slice behind them (birthday pinning, which is the one
+# thing a node cannot serve because it must happen before the wallet exists),
+# `[spend] min_split_output_value` + `target_note_count` (the change-split
+# floor), `SyncState::chain_tip` (sync progress), and
+# `lock::{is_datadir_locked, datadir_lock_path}` (so a held datadir is a typed
+# error rather than a message match).
+#
+# WHICH ZECD. The 0.8.0 line (the port was first built on the released 0.7.0):
+# ChainHub (one shared upstream connection per endpoint), the multi-wallet
+# fleet, SOCKS5 for the node's own dialing, the h2 load-shed fix
+# (upstream #237 / #238), the Zakura Common switch (#244) that the Zcash block
+# above follows, and the fleet API #270 answered (`Node::wallet_location`,
+# per-member `imported`/`import_error`, a public `fleet::write_manifest`).
+#
+# The published `0.8.0-rc1` was cut from `88338ef`, before the forks landed and
+# before the fleet was gated behind `[fleet] enabled`, so pinning it would have
+# tested something 0.8.0 will not be. **rc2 is that line**, from crates.io, with
+# the same Zakura pins zkv carries (`zakura-*`, the crypto family `=1.0.0`, the
+# wallet layer `0.1.0-rc4`, `rand 0.10`, MSRV 1.91), so no git source is
+# involved anywhere in the graph.
+#
+# Pin the exact rc while the fleet's manifest format and RPCs carry no
+# compatibility guarantee: `=0.8.0-rc2`, so nothing in an experimental upstream
+# surface moves under zkv unnoticed. Move it deliberately and re-run the whole
+# gate; `crates/zkv/src/engine/config.rs`'s canaries are what say where an
+# upstream default changed.
+zecd = { version = "=0.8.0-rc2", default-features = false }
 
 # NOTE: there is deliberately no [patch.crates-io] section any more.
 #
@@ -95,9 +180,9 @@ zip321 = "0.9"
 # zcash_protocol 0.10.4, pczt 0.9, orchard 0.15, shardtree 0.7 (carrying the
 # checkpoint-retention APIs and the `clear_flags` checkpoint-pruning panic fix),
 # and the zcash_client_backend 0.24 / zcash_client_sqlite 0.22 wallet crates
-# that depend on them. Upstream librustzcash main no longer patches anything
-# either, so neither do we, and `deny.toml` no longer allow-lists any git
-# source.
+# that depend on them, and which the Zakura Common forks above are forks of.
+# Upstream librustzcash main no longer patches anything either, so neither do
+# we, and `deny.toml` now allows no git source at all.
 #
 # If a future pre-release cycle needs git pins again, they must live here: a
 # [patch] only takes effect from the workspace root.

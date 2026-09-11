@@ -8,7 +8,8 @@
 //! cargo run -p zkv --example verify_signature
 //! ```
 
-use rand::{rngs::OsRng, RngCore};
+use rand::rand_core::UnwrapErr;
+use rand::{rngs::SysRng, Rng as _};
 use secp256k1::{Secp256k1, SecretKey};
 
 use zkv::protocol::{sign_command, signed_payload, verify_command, Op};
@@ -24,7 +25,7 @@ fn main() {
     // Generate an ad-hoc keypair for the demo.
     let secp = Secp256k1::new();
     let mut sk_bytes = [0u8; 32];
-    OsRng.fill_bytes(&mut sk_bytes);
+    UnwrapErr(SysRng).fill_bytes(&mut sk_bytes);
     let sk = SecretKey::from_slice(&sk_bytes).expect("32 random bytes");
     let pk = sk.public_key(&secp);
 

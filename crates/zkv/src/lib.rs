@@ -81,6 +81,14 @@ pub mod config;
 /// **Unstable.** See the crate-level docs for the stability contract.
 pub mod data;
 
+/// Which files a database's reads should open, and the shared-scan (fleet)
+/// layout that answers it for watch-only databases.
+///
+/// **Unstable**, and mostly internal: a library consumer asks `db::Database`,
+/// which resolves all of this for them. It is public so the `zkv` binary's
+/// `fleet` subcommand can report and manage the arrangement.
+pub mod fleet;
+
 // NOTE: no outer `///` doc here on purpose, same as `shallow` above: the
 // module's inner `//!` docs use bare intra-doc links (`Network`) that must
 // resolve in the module's own scope, and an outer doc comment would force the
@@ -94,6 +102,12 @@ pub mod network;
 ///
 /// **Unstable.** See the crate-level docs for the stability contract.
 pub mod internal;
+
+/// The wallet engine: the single seam onto the embedded `zecd` node that
+/// scans the chain, owns `data.sqlite`, spends, and broadcasts.
+///
+/// **Unstable.** See the module docs.
+pub mod engine;
 
 /// `lightwalletd` connection arguments (server choice + direct/SOCKS5).
 ///

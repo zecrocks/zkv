@@ -183,6 +183,12 @@ impl Server<'_> {
     }
 
     pub async fn connect_direct(&self) -> anyhow::Result<CompactTxStreamerClient<Channel>> {
+        Ok(CompactTxStreamerClient::new(self.dial_direct().await?))
+    }
+
+    /// [`Self::connect_direct`] stopping at the channel, for a caller that
+    /// wraps it in something other than a `CompactTxStreamerClient`.
+    async fn dial_direct(&self) -> anyhow::Result<Channel> {
         info!("Connecting to {}", self);
 
         let endpoint = Channel::from_shared(self.endpoint())?;
@@ -198,13 +204,24 @@ impl Server<'_> {
         };
         let endpoint = tune_endpoint(endpoint);
 
-        Ok(CompactTxStreamerClient::new(endpoint.connect().await?))
+        Ok(endpoint.connect().await?)
     }
 
     pub async fn connect_over_socks(
         &self,
         proxy_addr: SocketAddr,
     ) -> anyhow::Result<CompactTxStreamerClient<Channel>> {
+        // The explicit origin is what the channel would apply anyway (tonic's
+        // `AddOrigin` layer takes `endpoint.uri()`, which `dial_over_socks`
+        // builds from this same address), so a caller that wraps the bare
+        // channel itself is not losing it.
+        let uri: Uri = self.endpoint().parse()?;
+        let channel = self.dial_over_socks(proxy_addr).await?;
+        Ok(CompactTxStreamerClient::with_origin(channel, uri))
+    }
+
+    /// [`Self::connect_over_socks`] stopping at the channel.
+    async fn dial_over_socks(&self, proxy_addr: SocketAddr) -> anyhow::Result<Channel> {
         info!("Connecting to {} via SOCKS proxy {}", self, proxy_addr);
 
         let connector = SocksConnector::new(proxy_addr);
@@ -222,8 +239,7 @@ impl Server<'_> {
             )?;
         }
 
-        let channel = endpoint.connect_with_connector(connector).await?;
-        Ok(CompactTxStreamerClient::with_origin(channel, uri))
+        Ok(endpoint.connect_with_connector(connector).await?)
     }
 }
 
@@ -310,6 +326,28 @@ impl ConnectionArgs {
         };
         verify_server_network(&mut client, network).await?;
         Ok(client)
+    }
+
+    /// [`Self::connect`] stopping at the channel: same server choice, same
+    /// proxy handling, same network check, but handing back the transport
+    /// rather than a `CompactTxStreamerClient` over it.
+    ///
+    /// This exists for the wallet-engine probes, which wrap the channel in
+    /// zecd's own client (`chain::lwd::LwdSource::connect`) so the birthday a
+    /// database is created with is the one zecd's `init` would have recorded.
+    /// The network check stays on this side: it is zkv's guarantee that a
+    /// birthday is never pinned against a server serving a different chain.
+    pub async fn dial(&self, network: Network) -> anyhow::Result<Channel> {
+        let server = self.servers_for(network).pick(network)?;
+        let channel = match &self.connection {
+            ConnectionMode::Direct => server.dial_direct().await?,
+            ConnectionMode::SocksProxy(addr) => server.dial_over_socks(*addr).await?,
+        };
+        // `Channel` is a cheap handle to the same connection, so the check
+        // costs one `GetLightdInfo` and no second dial.
+        let mut client = CompactTxStreamerClient::new(channel.clone());
+        verify_server_network(&mut client, network).await?;
+        Ok(channel)
     }
 
     /// Probe the lightwalletd server for `network`: dial it and pull a single

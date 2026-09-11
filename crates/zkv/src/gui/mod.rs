@@ -121,10 +121,14 @@ pub async fn serve(config: GuiConfig) -> anyhow::Result<()> {
         open_browser(&url);
     }
 
-    axum::serve(listener, app)
+    let served = axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
-        .await
-        .map_err(|e| anyhow::anyhow!("server error: {e}"))?;
+        .await;
+    // Stop the shared scan before returning, so its datadir lock is released
+    // rather than left for the next process to wait out. Per-database nodes are
+    // owned by the handles that opened them and go with those.
+    crate::engine::shutdown_all().await;
+    served.map_err(|e| anyhow::anyhow!("server error: {e}"))?;
     Ok(())
 }
 
@@ -244,6 +248,10 @@ struct PauseReq {
 #[derive(Deserialize)]
 struct SettingsReq {
     sync_workers: usize,
+    /// Omitted leaves the shared-scan default alone, so a client that predates
+    /// the setting cannot switch it off by not mentioning it.
+    #[serde(default)]
+    fleet_watch: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -469,7 +477,11 @@ async fn handle_settings(
     State(state): State<Arc<AppState>>,
     Json(body): Json<SettingsReq>,
 ) -> Json<SettingsResp> {
-    Json(state.engine.set_settings(body.sync_workers))
+    Json(
+        state
+            .engine
+            .set_settings(body.sync_workers, body.fleet_watch),
+    )
 }
 
 async fn handle_init(
@@ -698,9 +710,9 @@ fn parse_pool(s: Option<&str>, network: Network) -> Result<ShieldedPool, ApiErro
 }
 
 fn random_token() -> String {
-    use rand::RngCore;
+    use rand::Rng as _;
     let mut bytes = [0u8; 16];
-    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    rand::rand_core::UnwrapErr(rand::rngs::SysRng).fill_bytes(&mut bytes);
     hex::encode(bytes)
 }
 
@@ -872,6 +884,14 @@ impl From<ZkvError> for ApiError {
             ZkvError::NotSynced => (StatusCode::CONFLICT, "not_synced"),
             ZkvError::StaleChainTip => (StatusCode::SERVICE_UNAVAILABLE, "stale_tip"),
             ZkvError::WatchOnly => (StatusCode::FORBIDDEN, "watch_only"),
+            // Not an error the caller can act on: the shared scan imports the
+            // member on a later pass. 409, like the other "come back shortly"
+            // states, rather than a 404 that reads as a missing database.
+            ZkvError::Importing => (StatusCode::CONFLICT, "importing"),
+            // This one never resolves on its own, so it is not a "come back
+            // shortly": the manifest has to change. 422, the shape for a
+            // request whose content the server understood and cannot act on.
+            ZkvError::ImportFailed(_) => (StatusCode::UNPROCESSABLE_ENTITY, "import_failed"),
             ZkvError::Unauthorized(_) => (StatusCode::FORBIDDEN, "unauthorized"),
             ZkvError::InsufficientFunds { .. } => {
                 (StatusCode::PAYMENT_REQUIRED, "insufficient_funds")
@@ -923,7 +943,33 @@ mod tests {
     use super::*;
     use axum::body::Body;
     use axum::http::Request;
+    use std::path::{Path, PathBuf};
+    use std::sync::OnceLock;
     use tower::ServiceExt; // for `oneshot`
+
+    /// One empty data directory, shared by every test in this module that
+    /// needs the wallet layer to find no databases.
+    ///
+    /// These tests run as threads in a single process, so pointing the data
+    /// dir somewhere is a process-global write. Each of them used to set
+    /// `ZKV_DATA` to a directory of its own, which raced the other eleven
+    /// tests in this file and only agreed because every one of them wanted an
+    /// empty directory: the first test to populate one would have flaked the
+    /// rest. One directory, installed exactly once, removes the race.
+    ///
+    /// It also installs it through `set_data_dir_override` rather than
+    /// `std::env::set_var`, which is `unsafe` from Rust 2024 and would block
+    /// an edition bump. The override is idempotent and outranks `$ZKV_DATA`,
+    /// so it wins no matter what the environment holds.
+    fn empty_data_dir() -> &'static Path {
+        static DIR: OnceLock<PathBuf> = OnceLock::new();
+        DIR.get_or_init(|| {
+            let dir = std::env::temp_dir().join(format!("zkv-gui-tests-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).expect("create the shared test data dir");
+            crate::data::set_data_dir_override(dir.clone());
+            dir
+        })
+    }
 
     fn test_state(token: &str) -> Arc<AppState> {
         Arc::new(AppState {
@@ -1048,9 +1094,7 @@ mod tests {
     #[tokio::test]
     async fn api_lists_databases_as_json() {
         // Point the data dir at an empty temp dir so the list is [].
-        let dir = std::env::temp_dir().join(format!("zkv-gui-it-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("ZKV_DATA", &dir);
+        empty_data_dir();
 
         let app = router(test_state("secrettoken"));
         let res = app
@@ -1069,9 +1113,7 @@ mod tests {
     async fn api_lists_databases_basic_via_query_param() {
         // The `?basic=1` variant (fast launch list) shares the route and the
         // `ListQuery` extractor; on an empty data dir it returns the same `[]`.
-        let dir = std::env::temp_dir().join(format!("zkv-gui-basic-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("ZKV_DATA", &dir);
+        empty_data_dir();
 
         let app = router(test_state("secrettoken"));
         let res = app
@@ -1090,9 +1132,7 @@ mod tests {
     async fn api_history_unknown_db_is_404() {
         // Routing + the `?key=` Query extractor + error mapping: an unknown
         // database resolves to a structured 404 just like the detail route.
-        let dir = std::env::temp_dir().join(format!("zkv-gui-hist-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("ZKV_DATA", &dir);
+        empty_data_dir();
 
         let app = router(test_state("secrettoken"));
         let res = app
@@ -1112,9 +1152,7 @@ mod tests {
         // a DELETE against an unknown database resolves to a structured 404,
         // just like the GET detail/history routes. (The success path deletes a
         // real db directory, exercised by the facade/data layer.)
-        let dir = std::env::temp_dir().join(format!("zkv-gui-forget-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("ZKV_DATA", &dir);
+        empty_data_dir();
 
         let req = Request::builder()
             .method("DELETE")
@@ -1132,9 +1170,7 @@ mod tests {
     async fn api_roles_unknown_db_is_404() {
         // Routing + error mapping: an unknown database resolves to a
         // structured 404 just like the detail and history routes.
-        let dir = std::env::temp_dir().join(format!("zkv-gui-roles-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("ZKV_DATA", &dir);
+        empty_data_dir();
 
         let app = router(test_state("secrettoken"));
         let res = app
@@ -1152,9 +1188,7 @@ mod tests {
     async fn api_funding_unknown_db_is_404() {
         // Routing + the `FundingQuery` extractor + error mapping: an unknown
         // database resolves to a structured 404, like the history route.
-        let dir = std::env::temp_dir().join(format!("zkv-gui-fund-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("ZKV_DATA", &dir);
+        empty_data_dir();
 
         let app = router(test_state("secrettoken"));
         let res = app
@@ -1174,9 +1208,7 @@ mod tests {
         // signing against an unknown database resolves to a structured 404,
         // just like the detail/history routes (the op never gets as far as a
         // wallet).
-        let dir = std::env::temp_dir().join(format!("zkv-gui-sign-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("ZKV_DATA", &dir);
+        empty_data_dir();
 
         let app = router(test_state("secrettoken"));
         let res = app
@@ -1196,9 +1228,7 @@ mod tests {
         // an unknown database resolves to a structured 404, like the other
         // db-scoped routes. (A real preview needs an initialized, funded wallet,
         // so the success path is exercised by the facade/protocol tests.)
-        let dir = std::env::temp_dir().join(format!("zkv-gui-signprev-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        std::env::set_var("ZKV_DATA", &dir);
+        empty_data_dir();
 
         let app = router(test_state("secrettoken"));
         let res = app

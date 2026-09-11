@@ -18,8 +18,7 @@ use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::TxId;
 use zcash_protocol::{consensus::BlockHeight, ShieldedPool};
 
-use super::{decrypt, validate, ShallowError, CHUNK};
-use crate::internal::sync;
+use super::{decrypt, fetch, validate, ShallowError, CHUNK};
 
 /// A shallow client's view of the chain. Implemented by [`GrpcSource`]
 /// (lightwalletd) in production and by an in-memory mock in tests.
@@ -115,7 +114,7 @@ impl ChainSource for GrpcSource {
     ) -> Result<Option<(u32, Vec<(u32, String)>)>, ShallowError> {
         let tip_bh = BlockHeight::from_u32(tip);
         let Some((tx, mined)) =
-            sync::fetch_transaction(&mut self.client, &self.network, tip_bh, txid).await?
+            fetch::fetch_transaction(&mut self.client, &self.network, tip_bh, txid).await?
         else {
             return Ok(None);
         };

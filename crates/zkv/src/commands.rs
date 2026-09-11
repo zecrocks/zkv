@@ -5,6 +5,7 @@ pub(crate) mod admin;
 pub(crate) mod balance;
 pub(crate) mod connection_args;
 pub(crate) mod del;
+pub(crate) mod fleet;
 pub(crate) mod get;
 pub(crate) mod glob;
 #[cfg(feature = "gui")]
@@ -16,6 +17,7 @@ pub(crate) mod init;
 pub(crate) mod inspect;
 pub(crate) mod keys;
 pub(crate) mod list;
+pub(crate) mod migrate;
 pub(crate) mod owner;
 pub(crate) mod remove;
 pub(crate) mod restore;

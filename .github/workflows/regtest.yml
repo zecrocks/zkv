@@ -78,6 +78,12 @@ on:
 # "unknown field" on ones it doesn't recognise. (The harness also scrubs
 # ZEBRA_* before spawning zebrad, as a second line of defence.)
 env:
+  # The newest release before the wallet engine landed. The migration test
+  # drives a binary built from this ref to lay down a database the way a
+  # released zkv does, then upgrades it in place. A tag rather than a commit
+  # hash, so the ref resolves in every clone of the project; the test skips
+  # itself if it cannot be fetched.
+  ZKV_OLD_REF: "v0.1.0"
   ZEBRAD_IMAGE_PINNED: "6.0.0"
   LWD_IMAGE: "emersonian/zcash-lwd-ironwood@sha256:5f63b64ed788330ad8fe859fbbb334ceea844cf8a376318e7e25fbd3351b2f9f"
   DEVTOOL_IMAGE: "emersonian/zcash-devtool@sha256:fd95d8b432f47d3eec6e5f1eca0bdfbb8daa094c28742d230bec3ac47957bd6c"
@@ -102,7 +108,7 @@ jobs:
         image: ${{ github.event_name == 'schedule' && fromJSON('["pinned", "latest"]') || fromJSON('["event"]') }}
         include:
           - suite: zkv
-            tests: --test regtest_unfunded --test regtest_kv
+            tests: --lib --test regtest_unfunded --test regtest_kv --test regtest_lock --test regtest_gui --test regtest_migration --test regtest_fleet
     name: regtest (${{ matrix.suite }}, ${{ matrix.image }})
     steps:
       - uses: actions/checkout@v4
@@ -116,10 +122,52 @@ jobs:
             regtest-harness
 
       # Release build: writes prove Orchard spends, and debug proving is >20s
-      # per transaction; release keeps the harness snappy. The lean CLI build
-      # skips the GUI asset/licensing build steps.
-      - name: Build zkv (release, lean CLI)
-        run: cargo build --release -p zcash_zkv --bin zkv --no-default-features --features cli,transparent-inputs
+      # per transaction; release keeps the harness snappy.
+      #
+      # `gui` is on because `zkv gui-browser` lives behind it, and the GUI test
+      # drives that server against the live chain; without it the subcommand
+      # does not exist in this binary. It costs about a minute (axum, flate2,
+      # the build-time license bundle; rustls and ring are already in the tree
+      # via tonic). `desktop`/Tauri stays off: it needs system webview libs and
+      # nothing here drives it.
+      #
+      # The example is how the harness reaches `Database::write_many`, which no
+      # CLI surface exposes. Same target dir, so it shares this build.
+      - name: Build zkv (release, CLI + web GUI) and the batch-write example
+        run: |
+          cargo build --release -p zcash_zkv --bin zkv \
+            --no-default-features --features cli,gui,transparent-inputs
+          cargo build --release -p zcash_zkv --example batch_write \
+            --no-default-features --features cli,gui,transparent-inputs
+          echo "ZKV_BATCH_BIN=$PWD/target/release/examples/batch_write" >> "$GITHUB_ENV"
+
+      # The migration test upgrades a database in place, so it needs the
+      # release that laid it down as well as the build under test. Built from
+      # a worktree at a pinned pre-engine ref, into its own target directory so
+      # it cannot disturb the build above. If the ref is unreachable (a shallow
+      # clone without it), ZKV_OLD_BIN stays unset and the test skips itself
+      # rather than failing the run.
+      #
+      # The pinned ref predates the crates.io rename, so its package is still
+      # selected as `-p zkv`.
+      - name: Build the pre-engine zkv (for the migration test)
+        env:
+          ZKV_OLD_REF: ${{ env.ZKV_OLD_REF }}
+        run: |
+          set -euo pipefail
+          ref="${ZKV_OLD_REF:-}"
+          if [ -z "$ref" ]; then echo "ZKV_OLD_REF unset; skipping"; exit 0; fi
+          if ! git fetch --depth 1 origin "$ref" 2>/dev/null; then
+            echo "::warning::cannot fetch $ref; the migration test will skip"
+            exit 0
+          fi
+          rm -rf /tmp/zkv-old
+          git worktree add --detach /tmp/zkv-old FETCH_HEAD
+          cargo build --release -p zkv --bin zkv \
+            --no-default-features --features cli,transparent-inputs \
+            --manifest-path /tmp/zkv-old/Cargo.toml \
+            --target-dir /tmp/zkv-old-target
+          echo "ZKV_OLD_BIN=/tmp/zkv-old-target/release/zkv" >> "$GITHUB_ENV"
 
       # Pick the zebra image. The matrix names it outright on the weekly
       # schedule (pinned + latest legs); otherwise ("event") it comes from the
