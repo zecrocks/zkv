@@ -47,6 +47,8 @@ impl From<ZkvError> for CmdError {
             NotSynced => "not_synced",
             StaleChainTip => "stale_tip",
             WatchOnly => "watch_only",
+            Importing => "importing",
+            ImportFailed(_) => "import_failed",
             Unauthorized(_) => "unauthorized",
             InsufficientFunds { .. } => "insufficient_funds",
             ClientUpgradeRequired { .. } => "client_upgrade_required",
