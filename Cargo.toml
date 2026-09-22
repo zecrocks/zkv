@@ -155,19 +155,19 @@ zip321 = "0.9"
 # above follows, and the fleet API #270 answered (`Node::wallet_location`,
 # per-member `imported`/`import_error`, a public `fleet::write_manifest`).
 #
-# The published `0.8.0-rc1` was cut from `88338ef`, before the forks landed and
-# before the fleet was gated behind `[fleet] enabled`, so pinning it would have
-# tested something 0.8.0 will not be. **rc2 is that line**, from crates.io, with
-# the same Zakura pins zkv carries (`zakura-*`, the crypto family `=1.0.0`, the
-# wallet layer `0.1.0-rc4`, `rand 0.10`, MSRV 1.91), so no git source is
-# involved anywhere in the graph.
+# `0.8.0` is the released line, from crates.io, carrying the same Zakura pins
+# zkv does (`zakura-*`, the crypto family `=1.0.0`, the wallet layer
+# `0.1.0-rc4`, `rand 0.10`, MSRV 1.91), so no git source is involved anywhere
+# in the graph. The port was built against `0.8.0-rc2`, the first release of
+# this line that carried the forks and the gated fleet, and moved to the
+# release once it shipped: no zkv source changed on the way.
 #
-# Pin the exact rc while the fleet's manifest format and RPCs carry no
-# compatibility guarantee: `=0.8.0-rc2`, so nothing in an experimental upstream
+# Pin the exact version while the fleet's manifest format and RPCs carry no
+# compatibility guarantee: `=0.8.0`, so nothing in an experimental upstream
 # surface moves under zkv unnoticed. Move it deliberately and re-run the whole
 # gate; `crates/zkv/src/engine/config.rs`'s canaries are what say where an
 # upstream default changed.
-zecd = { version = "=0.8.0-rc2", default-features = false }
+zecd = { version = "=0.8.0", default-features = false }
 
 # NOTE: there is deliberately no [patch.crates-io] section any more.
 #

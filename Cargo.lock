@@ -8384,9 +8384,9 @@ dependencies = [
 
 [[package]]
 name = "zecd"
-version = "0.8.0-rc2"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6387a7092cb961e2aaf980ae3776dd9a8941c0153754bd99d4483bb0333065d4"
+checksum = "55fde00472b3828b74eb61fc0ca6dbe52c3e83e9da5036e627883fb137b2d851"
 dependencies = [
  "age 0.12.1",
  "anyhow",
