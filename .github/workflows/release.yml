@@ -18,6 +18,12 @@ name: release
 #   <product>-<version>-<platform>-<arch>.<ext>   everything except the .deb
 #   <product>_<version>_<arch>.deb                Debian's own convention
 #
+# A prerelease spells its version Debian's way in the .deb alone, with a tilde
+# (`0.2.0~rc1`, not `0.2.0-rc1`): dpkg sorts `~` before everything and a bare
+# hyphen above it, so the semver spelling would make the eventual `0.2.0` read
+# as a downgrade and apt would refuse it. Every other artifact keeps the semver
+# spelling, and a normal release is unaffected.
+#
 # So a v0.0.1 release lists:
 #   * Linux, amd64 (build `x86_64-unknown-linux-gnu`) and arm64 (build
 #     `aarch64-unknown-linux-gnu`), each on a native runner (no cross-compile):
@@ -77,6 +83,7 @@ jobs:
     outputs:
       matrix: ${{ steps.matrix.outputs.value }}
       version: ${{ steps.version.outputs.version }}
+      deb_version: ${{ steps.version.outputs.deb_version }}
     steps:
       - uses: actions/checkout@v5
 
@@ -109,6 +116,20 @@ jobs:
           fi
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Resolved version=${version}"
+
+          # The Debian spelling of the same version, which names the .deb
+          # (the control field inside it is rewritten at packaging time, from
+          # what the bundler wrote there). dpkg sorts `~` before everything and a bare hyphen
+          # above it, so a semver `0.2.0-rc1` sorts ABOVE `0.2.0` and apt reads
+          # the finished release as a downgrade; `0.2.0~rc1` sorts below it, as
+          # a prerelease should. Only a real semver prerelease is rewritten: a
+          # `dev-<sha>` build keeps its hyphen, since nothing upgrades from one.
+          case "$version" in
+            [0-9]*.[0-9]*.[0-9]*-*) deb_version="${version%%-*}~${version#*-}" ;;
+            *) deb_version="$version" ;;
+          esac
+          echo "deb_version=${deb_version}" >> "$GITHUB_OUTPUT"
+          echo "Resolved deb_version=${deb_version}"
 
       # The version is baked into every filename now, so a manifest that
       # disagrees with the tag would ship artifacts whose names contradict the
@@ -158,6 +179,7 @@ jobs:
         include: ${{ fromJSON(needs.setup.outputs.matrix) }}
     env:
       VERSION: ${{ needs.setup.outputs.version }}
+      DEB_VERSION: ${{ needs.setup.outputs.deb_version }}
     steps:
       - uses: actions/checkout@v5
 
@@ -414,14 +436,49 @@ jobs:
           fi
           cp "$appimage" "dist/zkv-browser-${VERSION}-${{ matrix.label }}.AppImage"
 
-          # Debian package.
+          # Debian package. The bundler writes the crate version into the
+          # control file verbatim, so on a prerelease it arrives spelled the
+          # semver way; rewrite that one field and name the file to match. The
+          # payload is untouched: dpkg-deb repacks the same tree, so only the
+          # control file differs. Outside a prerelease the two spellings are
+          # equal and none of this runs.
           deb="$(find "$rel/bundle/deb" -name '*.deb' -print -quit)"
           if [ -z "$deb" ]; then
             echo "::error::no .deb produced by the Tauri bundler"
             find "$rel/bundle" -type f || true
             exit 1
           fi
-          cp "$deb" "dist/zkv-browser_${VERSION}_${{ matrix.arch }}.deb"
+          # Rewritten from what the bundler actually wrote, not from the
+          # artifact version: on a dev build the two differ (filenames carry
+          # `dev-<sha>`, the control file carries the manifest version), and
+          # the control file is the one apt reads.
+          have="$(dpkg-deb -f "$deb" Version)"
+          case "$have" in
+            [0-9]*.[0-9]*.[0-9]*-*) want="${have%%-*}~${have#*-}" ;;
+            *) want="$have" ;;
+          esac
+          if [ "$want" != "$have" ]; then
+            dpkg-deb -R "$deb" "$RUNNER_TEMP/deb-repack"
+            sed -i "s/^Version: .*/Version: ${want}/" "$RUNNER_TEMP/deb-repack/DEBIAN/control"
+            dpkg-deb --build "$RUNNER_TEMP/deb-repack" "$RUNNER_TEMP/repacked.deb" >/dev/null
+            deb="$RUNNER_TEMP/repacked.deb"
+          fi
+          out="dist/zkv-browser_${DEB_VERSION}_${{ matrix.arch }}.deb"
+          cp "$deb" "$out"
+
+          # apt orders releases by this field, so assert it rather than trust
+          # the rewrite above. On a tag push the filename and the field name
+          # the same version and must agree; on a dev build they do not.
+          got="$(dpkg-deb -f "$out" Version)"
+          if [ "$got" != "$want" ]; then
+            echo "::error::$out declares Version ${got}, expected ${want}"
+            exit 1
+          fi
+          if [ "$GITHUB_REF_TYPE" = "tag" ] && [ "$got" != "$DEB_VERSION" ]; then
+            echo "::error::$out declares Version ${got}, but this release is ${DEB_VERSION}"
+            exit 1
+          fi
+          echo "deb Version: ${got}"
           ls -l dist
 
       # --- upload: one artifact per distributable -------------------------
