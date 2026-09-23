@@ -597,3 +597,7 @@ jobs:
             dist/SHA256SUMS
           fail_on_unmatched_files: true
           generate_release_notes: true
+          # A tag with a suffix (`v0.2.0-rc1`) is a release candidate: publish
+          # it as a prerelease, which GitHub never marks Latest, so the stable
+          # release keeps that spot. A plain `vX.Y.Z` publishes normally.
+          prerelease: ${{ contains(github.ref_name, '-') }}
