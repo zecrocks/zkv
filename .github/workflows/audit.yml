@@ -1,0 +1,32 @@
+name: audit
+
+# A new RustSec advisory can fail a tree nobody has touched: RUSTSEC-2026-0285
+# (rustls) turned the unchanged, previously green v0.2.0-rc1 branch red. ci.yml
+# only runs cargo-deny when something is pushed, so this checks main weekly and
+# on demand, and a new advisory surfaces as a failed run rather than at release
+# time. Scheduled runs use the default branch; GitHub pauses them after 60 days
+# without repository activity.
+on:
+  schedule:
+    - cron: "17 7 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  advisories:
+    name: cargo deny advisories
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny
+
+      - name: cargo deny advisories
+        run: cargo deny --all-features check advisories
