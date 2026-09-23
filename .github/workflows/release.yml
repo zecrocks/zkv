@@ -117,13 +117,14 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Resolved version=${version}"
 
-          # The Debian spelling of the same version, which names the .deb
-          # (the control field inside it is rewritten at packaging time, from
-          # what the bundler wrote there). dpkg sorts `~` before everything and a bare hyphen
-          # above it, so a semver `0.2.0-rc1` sorts ABOVE `0.2.0` and apt reads
-          # the finished release as a downgrade; `0.2.0~rc1` sorts below it, as
-          # a prerelease should. Only a real semver prerelease is rewritten: a
-          # `dev-<sha>` build keeps its hyphen, since nothing upgrades from one.
+          # The Debian spelling of the same version, which names the .deb (the
+          # control field inside it is rewritten at packaging time, from what
+          # the bundler wrote there). dpkg sorts `~` before everything and a
+          # bare hyphen above it, so a semver `0.2.0-rc1` sorts ABOVE `0.2.0`
+          # and apt reads the finished release as a downgrade; `0.2.0~rc1`
+          # sorts below it, as a prerelease should. Only a real semver
+          # prerelease is rewritten: a `dev-<sha>` build keeps its hyphen,
+          # since nothing upgrades from one.
           case "$version" in
             [0-9]*.[0-9]*.[0-9]*-*) deb_version="${version%%-*}~${version#*-}" ;;
             *) deb_version="$version" ;;
@@ -438,10 +439,15 @@ jobs:
 
           # Debian package. The bundler writes the crate version into the
           # control file verbatim, so on a prerelease it arrives spelled the
-          # semver way; rewrite that one field and name the file to match. The
-          # payload is untouched: dpkg-deb repacks the same tree, so only the
-          # control file differs. Outside a prerelease the two spellings are
-          # equal and none of this runs.
+          # semver way; rewrite that one field and name the file to match.
+          # Every file's contents are unchanged, but the archive is rebuilt:
+          # with `--root-owner-group`, because this runner is unprivileged and
+          # dpkg-deb otherwise records the runner's own uid as the owner of
+          # every file, which dpkg then reproduces on the user's machine
+          # (`/usr/bin/zkv-browser` owned by uid 1001); and with `-Zzstd`, to
+          # pin a compression Debian 12+ and Ubuntu 22.04+ (the supported
+          # floor) read rather than inherit the runner's default. Outside a
+          # prerelease the two spellings are equal and none of this runs.
           deb="$(find "$rel/bundle/deb" -name '*.deb' -print -quit)"
           if [ -z "$deb" ]; then
             echo "::error::no .deb produced by the Tauri bundler"
@@ -460,7 +466,7 @@ jobs:
           if [ "$want" != "$have" ]; then
             dpkg-deb -R "$deb" "$RUNNER_TEMP/deb-repack"
             sed -i "s/^Version: .*/Version: ${want}/" "$RUNNER_TEMP/deb-repack/DEBIAN/control"
-            dpkg-deb --build "$RUNNER_TEMP/deb-repack" "$RUNNER_TEMP/repacked.deb" >/dev/null
+            dpkg-deb --root-owner-group -Zzstd --build "$RUNNER_TEMP/deb-repack" "$RUNNER_TEMP/repacked.deb" >/dev/null
             deb="$RUNNER_TEMP/repacked.deb"
           fi
           out="dist/zkv-browser_${DEB_VERSION}_${{ matrix.arch }}.deb"
@@ -478,7 +484,15 @@ jobs:
             echo "::error::$out declares Version ${got}, but this release is ${DEB_VERSION}"
             exit 1
           fi
-          echo "deb Version: ${got}"
+          # Every installed file must belong to root, or whichever uid built
+          # the package owns it on each machine that installs it. Checked on
+          # every .deb, repacked or not.
+          owners="$(dpkg-deb --fsys-tarfile "$out" | tar --numeric-owner -tvf - | awk '{print $2}' | sort -u | tr '\n' ' ')"
+          if [ "$owners" != "0/0 " ]; then
+            echo "::error::$out has files owned by ${owners}; expected only 0/0"
+            exit 1
+          fi
+          echo "deb Version: ${got}, owners: ${owners}"
           ls -l dist
 
       # --- upload: one artifact per distributable -------------------------
