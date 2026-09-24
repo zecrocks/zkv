@@ -18,11 +18,14 @@ name: release
 #   <product>-<version>-<platform>-<arch>.<ext>   everything except the .deb
 #   <product>_<version>_<arch>.deb                Debian's own convention
 #
-# A prerelease spells its version Debian's way in the .deb alone, with a tilde
-# (`0.2.0~rc1`, not `0.2.0-rc1`): dpkg sorts `~` before everything and a bare
-# hyphen above it, so the semver spelling would make the eventual `0.2.0` read
-# as a downgrade and apt would refuse it. Every other artifact keeps the semver
-# spelling, and a normal release is unaffected.
+# A prerelease spells its version Debian's way inside the .deb, with a tilde in
+# the control file's `Version:` (`0.2.0~rc1`, not `0.2.0-rc1`): dpkg sorts `~`
+# before everything and a bare hyphen above it, so the semver spelling would
+# make the eventual `0.2.0` read as a downgrade and apt would refuse it. The
+# .deb's FILENAME keeps the semver spelling, like every other artifact: a
+# GitHub release asset name cannot contain `~` (it is silently turned into
+# `.`, which broke SHA256SUMS on the first v0.2.0-rc1), and apt never reads the
+# filename. A normal release is unaffected.
 #
 # So a v0.0.1 release lists:
 #   * Linux, amd64 (build `x86_64-unknown-linux-gnu`) and arm64 (build
@@ -117,14 +120,14 @@ jobs:
           echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "Resolved version=${version}"
 
-          # The Debian spelling of the same version, which names the .deb (the
-          # control field inside it is rewritten at packaging time, from what
-          # the bundler wrote there). dpkg sorts `~` before everything and a
-          # bare hyphen above it, so a semver `0.2.0-rc1` sorts ABOVE `0.2.0`
-          # and apt reads the finished release as a downgrade; `0.2.0~rc1`
-          # sorts below it, as a prerelease should. Only a real semver
-          # prerelease is rewritten: a `dev-<sha>` build keeps its hyphen,
-          # since nothing upgrades from one.
+          # The Debian spelling of the same version. A tag push asserts that
+          # the .deb's control field carries it; the field is rewritten at
+          # packaging time from what the bundler wrote there. dpkg sorts `~`
+          # before everything and a bare hyphen above it, so a semver
+          # `0.2.0-rc1` sorts ABOVE `0.2.0` and apt reads the finished release
+          # as a downgrade; `0.2.0~rc1` sorts below it, as a prerelease
+          # should. Only a real semver prerelease is rewritten: a `dev-<sha>`
+          # build keeps its hyphen, since nothing upgrades from one.
           case "$version" in
             [0-9]*.[0-9]*.[0-9]*-*) deb_version="${version%%-*}~${version#*-}" ;;
             *) deb_version="$version" ;;
@@ -439,8 +442,9 @@ jobs:
 
           # Debian package. The bundler writes the crate version into the
           # control file verbatim, so on a prerelease it arrives spelled the
-          # semver way; rewrite that one field and name the file to match.
-          # Every file's contents are unchanged, but the archive is rebuilt:
+          # semver way; rewrite that one field. The filename keeps the semver
+          # spelling (see the note at the top of this file). Every file's
+          # contents are unchanged, but the archive is rebuilt:
           # with `--root-owner-group`, because this runner is unprivileged and
           # dpkg-deb otherwise records the runner's own uid as the owner of
           # every file, which dpkg then reproduces on the user's machine
@@ -469,12 +473,12 @@ jobs:
             dpkg-deb --root-owner-group -Zzstd --build "$RUNNER_TEMP/deb-repack" "$RUNNER_TEMP/repacked.deb" >/dev/null
             deb="$RUNNER_TEMP/repacked.deb"
           fi
-          out="dist/zkv-browser_${DEB_VERSION}_${{ matrix.arch }}.deb"
+          out="dist/zkv-browser_${VERSION}_${{ matrix.arch }}.deb"
           cp "$deb" "$out"
 
           # apt orders releases by this field, so assert it rather than trust
-          # the rewrite above. On a tag push the filename and the field name
-          # the same version and must agree; on a dev build they do not.
+          # the rewrite above. On a tag push it must also be the Debian
+          # spelling of the tag itself; a dev build has no tag to compare with.
           got="$(dpkg-deb -f "$out" Version)"
           if [ "$got" != "$want" ]; then
             echo "::error::$out declares Version ${got}, expected ${want}"
